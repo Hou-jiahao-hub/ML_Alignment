@@ -1,0 +1,24 @@
+# Build artifacts
+AlignDerivLib/build/
+AlignDerivLib/build_pybind11/
+install/
+__pycache__/
+*.pyc
+*.pyo
+
+# Large output / log files
+*.log
+alignment_output/
+reconstruction_output/
+simulation_output/
+alignLog*
+recon_*_log.txt
+ml_align_log*.txt
+
+# Large data files
+odd_transforms.json
+
+# Editor temporaries
+*.swp
+*.swo
+.DS_Store

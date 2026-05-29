@@ -1,0 +1,307 @@
+import uproot
+import awkward as ak
+import numpy as np
+import argparse
+from pathlib import Path
+
+try:
+    import ROOT
+    ROOT.gROOT.SetBatch(True)
+    ROOT.TH1.StatOverflows(True)
+except ImportError:
+    ROOT = None
+
+ROOT_COLORS = {"Nominal": ROOT.kBlue, "Aligned": ROOT.kGreen+2, "Misaligned": ROOT.kRed} if ROOT else {}
+
+# ODD subsystem definitions: volume IDs, intrinsic resolutions [mm], and default plot ranges [mm]
+SUBSYSTEMS = {
+    "Pixel": {
+        "volumes": [16, 17, 18],
+        "res_x": 0.015, "res_y": 0.015,
+        "range_x": (-0.15, 0.15), "range_y": (-0.15, 0.15),
+    },
+    "ShortStrip": {
+        "volumes": [23, 24, 25],
+        "res_x": 0.043, "res_y": 1.200,
+        "range_x": (-0.30, 0.30), "range_y": (-5.0, 5.0),
+    },
+    "LongStrip": {
+        "volumes": [28, 29, 30],
+        "res_x": 0.072, "res_y": None,
+        "range_x": (-0.50, 0.50), "range_y": (-5.0, 5.0),
+    },
+}
+
+
+def get_branch_data(file_path: Path, tree_name: str, branch_meas: str, branch_pred: str, vol_ids=None, lay_id=None):
+    """Read residual data from a ROOT tree, optionally filtered by one or more volume IDs."""
+    if not file_path.exists():
+        print(f"warning: No file found at {file_path}")
+        return None
+
+    try:
+        with uproot.open(file_path) as file:
+            if tree_name not in file:
+                print(f"error: Tree '{tree_name}' not found in {file_path}")
+                return None
+
+            tree = file[tree_name]
+            if branch_meas not in tree or branch_pred not in tree:
+                print(f"error: Branch '{branch_meas}' or '{branch_pred}' not found in tree '{tree_name}'")
+                return None
+
+            data_meas = tree[branch_meas].array(library="ak")
+            data_pred = tree[branch_pred].array(library="ak")
+            data = data_meas - data_pred
+
+            mask = None
+            if vol_ids is not None:
+                vol_ids_list = [vol_ids] if isinstance(vol_ids, int) else list(vol_ids)
+                if "volume_id" in tree:
+                    v_arr = tree["volume_id"].array(library="ak")
+                    vol_mask = (v_arr == vol_ids_list[0])
+                    for vid in vol_ids_list[1:]:
+                        vol_mask = vol_mask | (v_arr == vid)
+                    mask = vol_mask
+                else:
+                    print("Warning: 'volume_id' branch not found. Ignoring volume filter.")
+
+            if lay_id is not None:
+                if "layer_id" in tree:
+                    l_arr = tree["layer_id"].array(library="ak")
+                    mask = (l_arr == lay_id) if mask is None else mask & (l_arr == lay_id)
+                else:
+                    print("Warning: 'layer_id' branch not found. Ignoring layer filter.")
+
+            if mask is not None:
+                data = data[mask]
+
+            try:
+                flat_data = ak.flatten(data).to_numpy()
+            except Exception:
+                flat_data = ak.to_numpy(data)
+
+            return flat_data[np.isfinite(flat_data)]
+
+    except Exception as e:
+        print(f"An error occurred while reading {file_path}: {e}")
+        return None
+
+
+def histograms(data_dict, base_dir, var_name, layer_tag="", units="mm", plot_range=(-1.0, 1.0), bins=100, odd_resolution=None, output_label=""):
+    base_dir.mkdir(parents=True, exist_ok=True)
+    file_suffix = f"{layer_tag}" if layer_tag else ""
+    label_prefix = f"{output_label}_" if output_label else ""
+    output_root = base_dir / f"{label_prefix}{var_name}_{file_suffix}_comparison.root"
+    print(f"\n Generating ROOT file: {output_root.name}")
+
+    try:
+        f = ROOT.TFile(str(output_root), "RECREATE")
+        c = ROOT.TCanvas(f"canvas_{var_name}", f"Overlay of {var_name}", 800, 600)
+        c.cd()
+
+        label_suffix = f"-{output_label.upper()}" if output_label else ""
+        stack_title = f"({var_name}_{file_suffix}) Comparison{label_suffix};Residual [{units}];Number of hits"
+        hs = ROOT.THStack(f"hs_{var_name}", stack_title)
+        hists        = {}
+        # fitted_funcs = {}
+
+        for label, data in data_dict.items():
+            if data is None or len(data) == 0:
+                continue
+            mean = np.mean(data)
+            std  = np.std(data)
+            counts, bin_edges = np.histogram(data, bins=bins, range=plot_range)
+
+            if np.all(counts == 0):
+                print(f"Warning: {label} histogram all 0, check plot range!")
+                continue
+
+            hname  = f"hist_{label.lower()}"
+            htitle = f"{label} (Mean: {mean:.4f} {units}, Std: {std:.4f} {units})"
+
+            h = ROOT.TH1D(hname, htitle, bins, plot_range[0], plot_range[1])
+            data_f  = np.ascontiguousarray(data, dtype=np.float64)
+            weights = np.ones(len(data_f), dtype=np.float64)
+            h.FillN(len(data_f), data_f, weights)
+            h.SetLineColor(ROOT_COLORS.get(label, ROOT.kBlack))
+            h.SetLineWidth(3)
+
+            # # Gaussian fit via ROOT TF1
+            # # "QSN": Q=quiet, S=store result, N=do NOT auto-draw (we draw explicitly later)
+            # gaus_func = ROOT.TF1(f"gaus_fit_{hname}", "gaus", plot_range[0], plot_range[1])
+            # try:
+            #     fit_ptr = h.Fit(gaus_func, "QSN")
+            #     if fit_ptr.IsValid():
+            #         mu  = gaus_func.GetParameter(1)
+            #         sig = abs(gaus_func.GetParameter(2))
+            #         print(f"    Gauss fit [{label}]: μ={mu*1e3:.3f} μm, σ={sig*1e3:.3f} μm")
+            #         gaus_func.SetLineColor(ROOT_COLORS.get(label, ROOT.kBlack))
+            #         gaus_func.SetLineWidth(2)
+            #         gaus_func.SetLineStyle(1)
+            #         fitted_funcs[label] = gaus_func
+            #         gaus_func.Write()
+            # except Exception as fit_err:
+            #     print(f"    Gauss fit failed for {label}: {fit_err}")
+
+            hists[label] = h
+            h.Write()
+
+        if not hists:
+            print("Error: No valid histograms to draw!")
+            f.Close()
+            return
+
+        # ── Draw histograms (step style) ──────────────────────────────────
+        leg = ROOT.TLegend(0.55, 0.62, 0.90, 0.90)
+        leg.SetBorderSize(1)
+        leg.SetTextSize(0.028)
+
+        for label in ["Nominal", "Aligned", "Misaligned"]:
+            if label in hists:
+                hs.Add(hists[label])
+                leg.AddEntry(hists[label], label, "l")
+
+        hs.Draw("HIST NOSTACK")
+
+        # # ── Overlay Gaussian fit curves (explicit Draw after THStack) ─────
+        # for label in ["Nominal", "Aligned", "Misaligned"]:
+        #     if label in fitted_funcs:
+        #         func = fitted_funcs[label]
+        #         mu   = func.GetParameter(1)
+        #         sig  = abs(func.GetParameter(2))
+        #         func.Draw("SAME")
+        #         leg.AddEntry(func,
+        #                      f"Gauss {label}: #mu={mu*1e3:.2f} #mum, #sigma={sig*1e3:.2f} #mum",
+        #                      "l")
+
+        # ── ODD reference lines ───────────────────────────────────────────
+        ref_lines = []
+        if odd_resolution is not None:
+            y_max = hs.GetMaximum() * 1.05
+            for x_val in (odd_resolution, -odd_resolution):
+                line = ROOT.TLine(x_val, 0, x_val, y_max)
+                line.SetLineColor(ROOT.kViolet)
+                line.SetLineStyle(9)
+                line.SetLineWidth(2)
+                line.Draw("SAME")
+                ref_lines.append(line)
+            leg.AddEntry(ref_lines[0], f"#pm ODD #sigma = {odd_resolution*1e3:.1f} #mum", "l")
+
+        leg.Draw("SAME")
+        c.Modified()
+        c.Update()
+        c.Write()
+        hs.Write()
+        f.Close()
+
+    except (ImportError, AttributeError):
+        print("  -> Warning: PyROOT not found. Falling back to basic uproot writing.")
+        with uproot.recreate(output_root) as root_file:
+            for label, data in data_dict.items():
+                if data is None or len(data) == 0:
+                    continue
+                counts, bin_edges = np.histogram(data, bins=bins, range=plot_range)
+                root_file[f"hist_{label.lower()}"] = (counts, bin_edges, f"{label};Residual [{units}];Hits")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Save track residual distributions to ROOT files per ODD subsystem.")
+    parser.add_argument("--recon-dir", type=str, default="reconstruction_output",
+                        help="Reconstruction output base directory")
+    parser.add_argument("--residuals", nargs="+", default=["X", "Y"],
+                        help="Residual axes to plot (X, Y, or both)")
+    parser.add_argument("--range", type=float, nargs=2, default=None,
+                        help="Override plot range [mm]: min max. Default: per-subsystem from config.")
+    parser.add_argument("--bins", type=int, default=100, help="Number of histogram bins")
+    parser.add_argument("--volume_id", type=int, default=None,
+                        help="Single Volume ID (manual mode, bypasses subsystem loop)")
+    parser.add_argument("--layer_id", type=int, default=None, help="Layer ID filter")
+    parser.add_argument("--odd-res-x", type=float, default=None,
+                        help="ODD resolution in local X [mm] (manual mode only)")
+    parser.add_argument("--odd-res-y", type=float, default=None,
+                        help="ODD resolution in local Y [mm] (manual mode only)")
+    parser.add_argument("--aligned-trackstates", type=str, default=None,
+                        help="Path to ML-aligned trackstates ROOT file (overrides default Aligned entry)")
+    parser.add_argument("--label", type=str, default="",
+                        help="Label appended to output file name and title (e.g. 'ml' → ml_res_X_..._comparison.root, title Comparison-ML)")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Directory to save output ROOT files (default: same as --recon-dir)")
+
+    args = parser.parse_args()
+
+    if args.bins <= 0:
+        raise ValueError(f"Invalid bins value: {args.bins}")
+    if args.range is not None and args.range[0] >= args.range[1]:
+        raise ValueError(f"Invalid plot range: {args.range} (min >= max)")
+
+    base_dir   = Path(args.recon_dir)
+    output_dir = Path(args.output_dir) if args.output_dir else base_dir
+    tree_name  = "trackstates"
+
+    files = {
+        "Nominal":    base_dir / "nominal" / "trackstates_kf_v17l8_v24l4.root",
+        "Aligned":    base_dir / "aligned" / f"{args.aligned_trackstates}" if args.aligned_trackstates else base_dir / "aligned" / "trackstates_kf_v17l8_v24l4.root",
+        "Misaligned": base_dir / "misaligned" / "trackstates_kf_v17l8_v24l4.root",
+    }
+
+    lay_suffix = f"_Lay{args.layer_id}" if args.layer_id is not None else ""
+
+    def _run_axis(axis, vol_ids, layer_tag, plot_range, odd_res):
+        axis = axis.upper()
+        if axis == "X":
+            b_meas, b_pred, var_name = "l_x_hit", "t_eLOC0", "res_X"
+        elif axis == "Y":
+            b_meas, b_pred, var_name = "l_y_hit", "t_eLOC1", "res_Y"
+        else:
+            print(f"Warning: Unknown axis '{axis}'. Skipping.")
+            return
+
+        ref_str = f"{odd_res*1e3:.0f} μm" if odd_res is not None else "N/A"
+        print(f"\n  [{axis}]  ODD σ_ref = {ref_str},  range = {plot_range}")
+
+        data_dict = {}
+        for label, path in files.items():
+            data = get_branch_data(path, tree_name, b_meas, b_pred,
+                                   vol_ids=vol_ids, lay_id=args.layer_id)
+            data_dict[label] = data
+            if data is not None:
+                print(f"   - {label}: {len(data)} valid hits")
+
+        histograms(data_dict, base_dir=output_dir, var_name=var_name,
+                   layer_tag=layer_tag, plot_range=plot_range,
+                   bins=args.bins, odd_resolution=odd_res, output_label=args.label)
+
+    if args.volume_id is not None:
+        # ── Manual single-volume mode ─────────────────────────────────────
+        layer_tag = f"Vol{args.volume_id}{lay_suffix}"
+        print(f"==> Manual mode: Volume {args.volume_id}" +
+              (f", Layer {args.layer_id}" if args.layer_id else ""))
+        for axis in args.residuals:
+            plot_range = tuple(args.range) if args.range else (-0.5, 0.5)
+            odd_res = args.odd_res_x if axis.upper() == "X" else args.odd_res_y
+            _run_axis(axis, args.volume_id, layer_tag, plot_range, odd_res)
+
+    else:
+        # ── Subsystem loop mode (Pixel / ShortStrip / LongStrip) ─────────
+        for subsystem_name, sub_cfg in SUBSYSTEMS.items():
+            vol_ids = sub_cfg["volumes"]
+            print(f"\n{'='*62}")
+            print(f"  Subsystem: {subsystem_name}   volumes: {vol_ids}")
+            print(f"{'='*62}")
+            layer_tag = subsystem_name + lay_suffix
+            for axis in args.residuals:
+                if axis.upper() == "X":
+                    odd_res    = sub_cfg["res_x"]
+                    plot_range = tuple(args.range) if args.range else sub_cfg["range_x"]
+                else:
+                    odd_res    = sub_cfg["res_y"]
+                    plot_range = tuple(args.range) if args.range else sub_cfg["range_y"]
+                _run_axis(axis, vol_ids, layer_tag, plot_range, odd_res)
+
+    print(f"\nAll tasks completed successfully!")
+
+
+if __name__ == "__main__":
+    main()
