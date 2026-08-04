@@ -13,7 +13,21 @@ import acts.examples
 import acts.examples.alignment
 from acts.examples.alignment import AlignmentDecorator
 
+from alignment_artifact_layout import (
+    TARGET_LAYER_DIR,
+    TARGET_LAYER_SUFFIX,
+    artifact_filename,
+    target_subdir,
+    target_volume_map,
+)
+
 u = acts.UnitConstants
+
+
+def reconstruction_output_name(stem: str, output_suffix: str = "") -> str:
+    if output_suffix:
+        return f"{stem}_{output_suffix}.root"
+    return artifact_filename(stem, ".root")
 
 
 def parse_geoid(id_str):
@@ -582,7 +596,7 @@ def setupMisalignment(
     print(f"\nTotal misaligned detector elements: {len(geoIdMap)}")
 
     # Save misalignment record
-    misalignment_file = outputDir / "misalignment_applied.json"
+    misalignment_file = outputDir / artifact_filename("misalignment_applied", ".json")
     with open(misalignment_file, "w") as f:
         json.dump(misalignment_record, f, indent=2)
     print(f"Misalignment record saved to: {misalignment_file}")
@@ -620,7 +634,8 @@ def runAlignment(
 
     rnd = acts.examples.RandomNumbers(seed=42)
     inputDir = Path(inputDir)
-    outputDir = Path(outputDir)
+    outputDir = target_subdir(outputDir)
+    outputDir.mkdir(parents=True, exist_ok=True)
 
     logger = acts.logging.getLogger("Alignment")
 
@@ -641,8 +656,7 @@ def runAlignment(
     # Use -1 for layer value to match all sensors in that layer
     # Use -1 for sensor list to match all sensors: {16: {4: -1}} means all sensors in vol16/lay4
     # Format 1: Use hierarchical structure (dict) - specify volume -> layer -> sensors
-    #target_volume = {17: {8: -1}, 24: {4: -1}}
-    target_volume = {17: {8: -1}, 24: {4: -1}}
+    target_volume = target_volume_map()
     # Format 2: Use flat structure (backward compatible)
     # target_volume = -1      # -1 = all volumes, or dict for hierarchical: {vol: {lay: [sensors]}}
     # target_layer = -1        # -1 = all layers (used only if target_volume is not a dict)
@@ -924,7 +938,7 @@ def runAlignment(
             print(f"Warning: Could not find aligned transform for {element_id}")
 
     # Save aligned transforms record
-    aligned_file = outputDir / "aligned_transforms_v17l8_v24l4.json"
+    aligned_file = outputDir / artifact_filename("aligned_transforms", ".json")
     with open(aligned_file, "w") as f:
         json.dump(aligned_record, f, indent=2)
     print(f"\nAligned transforms saved to: {aligned_file}")
@@ -938,9 +952,9 @@ def runAlignment(
     print("=" * 60)
     print(f"\nOutput files saved to: {outputDir}")
     print("\nGenerated files:")
-    print("  - misalignment_applied.json: Applied misalignment transforms")
+    print(f"  - {artifact_filename('misalignment_applied', '.json')}: Applied misalignment transforms")
     print("    * Includes Translation and RotationMatrix")
-    print("  - aligned_transforms.json: Final aligned transforms")
+    print(f"  - {artifact_filename('aligned_transforms', '.json')}: Final aligned transforms")
     print("    * Includes Translation and RotationMatrix")
 
     return s
@@ -974,8 +988,8 @@ def runReconstruction(
     ----------
     mode : str
         - "nominal": Use nominal geometry (no alignment decorator)
-        - "misaligned": Use misaligned geometry (loads from misalignment_applied.json)
-        - "aligned": Use aligned geometry (loads from aligned_transforms.json)
+        - "misaligned": Use misaligned geometry (loads from misalignment_applied_v17l8_v24l4.json)
+        - "aligned": Use aligned geometry (loads from aligned_transforms_v17l8_v24l4.json)
     alignmentDir : Path
         Directory containing alignment output files (default: alignment_output)
     """
@@ -997,13 +1011,16 @@ def runReconstruction(
 
     rnd = acts.examples.RandomNumbers(seed=42)
     inputDir = Path(inputDir)
-    outputDir = Path(outputDir)
+    outputDir = target_subdir(outputDir)
+    outputDir.mkdir(parents=True, exist_ok=True)
 
     logger = acts.logging.getLogger("Reconstruction")
 
     # Determine alignment directory
     if alignmentDir is None:
-        alignmentDir = Path(__file__).resolve().parent / "alignment_output"
+        alignmentDir = target_subdir(Path(__file__).resolve().parent / "alignment_output")
+    else:
+        alignmentDir = target_subdir(alignmentDir)
 
     # Load transforms based on mode
     if mode == "nominal":
@@ -1016,7 +1033,7 @@ def runReconstruction(
         print("=" * 60)
         print("Running reconstruction with MISALIGNED geometry...")
         print("=" * 60)
-        json_path = alignmentDir / "misalignment_applied.json"
+        json_path = alignmentDir / artifact_filename("misalignment_applied", ".json")
         print(f"Loading misaligned transforms from: {json_path}")
         use_alignment_decorator = True
     elif mode == "aligned":
@@ -1024,9 +1041,15 @@ def runReconstruction(
         print("Running reconstruction with ALIGNED geometry...")
         print("=" * 60)
         if alignedFile is not None:
-            json_path = alignmentDir / alignedFile
+            aligned_path = Path(alignedFile)
+            if aligned_path.is_absolute():
+                json_path = aligned_path
+            elif aligned_path.parts and aligned_path.parts[0] == TARGET_LAYER_DIR:
+                json_path = alignmentDir.parent / aligned_path
+            else:
+                json_path = alignmentDir / aligned_path
         else:
-            json_path = alignmentDir / "aligned_transforms_v17l8_v24l4.json"
+            json_path = alignmentDir / artifact_filename("aligned_transforms", ".json")
         print(f"Loading aligned transforms from: {json_path}")
         use_alignment_decorator = True
     else:
@@ -1173,7 +1196,7 @@ def runReconstruction(
             inputTrackParticleMatching="track_particle_matching",
             inputSimHits="simhits",
             inputMeasurementSimHitsMap="measurement_simhits_map",
-            filePath=str(outputDir / f"trackstates_kf_v17l8_v24l4{'_' + outputSuffix if outputSuffix else ''}.root"),
+            filePath=str(outputDir / reconstruction_output_name("trackstates_kf", outputSuffix)),
         )
     )
 
@@ -1183,7 +1206,7 @@ def runReconstruction(
             inputTracks="tracks",
             inputParticles="particles_selected",
             inputTrackParticleMatching="track_particle_matching",
-            filePath=str(outputDir / f"tracksummary_kf_v17l8_v24l4{'_' + outputSuffix if outputSuffix else ''}.root"),
+            filePath=str(outputDir / reconstruction_output_name("tracksummary_kf", outputSuffix)),
         )
     )
 
@@ -1193,7 +1216,7 @@ def runReconstruction(
             inputTracks="tracks",
             inputParticles="particles_selected",
             inputTrackParticleMatching="track_particle_matching",
-            filePath=str(outputDir / f"performance_kf_v17l8_v24l4{'_' + outputSuffix if outputSuffix else ''}.root"),
+            filePath=str(outputDir / reconstruction_output_name("performance_kf", outputSuffix)),
         )
     )
 
@@ -1315,7 +1338,7 @@ if "__main__" == __name__:
         "--output-suffix",
         type=str,
         default="",
-        help="Suffix appended to output ROOT file names (e.g. 'ml' → trackstates_kf_v17l8_v24l4_ml.root)",
+        help="Suffix appended to output ROOT file names (e.g. 'ml' -> trackstates_kf_ml.root)",
     )
 
     args = parser.parse_args()
@@ -1347,7 +1370,7 @@ if "__main__" == __name__:
             if args.simulation_dir
             else Path.cwd() / "simulation_output"
         )
-        alignmentDir = (
+        alignmentDir = target_subdir(
             Path(args.alignment_dir)
             if args.alignment_dir
             else Path.cwd() / "alignment_output"
@@ -1383,7 +1406,7 @@ if "__main__" == __name__:
         print("\n" + "=" * 80)
         print("STEP 2: ALIGNMENT (starting from MISALIGNED geometry)")
         print("=" * 80)
-        alignmentDir.mkdir(exist_ok=True)
+        alignmentDir.mkdir(parents=True, exist_ok=True)
 
         detector_mis = getOpenDataDetector(misaligned=True)
         trackingGeometry_mis = detector_mis.trackingGeometry()
@@ -1403,7 +1426,7 @@ if "__main__" == __name__:
         print("STEP 3: RECONSTRUCTION WITH NOMINAL GEOMETRY")
         print("=" * 80)
         # detector_nom and trackingGeometry_nom already created in Step 1
-        reconDir_nom = reconstructionDir / "nominal"
+        reconDir_nom = target_subdir(reconstructionDir / "nominal")
         reconDir_nom.mkdir(parents=True, exist_ok=True)
 
         runReconstruction(
@@ -1422,7 +1445,7 @@ if "__main__" == __name__:
         print("\n" + "=" * 80)
         print("STEP 4: RECONSTRUCTION WITH MISALIGNED GEOMETRY")
         print("=" * 80)
-        reconDir_mis = reconstructionDir / "misaligned"
+        reconDir_mis = target_subdir(reconstructionDir / "misaligned")
         reconDir_mis.mkdir(parents=True, exist_ok=True)
 
         runReconstruction(
@@ -1441,7 +1464,7 @@ if "__main__" == __name__:
         print("\n" + "=" * 80)
         print("STEP 5: RECONSTRUCTION WITH ALIGNED GEOMETRY")
         print("=" * 80)
-        reconDir_ali = reconstructionDir / "aligned"
+        reconDir_ali = target_subdir(reconstructionDir / "aligned")
         reconDir_ali.mkdir(parents=True, exist_ok=True)
 
         runReconstruction(
@@ -1495,7 +1518,7 @@ if "__main__" == __name__:
             if args.output_dir
             else Path.cwd() / "alignment_output"
         )
-        outputDir.mkdir(exist_ok=True)
+        outputDir.mkdir(parents=True, exist_ok=True)
 
         if not inputDir.exists():
             print(f"Error: Input directory {inputDir} does not exist!")
@@ -1530,7 +1553,7 @@ if "__main__" == __name__:
             if args.output_dir
             else Path.cwd() / "reconstruction_output"
         )
-        outputDir=baseoutputDir /args.mode
+        outputDir = target_subdir(baseoutputDir / args.mode)
         outputDir.mkdir(parents=True, exist_ok=True)
 
         if not inputDir.exists():
@@ -1564,6 +1587,6 @@ if "__main__" == __name__:
         print("=" * 60)
         print(f"\nOutput files saved to: {outputDir}")
         print("\nGenerated files:")
-        print("  - trackstates_kf.root: Track states")
-        print("  - tracksummary_kf.root: Track summary")
-        print("  - performance_kf.root: Reconstruction performance")
+        print(f"  - {reconstruction_output_name('trackstates_kf', args.output_suffix)}: Track states")
+        print(f"  - {reconstruction_output_name('tracksummary_kf', args.output_suffix)}: Track summary")
+        print(f"  - {reconstruction_output_name('performance_kf', args.output_suffix)}: Reconstruction performance")

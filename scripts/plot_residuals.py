@@ -2,7 +2,10 @@ import uproot
 import awkward as ak
 import numpy as np
 import argparse
+import re
 from pathlib import Path
+
+from alignment_artifact_layout import TARGET_LAYERS, artifact_filename
 
 try:
     import ROOT
@@ -12,6 +15,8 @@ except ImportError:
     ROOT = None
 
 ROOT_COLORS = {"Nominal": ROOT.kBlue, "Aligned": ROOT.kGreen+2, "Misaligned": ROOT.kRed} if ROOT else {}
+
+DEFAULT_TRACKSTATES = artifact_filename("trackstates_kf", ".root")
 
 # ODD subsystem definitions: volume IDs, intrinsic resolutions [mm], and default plot ranges [mm]
 SUBSYSTEMS = {
@@ -31,6 +36,38 @@ SUBSYSTEMS = {
         "range_x": (-0.50, 0.50), "range_y": (-5.0, 5.0),
     },
 }
+
+
+def get_subsystem_config(volume_id):
+    for sub_cfg in SUBSYSTEMS.values():
+        if volume_id in sub_cfg["volumes"]:
+            return sub_cfg
+    raise ValueError(f"No subsystem configuration found for volume {volume_id}")
+
+
+def vol_lay_directory_name(file_name: str):
+    pairs = re.findall(r"v(\d+)_?l(\d+)", Path(file_name).name)
+    if not pairs:
+        raise ValueError(f"Cannot infer vol/lay directory from file name: {file_name}")
+    return "__".join(f"Vol{vol}_Lay{lay}" for vol, lay in pairs)
+
+
+def _trackstates_path(recon_dir: Path, mode: str, file_name: str):
+    path = Path(file_name)
+    if path.is_absolute():
+        return path
+    if len(path.parts) > 1:
+        return recon_dir / mode / path
+    return recon_dir / mode / vol_lay_directory_name(file_name) / file_name
+
+
+def comparison_files(recon_dir: Path, trackstates_name: str, aligned_trackstates=None):
+    aligned_name = aligned_trackstates or trackstates_name
+    return {
+        "Nominal": _trackstates_path(recon_dir, "nominal", trackstates_name),
+        "Aligned": _trackstates_path(recon_dir, "aligned", aligned_name),
+        "Misaligned": _trackstates_path(recon_dir, "misaligned", trackstates_name),
+    }
 
 
 def get_branch_data(file_path: Path, tree_name: str, branch_meas: str, branch_pred: str, vol_ids=None, lay_id=None):
@@ -103,7 +140,7 @@ def histograms(data_dict, base_dir, var_name, layer_tag="", units="mm", plot_ran
         label_suffix = f"-{output_label.upper()}" if output_label else ""
         stack_title = f"({var_name}_{file_suffix}) Comparison{label_suffix};Residual [{units}];Number of hits"
         hs = ROOT.THStack(f"hs_{var_name}", stack_title)
-        hists        = {}
+        hists = {}
         # fitted_funcs = {}
 
         for label, data in data_dict.items():
@@ -207,16 +244,16 @@ def histograms(data_dict, base_dir, var_name, layer_tag="", units="mm", plot_ran
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Save track residual distributions to ROOT files per ODD subsystem.")
+        description="Save track residual distributions to ROOT files for the configured ODD target layers.")
     parser.add_argument("--recon-dir", type=str, default="reconstruction_output",
                         help="Reconstruction output base directory")
     parser.add_argument("--residuals", nargs="+", default=["X", "Y"],
                         help="Residual axes to plot (X, Y, or both)")
     parser.add_argument("--range", type=float, nargs=2, default=None,
-                        help="Override plot range [mm]: min max. Default: per-subsystem from config.")
+                        help="Override plot range [mm]: min max. Default: per-target-layer subsystem config.")
     parser.add_argument("--bins", type=int, default=100, help="Number of histogram bins")
     parser.add_argument("--volume_id", type=int, default=None,
-                        help="Single Volume ID (manual mode, bypasses subsystem loop)")
+                        help="Single Volume ID (manual mode, bypasses default target-layer loop)")
     parser.add_argument("--layer_id", type=int, default=None, help="Layer ID filter")
     parser.add_argument("--odd-res-x", type=float, default=None,
                         help="ODD resolution in local X [mm] (manual mode only)")
@@ -240,15 +277,13 @@ def main():
     output_dir = Path(args.output_dir) if args.output_dir else base_dir
     tree_name  = "trackstates"
 
-    files = {
-        "Nominal":    base_dir / "nominal" / "trackstates_kf_v17l8_v24l4.root",
-        "Aligned":    base_dir / "aligned" / f"{args.aligned_trackstates}" if args.aligned_trackstates else base_dir / "aligned" / "trackstates_kf_v17l8_v24l4.root",
-        "Misaligned": base_dir / "misaligned" / "trackstates_kf_v17l8_v24l4.root",
-    }
+    files = comparison_files(
+        base_dir,
+        DEFAULT_TRACKSTATES,
+        aligned_trackstates=args.aligned_trackstates,
+    )
 
-    lay_suffix = f"_Lay{args.layer_id}" if args.layer_id is not None else ""
-
-    def _run_axis(axis, vol_ids, layer_tag, plot_range, odd_res):
+    def _run_axis(axis, vol_ids, lay_id, layer_tag, plot_range, odd_res):
         axis = axis.upper()
         if axis == "X":
             b_meas, b_pred, var_name = "l_x_hit", "t_eLOC0", "res_X"
@@ -264,7 +299,7 @@ def main():
         data_dict = {}
         for label, path in files.items():
             data = get_branch_data(path, tree_name, b_meas, b_pred,
-                                   vol_ids=vol_ids, lay_id=args.layer_id)
+                                   vol_ids=vol_ids, lay_id=lay_id)
             data_dict[label] = data
             if data is not None:
                 print(f"   - {label}: {len(data)} valid hits")
@@ -275,22 +310,23 @@ def main():
 
     if args.volume_id is not None:
         # ── Manual single-volume mode ─────────────────────────────────────
+        lay_suffix = f"_Lay{args.layer_id}" if args.layer_id is not None else ""
         layer_tag = f"Vol{args.volume_id}{lay_suffix}"
         print(f"==> Manual mode: Volume {args.volume_id}" +
               (f", Layer {args.layer_id}" if args.layer_id else ""))
         for axis in args.residuals:
             plot_range = tuple(args.range) if args.range else (-0.5, 0.5)
             odd_res = args.odd_res_x if axis.upper() == "X" else args.odd_res_y
-            _run_axis(axis, args.volume_id, layer_tag, plot_range, odd_res)
+            _run_axis(axis, args.volume_id, args.layer_id, layer_tag, plot_range, odd_res)
 
     else:
-        # ── Subsystem loop mode (Pixel / ShortStrip / LongStrip) ─────────
-        for subsystem_name, sub_cfg in SUBSYSTEMS.items():
-            vol_ids = sub_cfg["volumes"]
+        # ── Default target-layer mode ────────────────────────────────────
+        for vol_id, lay_id in TARGET_LAYERS:
+            sub_cfg = get_subsystem_config(vol_id)
             print(f"\n{'='*62}")
-            print(f"  Subsystem: {subsystem_name}   volumes: {vol_ids}")
+            print(f"  Target layer: Volume {vol_id}, Layer {lay_id}")
             print(f"{'='*62}")
-            layer_tag = subsystem_name + lay_suffix
+            layer_tag = f"Vol{vol_id}_Lay{lay_id}"
             for axis in args.residuals:
                 if axis.upper() == "X":
                     odd_res    = sub_cfg["res_x"]
@@ -298,7 +334,7 @@ def main():
                 else:
                     odd_res    = sub_cfg["res_y"]
                     plot_range = tuple(args.range) if args.range else sub_cfg["range_y"]
-                _run_axis(axis, vol_ids, layer_tag, plot_range, odd_res)
+                _run_axis(axis, vol_id, lay_id, layer_tag, plot_range, odd_res)
 
     print(f"\nAll tasks completed successfully!")
 
