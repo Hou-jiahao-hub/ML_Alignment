@@ -76,7 +76,7 @@ fi
 refute_grep "--alignment-solver" "$tmp_default"
 refute_grep "--solver" "$tmp_default"
 refute_grep "--gain" "$tmp_default"
-grep -Fq -- "--aligned-file $DIR/aligned_transforms_${TAG}_${SUF}_iter0.json" "$tmp_default"
+grep -Fq -- "--aligned-file $ALIGNMENT_ROOT/$DIR/aligned_transforms_${TAG}_${SUF}_iter0.json" "$tmp_default"
 grep -Fq -- "--output-suffix ${TAG}_${SUF}_iter0" "$tmp_default"
 grep -Fq -- "--aligned-trackstates trackstates_kf_${TAG}_${SUF}_iter0.root" "$tmp_default"
 
@@ -118,10 +118,10 @@ bash "$SCRIPT" \
   --summary "reconstruction_output/aligned/$DIR/tracksummary_kf_${TAG}_${SUF}_iter3.root" \
   > "$tmp_resume"
 
-grep -Fq -- "--input-geom alignment_output/$DIR/aligned_transforms_${TAG}_${SUF}_iter3.json" "$tmp_resume"
+grep -Fq -- "--input-geom $REPO_DIR/alignment_output/$DIR/aligned_transforms_${TAG}_${SUF}_iter3.json" "$tmp_resume"
 grep -Fq -- "--output-geom $ALIGNMENT_ROOT/$DIR/aligned_transforms_${TAG}_${SUF}_iter4.json" "$tmp_resume"
 grep -Fq -- "--active-dof $ACTIVE_DOF_ESC" "$tmp_resume"
-grep -Fq -- "--aligned-file $DIR/aligned_transforms_${TAG}_${SUF}_iter4.json" "$tmp_resume"
+grep -Fq -- "--aligned-file $ALIGNMENT_ROOT/$DIR/aligned_transforms_${TAG}_${SUF}_iter4.json" "$tmp_resume"
 grep -Fq -- "--states $RECONSTRUCTION_ROOT/aligned/$DIR/trackstates_kf_${TAG}_${SUF}_iter4.root" "$tmp_resume"
 grep -Fq -- "--summary $RECONSTRUCTION_ROOT/aligned/$DIR/tracksummary_kf_${TAG}_${SUF}_iter4.root" "$tmp_resume"
 grep -Fq -- "--output-geom $ALIGNMENT_ROOT/$DIR/aligned_transforms_${TAG}_${SUF}_iter5.json" "$tmp_resume"

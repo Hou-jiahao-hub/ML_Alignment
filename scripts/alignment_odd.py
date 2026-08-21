@@ -14,6 +14,7 @@ import acts.examples.alignment
 from acts.examples.alignment import AlignmentDecorator
 
 from alignment_artifact_layout import (
+    PROJECT_CONFIG,
     TARGET_LAYER_DIR,
     TARGET_LAYER_SUFFIX,
     artifact_filename,
@@ -21,9 +22,18 @@ from alignment_artifact_layout import (
     target_subdir,
     target_volume_map,
 )
-from project_config import add_config_argument
+from project_config import absolute_project_path, add_config_argument, resolve_project_path
 
 u = acts.UnitConstants
+
+
+def get_configured_open_data_detector(*, misaligned: bool):
+    from acts.examples.odd import getOpenDataDetector
+
+    return getOpenDataDetector(
+        misaligned=misaligned,
+        odd_dir=PROJECT_CONFIG.odd_root,
+    )
 
 
 def reconstruction_output_name(stem: str, output_suffix: str = "") -> str:
@@ -1038,13 +1048,7 @@ def runReconstruction(
         print("Running reconstruction with ALIGNED geometry...")
         print("=" * 60)
         if alignedFile is not None:
-            aligned_path = Path(alignedFile)
-            if aligned_path.is_absolute():
-                json_path = aligned_path
-            elif aligned_path.parts and aligned_path.parts[0] == TARGET_LAYER_DIR:
-                json_path = alignmentDir.parent / aligned_path
-            else:
-                json_path = alignmentDir / aligned_path
+            json_path = resolve_project_path(alignedFile)
         else:
             json_path = alignmentDir / artifact_filename("aligned_transforms", ".json")
         print(f"Loading aligned transforms from: {json_path}")
@@ -1255,19 +1259,19 @@ if "__main__" == __name__:
     )
     full_parser.add_argument(
         "--simulation-dir",
-        type=str,
+        type=absolute_project_path,
         default=None,
         help="Simulation output directory (default: simulation_output)",
     )
     full_parser.add_argument(
         "--alignment-dir",
-        type=str,
+        type=absolute_project_path,
         default=None,
         help="Alignment output directory (default: alignment_output)",
     )
     full_parser.add_argument(
         "--reconstruction-dir",
-        type=str,
+        type=absolute_project_path,
         default=None,
         help="Reconstruction output directory (default: reconstruction_output)",
     )
@@ -1279,7 +1283,7 @@ if "__main__" == __name__:
     )
     sim_parser.add_argument(
         "--output-dir",
-        type=str,
+        type=absolute_project_path,
         default=None,
         help="Output directory (default: simulation_output)",
     )
@@ -1291,13 +1295,13 @@ if "__main__" == __name__:
     )
     align_parser.add_argument(
         "--input-dir",
-        type=str,
+        type=absolute_project_path,
         default=None,
         help="Input directory (default: simulation_output)",
     )
     align_parser.add_argument(
         "--output-dir",
-        type=str,
+        type=absolute_project_path,
         default=None,
         help="Output directory (default: alignment_output)",
     )
@@ -1316,19 +1320,19 @@ if "__main__" == __name__:
     )
     recon_parser.add_argument(
         "--input-dir",
-        type=str,
+        type=absolute_project_path,
         default=None,
         help="Input directory (default: simulation_output)",
     )
     recon_parser.add_argument(
         "--output-dir",
-        type=str,
+        type=absolute_project_path,
         default=None,
         help="Output directory (default: reconstruction_output)",
     )
     recon_parser.add_argument(
         "--aligned-file",
-        type=str,
+        type=absolute_project_path,
         default=None,
         help="Path to aligned transforms JSON (for --mode aligned; overrides default path)",
     )
@@ -1345,13 +1349,8 @@ if "__main__" == __name__:
         parser.print_help()
         sys.exit(1)
 
-    srcdir = Path(__file__).resolve().parent.parent.parent.parent.parent
-
-    # OpenDataDetector
-    from acts.examples.odd import getOpenDataDetector
-
     # Setup common paths and detector
-    digiConfigFile = srcdir / "Examples/Configs/odd-digi-smearing-config.json"
+    digiConfigFile = PROJECT_CONFIG.odd_digi_config
     field = acts.ConstantBField(acts.Vector3(0, 0, 2 * u.T))
 
     # Execute commands
@@ -1386,7 +1385,7 @@ if "__main__" == __name__:
         print("\n" + "=" * 80)
         print("STEP 1: SIMULATION (using NOMINAL geometry)")
         print("=" * 80)
-        detector_nom = getOpenDataDetector(misaligned=False)
+        detector_nom = get_configured_open_data_detector(misaligned=False)
         trackingGeometry_nom = detector_nom.trackingGeometry()
 
         runSimulation(
@@ -1406,7 +1405,7 @@ if "__main__" == __name__:
         print("=" * 80)
         alignmentDir.mkdir(parents=True, exist_ok=True)
 
-        detector_mis = getOpenDataDetector(misaligned=True)
+        detector_mis = get_configured_open_data_detector(misaligned=True)
         trackingGeometry_mis = detector_mis.trackingGeometry()
 
         runAlignment(
@@ -1495,7 +1494,7 @@ if "__main__" == __name__:
             if args.output_dir
             else data_path("simulation_output")
         )
-        detector = getOpenDataDetector(misaligned=True)
+        detector = get_configured_open_data_detector(misaligned=True)
         trackingGeometry = detector.trackingGeometry()
 
         runSimulation(
@@ -1523,7 +1522,7 @@ if "__main__" == __name__:
             print("Please run simulation first to generate simulation data.")
             sys.exit(1)
 
-        detector = getOpenDataDetector(misaligned=True)
+        detector = get_configured_open_data_detector(misaligned=True)
         trackingGeometry = detector.trackingGeometry()
 
         runAlignment(
@@ -1561,9 +1560,9 @@ if "__main__" == __name__:
 
         # Choose detector based on mode
         if args.mode == "nominal":
-            detector = getOpenDataDetector(misaligned=False)
+            detector = get_configured_open_data_detector(misaligned=False)
         else:
-            detector = getOpenDataDetector(misaligned=True)
+            detector = get_configured_open_data_detector(misaligned=True)
 
         trackingGeometry = detector.trackingGeometry()
 

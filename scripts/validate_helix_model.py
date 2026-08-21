@@ -28,7 +28,7 @@ from alignment_artifact_layout import (
     reconstruction_root_path,
     target_layers_spec,
 )
-from project_config import add_config_argument
+from project_config import absolute_project_path, add_config_argument
 
 
 S_MAX = 1200.0
@@ -1516,10 +1516,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     add_config_argument(parser)
     defaults = HelixValidationConfig()
-    parser.add_argument("--states", default=defaults.states)
-    parser.add_argument("--geometry", default=defaults.geometry)
+    parser.add_argument("--states", type=absolute_project_path, default=defaults.states)
+    parser.add_argument("--geometry", type=absolute_project_path, default=defaults.geometry)
     parser.add_argument(
-        "--nominal-full-geometry", default=defaults.nominal_full_geometry
+        "--nominal-full-geometry", type=absolute_project_path, default=defaults.nominal_full_geometry
     )
     parser.add_argument("--holdout-layers", default=target_layers_spec())
     parser.add_argument("--min-fit-hits", type=int, default=defaults.min_fit_hits)
@@ -1534,7 +1534,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--gpu", action="store_true")
     parser.add_argument("--rng-seed", type=int, default=defaults.rng_seed)
-    parser.add_argument("--output-dir", default=defaults.output_dir)
+    parser.add_argument("--output-dir", type=absolute_project_path, default=defaults.output_dir)
     parser.add_argument(
         "--geometry-tolerance", type=float, default=defaults.geometry_tolerance
     )

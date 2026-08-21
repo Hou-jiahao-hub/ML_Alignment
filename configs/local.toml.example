@@ -1,6 +1,10 @@
 # Copy to configs/local.toml for machine-specific paths. The copied file is ignored.
 [project]
-data_root = "data"
+data_root = "/home/houjiahao/ML_Alignment/data"
+align_derivlib_root = "/home/houjiahao/ML_Alignment/AlignDerivLib"
 
 [acts]
 root = "/home/houjiahao/alignTest"
+
+[runtime]
+conda_setup = "/home/houjiahao/miniconda3/etc/profile.d/conda.sh"

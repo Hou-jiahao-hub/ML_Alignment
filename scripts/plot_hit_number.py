@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 from alignment_artifact_layout import TARGET_LAYER_DIR, TARGET_LAYER_SUFFIX, artifact_filename, data_path
-from project_config import add_config_argument
+from project_config import absolute_project_path, add_config_argument
 
 
 GEOMETRY_ORDER = ("Nominal", "Misaligned", "Aligned")
@@ -198,7 +198,7 @@ def plot_comparison(data_dict, output_path: Path, bins: int = 16, x_range=(6, 22
     print(f"saved: {output_path}")
 
 
-def main():
+def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Plot reconstructed hit number distributions for nominal, misaligned, and aligned geometries."
     )
@@ -206,6 +206,7 @@ def main():
     parser.add_argument(
         "-o",
         "--output",
+        type=absolute_project_path,
         default=str(data_path("reconstruction_output/hit_number") / TARGET_LAYER_DIR / f"hit_number_{TARGET_LAYER_SUFFIX}.png"),
         help="Path to output image file",
     )
@@ -225,7 +226,7 @@ def main():
     )
     parser.add_argument(
         "--recon-dir",
-        type=str,
+        type=absolute_project_path,
         default=str(data_path("reconstruction_output")),
         help="Reconstruction output base directory",
     )
@@ -237,10 +238,15 @@ def main():
     )
     parser.add_argument(
         "--aligned-tracksummary",
-        type=str,
+        type=absolute_project_path,
         default=None,
         help="Aligned tracksummary file name override, e.g. *_ml.root or *_global.root",
     )
+    return parser
+
+
+def main():
+    parser = build_argument_parser()
     args = parser.parse_args()
 
     if args.bins <= 0:

@@ -70,6 +70,37 @@ def test_add_align_derivlib_to_path_uses_current_python_extension_suffix(
     assert str(incompatible_dir) not in sys.path
 
 
+def test_default_align_derivlib_root_is_inside_repository():
+    ml_alignment = load_ml_alignment_module()
+    repository_root = Path(__file__).resolve().parents[1]
+
+    assert ml_alignment.align_derivlib_root() == repository_root / "AlignDerivLib"
+
+
+def test_alignment_cli_paths_are_anchored_to_repository(monkeypatch, tmp_path):
+    ml_alignment = load_ml_alignment_module()
+    repository_root = Path(__file__).resolve().parents[1]
+    monkeypatch.chdir(tmp_path)
+
+    args = ml_alignment.build_argument_parser().parse_args(
+        [
+            "--input-geom",
+            "inputs/current.json",
+            "--states",
+            "inputs/states.root",
+            "--summary",
+            "inputs/summary.root",
+            "--output-geom",
+            "outputs/aligned.json",
+        ]
+    )
+
+    assert args.input_geom == str(repository_root / "inputs" / "current.json")
+    assert args.states_root == str(repository_root / "inputs" / "states.root")
+    assert args.summary_root == str(repository_root / "inputs" / "summary.root")
+    assert args.output_geom == str(repository_root / "outputs" / "aligned.json")
+
+
 def test_per_layer_residual_diagnostics_prints_before_after_mean(capsys):
     ml_alignment = load_ml_alignment_module()
 

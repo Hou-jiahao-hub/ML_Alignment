@@ -70,6 +70,25 @@ def test_legacy_artifact_paths_resolve_inside_configured_data_root():
     assert layout.data_path(absolute) == absolute
 
 
+def test_shell_exports_include_absolute_runtime_dependency_paths():
+    layout = load_layout_module()
+    exports = dict(
+        line.split("=", maxsplit=1) for line in layout.shell_exports().splitlines()
+    )
+
+    expected = {
+        "ML_ALIGNMENT_REPOSITORY_ROOT": layout.PROJECT_CONFIG.repository_root,
+        "ML_ALIGNMENT_ALIGN_DERIVLIB_ROOT": layout.PROJECT_CONFIG.align_derivlib_root,
+        "ML_ALIGNMENT_ALIGN_DERIVLIB_BUILD_DIR": layout.PROJECT_CONFIG.align_derivlib_build_dir,
+        "ML_ALIGNMENT_ACTS_SETUP": layout.PROJECT_CONFIG.acts_setup,
+        "ML_ALIGNMENT_ODD_ROOT": layout.PROJECT_CONFIG.odd_root,
+        "ML_ALIGNMENT_ODD_MATERIAL_MAP": layout.PROJECT_CONFIG.odd_material_map,
+        "ML_ALIGNMENT_ACTS_DIGI_CONFIG": layout.PROJECT_CONFIG.odd_digi_config,
+        "ML_ALIGNMENT_CONDA_SETUP": layout.PROJECT_CONFIG.conda_setup,
+    }
+    assert {key: Path(exports[key]) for key in expected} == expected
+
+
 def test_layout_uses_effective_project_configuration(monkeypatch, tmp_path):
     config_path = tmp_path / "layers.toml"
     config_path.write_text(

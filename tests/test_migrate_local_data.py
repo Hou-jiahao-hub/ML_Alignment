@@ -82,3 +82,16 @@ def test_dry_run_does_not_create_destination(tmp_path):
 
     assert result["file_count"] == 4
     assert not destination.exists()
+
+
+def test_migration_cli_paths_are_anchored_to_repository(monkeypatch, tmp_path):
+    from migrate_local_data import build_argument_parser
+
+    repository_root = Path(__file__).resolve().parents[1]
+    monkeypatch.chdir(tmp_path)
+    args = build_argument_parser().parse_args(
+        ["--source", "legacy/job", "--destination", "data"]
+    )
+
+    assert args.source == str(repository_root / "legacy" / "job")
+    assert args.destination == str(repository_root / "data")

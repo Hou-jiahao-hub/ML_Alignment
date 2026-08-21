@@ -18,6 +18,19 @@ def load_plot_hit_number_module():
     return module
 
 
+def test_hit_plot_cli_paths_are_anchored_to_repository(monkeypatch, tmp_path):
+    module = load_plot_hit_number_module()
+    repository_root = Path(__file__).resolve().parents[1]
+    monkeypatch.chdir(tmp_path)
+
+    args = module.build_argument_parser().parse_args(
+        ["--output", "outputs/hits.png", "--recon-dir", "inputs/recon"]
+    )
+
+    assert args.output == str(repository_root / "outputs" / "hits.png")
+    assert args.recon_dir == str(repository_root / "inputs" / "recon")
+
+
 def test_load_hit_numbers_reads_nmeasurements(monkeypatch, tmp_path):
     plot_hit_number = load_plot_hit_number_module()
 

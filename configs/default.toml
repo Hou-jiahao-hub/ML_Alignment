@@ -1,8 +1,12 @@
 [project]
 data_root = "data"
+align_derivlib_root = "AlignDerivLib"
 
 [acts]
 root = "../alignTest"
+
+[runtime]
+conda_setup = "$HOME/miniconda3/etc/profile.d/conda.sh"
 
 [alignment]
 target_layers = ["17:8", "24:4"]

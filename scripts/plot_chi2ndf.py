@@ -11,7 +11,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from alignment_artifact_layout import TARGET_LAYER_DIR, artifact_filename, data_path
-from project_config import add_config_argument
+from project_config import absolute_project_path, add_config_argument
 
 
 GEOMETRY_ORDER = ("Nominal", "Aligned", "Misaligned")
@@ -233,23 +233,28 @@ def plot_comparison(data_dict, output_path: Path, bins: int = 100, display_xmax:
     print(f"saved: {output_path}")
 
 
-def main():
+def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Plot chi2/NDF comparison from nominal, aligned, and misaligned tracksummary ROOT files.")
     add_config_argument(parser)
-    parser.add_argument("-o", "--output", required=True,
+    parser.add_argument("-o", "--output", type=absolute_project_path, required=True,
                         help="Path to output image file (e.g. chi2ndf.png)")
     parser.add_argument("--bins",  type=int,   default=100,
                         help="Number of logarithmic histogram bins (default: 100)")
     parser.add_argument("--display-xmax", type=float, default=DEFAULT_DISPLAY_XMAX,
                         help="Optional override for the log x-axis upper bound "
                              "(default: largest positive value in the data)")
-    parser.add_argument("--recon-dir", type=str, default=str(data_path("reconstruction_output")),
+    parser.add_argument("--recon-dir", type=absolute_project_path, default=str(data_path("reconstruction_output")),
                         help="Reconstruction output base directory for comparison mode")
     parser.add_argument("--tracksummary-name", type=str, default=DEFAULT_TRACKSUMMARY,
                         help=f"Tracksummary file name for comparison mode (default: {DEFAULT_TRACKSUMMARY})")
-    parser.add_argument("--aligned-tracksummary", type=str, default=None,
+    parser.add_argument("--aligned-tracksummary", type=absolute_project_path, default=None,
                         help="Aligned tracksummary file name override for comparison mode")
+    return parser
+
+
+def main():
+    parser = build_argument_parser()
     args = parser.parse_args()
     
     output_dir = data_path("reconstruction_output/chi2_ndf") / TARGET_LAYER_DIR

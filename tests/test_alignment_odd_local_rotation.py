@@ -21,6 +21,31 @@ except ModuleNotFoundError:
 
 @unittest.skipUnless(acts is not None, "ACTS Python bindings are unavailable")
 class LocalRotationTest(unittest.TestCase):
+    def test_detector_factory_uses_configured_odd_root(self):
+        import alignment_odd
+
+        configured_root = Path("/tmp/configured-odd").resolve()
+        sentinel = object()
+        with (
+            patch.object(
+                alignment_odd,
+                "PROJECT_CONFIG",
+                type("Config", (), {"odd_root": configured_root})(),
+            ),
+            patch(
+                "acts.examples.odd.getOpenDataDetector", return_value=sentinel
+            ) as factory,
+        ):
+            detector = alignment_odd.get_configured_open_data_detector(
+                misaligned=True
+            )
+
+        self.assertIs(detector, sentinel)
+        factory.assert_called_once_with(
+            misaligned=True,
+            odd_dir=configured_root,
+        )
+
     def test_rz_is_applied_about_the_local_z_axis(self):
         import alignment_odd
 

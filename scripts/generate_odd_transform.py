@@ -1,14 +1,12 @@
 import json
 import numpy as np
-import os
 import math
 import acts
-from acts.examples.odd import getOpenDataDetector, getOpenDataDetectorDirectory
-import pathlib
+from acts.examples.odd import getOpenDataDetector
 import argparse
 
-from alignment_artifact_layout import data_path
-from project_config import add_config_argument
+from alignment_artifact_layout import PROJECT_CONFIG, data_path
+from project_config import absolute_project_path, add_config_argument
 
 def extract_euler_angles(R):
     sy = math.sqrt(R[0,0] * R[0,0] + R[1,0] * R[1,0])
@@ -36,25 +34,16 @@ def geoid_to_str(geo_id):
 def main():
     parser = argparse.ArgumentParser(description="Generate ODD transform data")
     add_config_argument(parser)
-    parser.add_argument("--material-config", type=str, default=None, 
+    parser.add_argument("--material-config", type=absolute_project_path, default=None,
                         help="Custom path to ODD material map file")
-    parser.add_argument("--digi-config", type=str, default=None,
-                        help="Custom path to ODD digi config file")
     args = parser.parse_args()
 
-    geoDir = getOpenDataDetectorDirectory()
-    actsDir = pathlib.Path(__file__).parent.parent.parent.parent
+    geoDir = PROJECT_CONFIG.odd_root
 
     oddMaterialMap = (
         args.material_config
         if args.material_config
-        else geoDir / "data/odd-material-maps.root"
-        )
-
-    oddDigiConfig = (
-        args.digi_config
-        if args.digi_config
-        else actsDir / "Examples/Configs/odd-digi-smearing-config.json"
+        else PROJECT_CONFIG.odd_material_map
         )
 
     oddMaterialDeco = acts.IMaterialDecorator.fromFile(oddMaterialMap)

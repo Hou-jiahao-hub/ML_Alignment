@@ -39,6 +39,27 @@ def test_validation_module_does_not_import_plotting_eagerly(monkeypatch):
     assert callable(module.run_helix_validation)
 
 
+def test_validation_cli_paths_are_anchored_to_repository(monkeypatch, tmp_path):
+    module = load_module()
+    repository_root = Path(__file__).resolve().parents[1]
+    monkeypatch.chdir(tmp_path)
+
+    args = module.build_argument_parser().parse_args(
+        [
+            "--states",
+            "inputs/states.root",
+            "--geometry",
+            "inputs/current.json",
+            "--output-dir",
+            "outputs/validation",
+        ]
+    )
+
+    assert args.states == str(repository_root / "inputs" / "states.root")
+    assert args.geometry == str(repository_root / "inputs" / "current.json")
+    assert args.output_dir == str(repository_root / "outputs" / "validation")
+
+
 def load_plot_module():
     module_path = Path(__file__).resolve().parents[1] / "scripts" / "helix_validation_plots.py"
     assert module_path.exists(), "helix_validation_plots.py has not been implemented"

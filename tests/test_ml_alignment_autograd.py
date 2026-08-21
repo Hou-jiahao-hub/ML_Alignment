@@ -78,6 +78,35 @@ def test_jacobian_update_interval_config_field_is_not_exposed():
     assert not hasattr(ml_alignment.AlignmentRunConfig(), "jacobian_update_interval")
 
 
+def test_autograd_cli_paths_are_anchored_to_repository(monkeypatch, tmp_path):
+    ml_alignment = load_ml_alignment_autograd_module()
+    repository_root = Path(__file__).resolve().parents[1]
+    monkeypatch.chdir(tmp_path)
+
+    args = ml_alignment.build_argument_parser().parse_args(
+        [
+            "--input-geom",
+            "inputs/current.json",
+            "--states",
+            "inputs/states.root",
+            "--summary",
+            "inputs/summary.root",
+            "--output-geom",
+            "outputs/aligned.json",
+            "--nominal-full-geom",
+            "inputs/nominal.json",
+        ]
+    )
+
+    assert args.input_geom == str(repository_root / "inputs" / "current.json")
+    assert args.states_root == str(repository_root / "inputs" / "states.root")
+    assert args.summary_root == str(repository_root / "inputs" / "summary.root")
+    assert args.output_geom == str(repository_root / "outputs" / "aligned.json")
+    assert args.nominal_full_geom == str(
+        repository_root / "inputs" / "nominal.json"
+    )
+
+
 def test_autograd_residual_gradient_matches_translation_and_gamma_reference():
     ml_alignment = load_ml_alignment_autograd_module()
 

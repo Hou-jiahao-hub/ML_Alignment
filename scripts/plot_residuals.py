@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 from alignment_artifact_layout import TARGET_LAYERS, artifact_filename, data_path
-from project_config import add_config_argument
+from project_config import absolute_project_path, add_config_argument
 
 try:
     import ROOT
@@ -243,11 +243,11 @@ def histograms(data_dict, base_dir, var_name, layer_tag="", units="mm", plot_ran
                 root_file[f"hist_{label.lower()}"] = (counts, bin_edges, f"{label};Residual [{units}];Hits")
 
 
-def main():
+def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Save track residual distributions to ROOT files for the configured ODD target layers.")
     add_config_argument(parser)
-    parser.add_argument("--recon-dir", type=str, default=str(data_path("reconstruction_output")),
+    parser.add_argument("--recon-dir", type=absolute_project_path, default=str(data_path("reconstruction_output")),
                         help="Reconstruction output base directory")
     parser.add_argument("--residuals", nargs="+", default=["X", "Y"],
                         help="Residual axes to plot (X, Y, or both)")
@@ -261,12 +261,18 @@ def main():
                         help="ODD resolution in local X [mm] (manual mode only)")
     parser.add_argument("--odd-res-y", type=float, default=None,
                         help="ODD resolution in local Y [mm] (manual mode only)")
-    parser.add_argument("--aligned-trackstates", type=str, default=None,
+    parser.add_argument("--aligned-trackstates", type=absolute_project_path, default=None,
                         help="Path to ML-aligned trackstates ROOT file (overrides default Aligned entry)")
     parser.add_argument("--label", type=str, default="",
                         help="Label appended to output file name and title (e.g. 'ml' → ml_res_X_..._comparison.root, title Comparison-ML)")
-    parser.add_argument("--output-dir", type=str, default=None,
+    parser.add_argument("--output-dir", type=absolute_project_path, default=None,
                         help="Directory to save output ROOT files (default: same as --recon-dir)")
+
+    return parser
+
+
+def main():
+    parser = build_argument_parser()
 
     args = parser.parse_args()
 

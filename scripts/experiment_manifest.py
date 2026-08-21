@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from project_config import ProjectConfig
+from project_config import ProjectConfig, resolve_project_path
 
 
 VALID_STATUSES = {"running", "completed", "failed"}
@@ -63,7 +63,7 @@ def write_experiment_manifest(
 
     input_records: dict[str, dict[str, Any]] = {}
     for name, value in inputs.items():
-        input_path = Path(value).expanduser().resolve()
+        input_path = resolve_project_path(value, base=config.repository_root)
         if not input_path.is_file():
             raise FileNotFoundError(f"manifest input not found: {input_path}")
         input_records[name] = {
@@ -73,7 +73,7 @@ def write_experiment_manifest(
         }
 
     output_records = {
-        name: str(Path(value).expanduser().resolve())
+        name: str(resolve_project_path(value, base=config.repository_root))
         for name, value in (outputs or {}).items()
     }
     manifest = {
@@ -91,7 +91,7 @@ def write_experiment_manifest(
         "metrics": dict(metrics or {}),
     }
 
-    destination_dir = Path(run_dir).expanduser().resolve()
+    destination_dir = resolve_project_path(run_dir, base=config.repository_root)
     destination_dir.mkdir(parents=True, exist_ok=True)
     destination = destination_dir / "manifest.json"
     with tempfile.NamedTemporaryFile(

@@ -28,7 +28,7 @@ from alignment_artifact_layout import (
     reconstruction_root_path,
     target_layers_spec,
 )
-from project_config import add_config_argument
+from project_config import absolute_project_path, add_config_argument
 
 
 PIXEL_VOLUMES = {16, 17, 18}
@@ -1037,19 +1037,19 @@ def build_parser() -> argparse.ArgumentParser:
     add_config_argument(parser)
     subparsers = parser.add_subparsers(dest="command", required=True)
     assess = subparsers.add_parser("assess", help="compare ACTS residual RMS to nominal")
-    assess.add_argument("--nominal-states", required=True)
-    assess.add_argument("--candidate-states", required=True)
+    assess.add_argument("--nominal-states", type=absolute_project_path, required=True)
+    assess.add_argument("--candidate-states", type=absolute_project_path, required=True)
     assess.add_argument("--target-layers", default=target_layers_spec())
     assess.add_argument("--max-ratio", type=float, default=1.2)
-    assess.add_argument("--output-summary", required=True)
+    assess.add_argument("--output-summary", type=absolute_project_path, required=True)
     assess.set_defaults(handler=run_assess)
 
     align = subparsers.add_parser("align", help="fit held-out helices and optimize geometry")
-    align.add_argument("--input-geometry", required=True)
-    align.add_argument("--states", required=True)
-    align.add_argument("--nominal-geometry", default=str(data_path("odd_transforms.json")))
-    align.add_argument("--output-geometry", required=True)
-    align.add_argument("--output-summary", required=True)
+    align.add_argument("--input-geometry", type=absolute_project_path, required=True)
+    align.add_argument("--states", type=absolute_project_path, required=True)
+    align.add_argument("--nominal-geometry", type=absolute_project_path, default=str(data_path("odd_transforms.json")))
+    align.add_argument("--output-geometry", type=absolute_project_path, required=True)
+    align.add_argument("--output-summary", type=absolute_project_path, required=True)
     align.add_argument("--target-layers", default=target_layers_spec())
     align.add_argument("--active-dof", default="0,1,5")
     align.add_argument("--min-fit-hits", type=int, default=6)

@@ -19,6 +19,30 @@ def load_module():
     return module
 
 
+def test_helix_cli_paths_are_anchored_to_repository(monkeypatch, tmp_path):
+    module = load_module()
+    repository_root = Path(__file__).resolve().parents[1]
+    monkeypatch.chdir(tmp_path)
+
+    args = module.build_parser().parse_args(
+        [
+            "assess",
+            "--nominal-states",
+            "inputs/nominal.root",
+            "--candidate-states",
+            "inputs/candidate.root",
+            "--output-summary",
+            "outputs/assessment.json",
+        ]
+    )
+
+    assert args.nominal_states == str(repository_root / "inputs" / "nominal.root")
+    assert args.candidate_states == str(repository_root / "inputs" / "candidate.root")
+    assert args.output_summary == str(
+        repository_root / "outputs" / "assessment.json"
+    )
+
+
 def test_short_strip_loc1_is_kept_with_physical_variance_floor():
     m = load_module()
     variance = torch.tensor([[0.01, 0.04]], dtype=torch.float64)

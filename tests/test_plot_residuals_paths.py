@@ -15,6 +15,19 @@ def load_plot_residuals_module():
     return module
 
 
+def test_residual_plot_cli_paths_are_anchored_to_repository(monkeypatch, tmp_path):
+    module = load_plot_residuals_module()
+    repository_root = Path(__file__).resolve().parents[1]
+    monkeypatch.chdir(tmp_path)
+
+    args = module.build_argument_parser().parse_args(
+        ["--recon-dir", "inputs/recon", "--output-dir", "outputs/residuals"]
+    )
+
+    assert args.recon_dir == str(repository_root / "inputs" / "recon")
+    assert args.output_dir == str(repository_root / "outputs" / "residuals")
+
+
 def test_vol_lay_directory_name_accepts_compact_and_underscored_suffixes():
     plot_residuals = load_plot_residuals_module()
 

@@ -20,6 +20,7 @@ ML_Alignment/
 ```
 
 The detailed component and data flow is in [docs/architecture.md](docs/architecture.md).
+The complete input/output contract is in [docs/io-paths.md](docs/io-paths.md).
 
 ## Environment setup
 
@@ -55,9 +56,13 @@ Defaults live in `configs/default.toml`:
 ```toml
 [project]
 data_root = "data"
+align_derivlib_root = "AlignDerivLib"
 
 [acts]
 root = "../alignTest"
+
+[runtime]
+conda_setup = "$HOME/miniconda3/etc/profile.d/conda.sh"
 
 [alignment]
 target_layers = ["17:8", "24:4"]
@@ -67,6 +72,13 @@ active_dof = [0, 1, 5]
 Use an ignored `configs/local.toml`, `ML_ALIGNMENT_CONFIG`, or `--config PATH`
 for an override. Target suffixes and output directory names are derived from
 `target_layers`; do not edit them separately.
+
+Configuration and CLI paths are converted to absolute paths relative to the
+repository root before use. Inspect the effective contract from any directory:
+
+```bash
+python scripts/path_inventory.py --json
+```
 
 ## Workflow
 

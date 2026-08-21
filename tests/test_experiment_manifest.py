@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 
 
 def test_manifest_records_reproducible_inputs_and_effective_configuration(tmp_path):
@@ -77,3 +78,34 @@ def test_manifest_rejects_unknown_status_and_missing_input(tmp_path):
         assert "missing.root" in str(error)
     else:
         raise AssertionError("missing manifest input was accepted")
+
+
+def test_manifest_relative_paths_use_configured_repository_root(monkeypatch, tmp_path):
+    from experiment_manifest import write_experiment_manifest
+    from project_config import load_project_config
+
+    repository_root = tmp_path / "repository"
+    input_path = repository_root / "inputs" / "states.root"
+    input_path.parent.mkdir(parents=True)
+    input_path.write_bytes(b"states")
+    config = replace(load_project_config(), repository_root=repository_root)
+    external_cwd = tmp_path / "caller"
+    external_cwd.mkdir()
+    monkeypatch.chdir(external_cwd)
+
+    manifest_path = write_experiment_manifest(
+        "runs/test",
+        run_id="test",
+        command=["python", "solver.py"],
+        config=config,
+        inputs={"states": "inputs/states.root"},
+        outputs={"geometry": "outputs/aligned.json"},
+        git_commit="abc123",
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert manifest_path == repository_root / "runs" / "test" / "manifest.json"
+    assert manifest["inputs"]["states"]["path"] == str(input_path)
+    assert manifest["outputs"]["geometry"] == str(
+        repository_root / "outputs" / "aligned.json"
+    )

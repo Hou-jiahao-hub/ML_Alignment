@@ -29,7 +29,7 @@ def activate_cli_config(argv: list[str] | None = None) -> Path | None:
             selected = argument.split("=", maxsplit=1)[1]
     if selected is None:
         return None
-    path = Path(selected).expanduser().resolve()
+    path = resolve_project_path(selected)
     os.environ["ML_ALIGNMENT_CONFIG"] = str(path)
     return path
 
@@ -49,6 +49,8 @@ class ProjectConfig:
     repository_root: Path
     data_root: Path
     acts_root: Path
+    align_derivlib_root: Path
+    conda_setup: Path
     target_layers: tuple[tuple[int, int], ...]
     active_dof: tuple[int, ...]
     source_path: Path
@@ -63,11 +65,38 @@ class ProjectConfig:
             f"Vol{volume}_Lay{layer}" for volume, layer in self.target_layers
         )
 
+    @property
+    def align_derivlib_build_dir(self) -> Path:
+        return self.align_derivlib_root / "build_pybind11"
+
+    @property
+    def acts_setup(self) -> Path:
+        return self.acts_root / "setup_acts.sh"
+
+    @property
+    def odd_root(self) -> Path:
+        return self.acts_root / "thirdparty" / "OpenDataDetector"
+
+    @property
+    def odd_material_map(self) -> Path:
+        return self.odd_root / "data" / "odd-material-maps.root"
+
+    @property
+    def odd_digi_config(self) -> Path:
+        return self.acts_root / "Examples" / "Configs" / "odd-digi-smearing-config.json"
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "repository_root": str(self.repository_root),
             "data_root": str(self.data_root),
             "acts_root": str(self.acts_root),
+            "align_derivlib_root": str(self.align_derivlib_root),
+            "align_derivlib_build_dir": str(self.align_derivlib_build_dir),
+            "acts_setup": str(self.acts_setup),
+            "odd_root": str(self.odd_root),
+            "odd_material_map": str(self.odd_material_map),
+            "odd_digi_config": str(self.odd_digi_config),
+            "conda_setup": str(self.conda_setup),
             "target_layers": [
                 f"{volume}:{layer}" for volume, layer in self.target_layers
             ],
@@ -93,12 +122,18 @@ def _merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def _resolve_project_path(value: str) -> Path:
-    expanded = os.path.expandvars(os.path.expanduser(value))
+def resolve_project_path(
+    value: str | Path, *, base: Path | None = None
+) -> Path:
+    expanded = os.path.expandvars(os.path.expanduser(str(value)))
     path = Path(expanded)
     if not path.is_absolute():
-        path = REPOSITORY_ROOT / path
+        path = (REPOSITORY_ROOT if base is None else Path(base)) / path
     return path.resolve()
+
+
+def absolute_project_path(value: str) -> str:
+    return str(resolve_project_path(value))
 
 
 def _parse_target_layers(values: list[str]) -> tuple[tuple[int, int], ...]:
@@ -140,11 +175,11 @@ def load_project_config(path: str | Path | None = None) -> ProjectConfig:
 
     selected_path: Path | None
     if path is not None:
-        selected_path = Path(path).expanduser().resolve()
+        selected_path = resolve_project_path(path)
     else:
         environment_path = os.environ.get("ML_ALIGNMENT_CONFIG")
         selected_path = (
-            Path(environment_path).expanduser().resolve()
+            resolve_project_path(environment_path)
             if environment_path
             else None
         )
@@ -156,11 +191,18 @@ def load_project_config(path: str | Path | None = None) -> ProjectConfig:
 
     project = data.get("project", {})
     acts = data.get("acts", {})
+    runtime = data.get("runtime", {})
     alignment = data.get("alignment", {})
     return ProjectConfig(
         repository_root=REPOSITORY_ROOT,
-        data_root=_resolve_project_path(project.get("data_root", "data")),
-        acts_root=_resolve_project_path(acts.get("root", "../alignTest")),
+        data_root=resolve_project_path(project.get("data_root", "data")),
+        acts_root=resolve_project_path(acts.get("root", "../alignTest")),
+        align_derivlib_root=resolve_project_path(
+            project.get("align_derivlib_root", "AlignDerivLib")
+        ),
+        conda_setup=resolve_project_path(
+            runtime.get("conda_setup", "$HOME/miniconda3/etc/profile.d/conda.sh")
+        ),
         target_layers=_parse_target_layers(alignment.get("target_layers", [])),
         active_dof=_parse_active_dof(alignment.get("active_dof", [])),
         source_path=source_path,

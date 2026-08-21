@@ -27,6 +27,7 @@ simulation -> ROOT/geometry JSON -> loaders -> solver -> aligned geometry
 | `validate_helix_model.py` | Holdout validation and acceptance gates | None |
 | `plot_*.py` | Residual, chi2/NDF, and hit diagnostics | ROOT/uproot |
 | `experiment_manifest.py` | Reproducibility metadata and input hashes | None |
+| `path_inventory.py` | Effective absolute input/output path contract | None |
 
 ## Configuration flow
 
@@ -40,6 +41,11 @@ Configuration is merged in this order, with the last source winning:
 Relative paths resolve from the repository root. A target layer such as `17:8`
 derives `v17l8` for filenames and `Vol17_Lay8` for directories. Consumers must
 not maintain separate copies of those values.
+
+Before I/O, both default and explicit CLI paths are normalized to absolute
+paths. Runtime dependency roots for ACTS, ODD, AlignDerivLib, and Conda use the
+same configuration boundary. `scripts/path_inventory.py --json` is the
+machine-readable source for the effective input/output contract.
 
 ## Data layout
 

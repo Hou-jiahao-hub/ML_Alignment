@@ -21,7 +21,7 @@ from alignment_artifact_layout import (
     reconstruction_root_path,
     target_layers_spec,
 )
-from project_config import add_config_argument
+from project_config import absolute_project_path, add_config_argument
 
 EPS_COVARIANCE = 1e-8
 EPS_WEIGHT = 1e-12
@@ -1893,17 +1893,17 @@ def build_argument_parser():
                     "Reads current geometry + reconstruction residuals → writes updated geometry."
     )
     add_config_argument(p)
-    p.add_argument("--input-geom", default=str(alignment_json_path("alignment_output", "misalignment_applied")),
+    p.add_argument("--input-geom", type=absolute_project_path, default=str(alignment_json_path("alignment_output", "misalignment_applied")),
                    help="Current geometry G_k (correction base; delta is composed onto it).")
-    p.add_argument("--states", dest="states_root",
+    p.add_argument("--states", dest="states_root", type=absolute_project_path,
                    default=str(reconstruction_root_path("reconstruction_output", "misaligned", "trackstates_kf")),
                    help="trackstates ROOT from reconstruction performed with G_k.")
-    p.add_argument("--summary", dest="summary_root",
+    p.add_argument("--summary", dest="summary_root", type=absolute_project_path,
                    default=str(reconstruction_root_path("reconstruction_output", "misaligned", "tracksummary_kf")),
                    help="tracksummary ROOT from reconstruction performed with G_k.")
-    p.add_argument("--output-geom", default=str(alignment_json_path("alignment_output", "aligned_transforms", stem_prefix="ml")),
+    p.add_argument("--output-geom", type=absolute_project_path, default=str(alignment_json_path("alignment_output", "aligned_transforms", stem_prefix="ml")),
                    help="Updated geometry G_{k+1} = G_k compose delta.")
-    p.add_argument("--nominal", dest="nominal_file", default=str(data_path("odd_transforms.json")),
+    p.add_argument("--nominal", dest="nominal_file", type=absolute_project_path, default=str(data_path("odd_transforms.json")),
                    help="Nominal/truth geometry for the convergence metric (|true|rms).")
     p.add_argument("--iter", dest="iter_label", default=None,
                    help="Iteration label for logging.")
@@ -1934,7 +1934,7 @@ def build_argument_parser():
     p.add_argument("--joint-lr-track", type=float, default=JOINT_LR_TRACK)
     p.add_argument("--joint-clamp-t", type=float, default=JOINT_CLAMP_T)
     p.add_argument("--joint-clamp-r", type=float, default=JOINT_CLAMP_R)
-    p.add_argument("--nominal-full-geom", default=str(data_path("odd_transforms.json")),
+    p.add_argument("--nominal-full-geom", type=absolute_project_path, default=str(data_path("odd_transforms.json")),
                    help="Full nominal geometry used to anchor non-target hits in free mode.")
     p.add_argument("--freeze-tracks", action="store_true",
                    help="Freeze seeded helices and optimize geometry only in free mode.")

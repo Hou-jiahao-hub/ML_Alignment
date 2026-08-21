@@ -20,6 +20,37 @@ def test_default_config_derives_consistent_artifact_names(monkeypatch):
     assert config.target_layer_dir == "Vol17_Lay8__Vol24_Lay4"
     assert config.data_root == config.repository_root / "data"
     assert config.acts_root == config.repository_root.parent / "alignTest"
+    assert config.align_derivlib_root == config.repository_root / "AlignDerivLib"
+    assert config.align_derivlib_build_dir == (
+        config.repository_root / "AlignDerivLib" / "build_pybind11"
+    )
+    assert config.acts_setup == config.acts_root / "setup_acts.sh"
+    assert config.odd_root == config.acts_root / "thirdparty" / "OpenDataDetector"
+    assert config.odd_material_map == (
+        config.odd_root / "data" / "odd-material-maps.root"
+    )
+    assert config.odd_digi_config == (
+        config.acts_root / "Examples" / "Configs" / "odd-digi-smearing-config.json"
+    )
+    assert config.conda_setup.is_absolute()
+
+
+def test_project_paths_are_absolute_and_independent_of_current_directory(
+    monkeypatch, tmp_path
+):
+    from project_config import REPOSITORY_ROOT, absolute_project_path, resolve_project_path
+
+    monkeypatch.chdir(tmp_path)
+
+    assert resolve_project_path("inputs/../geometry.json") == (
+        REPOSITORY_ROOT / "geometry.json"
+    )
+    assert absolute_project_path("outputs/result.json") == str(
+        REPOSITORY_ROOT / "outputs" / "result.json"
+    )
+    assert resolve_project_path("/tmp/a/../external.root") == Path(
+        "/tmp/external.root"
+    )
 
 
 def test_effective_active_dof_is_shared_by_both_solver_modules(monkeypatch):
@@ -48,9 +79,13 @@ def test_explicit_config_overrides_environment_and_resolves_from_repository(
         """
 [project]
 data_root = "local-data"
+align_derivlib_root = "native/AlignDerivLib"
 
 [acts]
 root = "/opt/acts"
+
+[runtime]
+conda_setup = "tools/conda.sh"
 
 [alignment]
 target_layers = ["7:8", "9:10"]
@@ -66,6 +101,10 @@ active_dof = [0, 5]
     assert config.active_dof == (0, 5)
     assert config.data_root == config.repository_root / "local-data"
     assert config.acts_root == Path("/opt/acts")
+    assert config.align_derivlib_root == (
+        config.repository_root / "native" / "AlignDerivLib"
+    )
+    assert config.conda_setup == config.repository_root / "tools" / "conda.sh"
 
 
 def test_cli_config_activation_supports_split_and_equals_forms(monkeypatch, tmp_path):

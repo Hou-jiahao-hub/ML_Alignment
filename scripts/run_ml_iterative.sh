@@ -67,8 +67,8 @@ INPUT_GEOM=""
 INPUT_STATES=""
 INPUT_SUMMARY=""
 
-ACTS_SETUP="$ML_ALIGNMENT_ACTS_ROOT/setup_acts.sh"
-CONDA_SH="$HOME/miniconda3/etc/profile.d/conda.sh"
+ACTS_SETUP="$ML_ALIGNMENT_ACTS_SETUP"
+CONDA_SH="$ML_ALIGNMENT_CONDA_SETUP"
 CONDA_ENV="pytorch"
 DRY_RUN=0
 PLOT_RESIDUALS=1
@@ -196,8 +196,11 @@ print_command() {
     printf '\n'
 }
 
-relative_to_alignment_output() {
-    realpath -m --relative-to="$ALIGNMENT_DIR" "$1"
+absolute_project_path() {
+    case "$1" in
+        /*) realpath -m "$1" ;;
+        *) realpath -m "$ML_ALIGNMENT_REPOSITORY_ROOT/$1" ;;
+    esac
 }
 
 require_file() {
@@ -213,6 +216,16 @@ with_target_dir() {
         printf '%s/%s\n' "$path" "$TARGET_LAYER_DIR"
     fi
 }
+
+ALIGNMENT_DIR="$(absolute_project_path "$ALIGNMENT_DIR")"
+SIMULATION_DIR="$(absolute_project_path "$SIMULATION_DIR")"
+RECONSTRUCTION_DIR="$(absolute_project_path "$RECONSTRUCTION_DIR")"
+LOG_DIR="$(absolute_project_path "$LOG_DIR")"
+ACTS_SETUP="$(absolute_project_path "$ACTS_SETUP")"
+CONDA_SH="$(absolute_project_path "$CONDA_SH")"
+[[ -z "$INPUT_GEOM" ]] || INPUT_GEOM="$(absolute_project_path "$INPUT_GEOM")"
+[[ -z "$INPUT_STATES" ]] || INPUT_STATES="$(absolute_project_path "$INPUT_STATES")"
+[[ -z "$INPUT_SUMMARY" ]] || INPUT_SUMMARY="$(absolute_project_path "$INPUT_SUMMARY")"
 
 run_conda() {
     local log_file="$1"
@@ -328,7 +341,7 @@ for ((offset=0; offset<ITERS; offset++)); do
     iter=$((START_ITER + offset))
     iter_label="${RUN_TAG}_ml_${SUFFIX}_iter${iter}"
     output_geom="$ALIGNMENT_TARGET_DIR/aligned_transforms_${iter_label}.json"
-    aligned_file_arg="$(relative_to_alignment_output "$output_geom")"
+    aligned_file_arg="$output_geom"
     aligned_trackstates="trackstates_kf_${iter_label}.root"
     aligned_summary="tracksummary_kf_${iter_label}.root"
     next_states="$ALIGNED_RECON_DIR/$aligned_trackstates"

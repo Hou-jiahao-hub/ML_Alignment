@@ -8,6 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import Iterable
 
+from project_config import absolute_project_path
+
 
 MIGRATION_MAP = (
     ("odd_transforms.json", "geometry/odd_transforms.json"),
@@ -152,16 +154,27 @@ def migrate_local_data(
     return inventory
 
 
-def main() -> int:
+def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Copy detector-alignment artifacts without deleting or overwriting sources."
     )
-    parser.add_argument("--source", required=True, help="Former ACTS job directory")
-    parser.add_argument("--destination", required=True, help="ML_Alignment data directory")
+    parser.add_argument(
+        "--source", type=absolute_project_path, required=True,
+        help="Former ACTS job directory",
+    )
+    parser.add_argument(
+        "--destination", type=absolute_project_path, required=True,
+        help="ML_Alignment data directory",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Inventory only; write nothing")
     parser.add_argument(
         "--verify-only", action="store_true", help="Verify an existing migration"
     )
+    return parser
+
+
+def main() -> int:
+    parser = build_argument_parser()
     args = parser.parse_args()
 
     if args.dry_run and args.verify_only:

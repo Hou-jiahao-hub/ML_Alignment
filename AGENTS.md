@@ -27,6 +27,8 @@ Do not repeat an experiment without explaining what changed in its assumptions.
 - Versioned defaults: `configs/default.toml`.
 - Machine override: `configs/local.toml` or `ML_ALIGNMENT_CONFIG`.
 - CLI overrides use `--config PATH`.
+- Relative configuration and CLI paths resolve from the repository root; use
+  `python scripts/path_inventory.py --json` to inspect effective absolute paths.
 - Target directory and suffix are derived from `alignment.target_layers`; never
   hard-code them in another module.
 - Large artifacts belong below `data/` and must not be committed.

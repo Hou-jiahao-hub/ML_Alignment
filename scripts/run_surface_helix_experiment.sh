@@ -40,8 +40,8 @@ INPUT_GEOM=""
 INPUT_STATES=""
 INPUT_SUMMARY=""
 NOMINAL_STATES=""
-ACTS_SETUP="$ML_ALIGNMENT_ACTS_ROOT/setup_acts.sh"
-CONDA_SH="$HOME/miniconda3/etc/profile.d/conda.sh"
+ACTS_SETUP="$ML_ALIGNMENT_ACTS_SETUP"
+CONDA_SH="$ML_ALIGNMENT_CONDA_SETUP"
 CONDA_ENV="pytorch"
 DRY_RUN=0
 
@@ -118,6 +118,24 @@ with_target_dir() {
     else printf '%s/%s\n' "$1" "$TARGET_LAYER_DIR"; fi
 }
 
+absolute_project_path() {
+    case "$1" in
+        /*) realpath -m "$1" ;;
+        *) realpath -m "$ML_ALIGNMENT_REPOSITORY_ROOT/$1" ;;
+    esac
+}
+
+ALIGNMENT_DIR="$(absolute_project_path "$ALIGNMENT_DIR")"
+SIMULATION_DIR="$(absolute_project_path "$SIMULATION_DIR")"
+RECONSTRUCTION_DIR="$(absolute_project_path "$RECONSTRUCTION_DIR")"
+LOG_DIR="$(absolute_project_path "$LOG_DIR")"
+ACTS_SETUP="$(absolute_project_path "$ACTS_SETUP")"
+CONDA_SH="$(absolute_project_path "$CONDA_SH")"
+[[ -z "$INPUT_GEOM" ]] || INPUT_GEOM="$(absolute_project_path "$INPUT_GEOM")"
+[[ -z "$INPUT_STATES" ]] || INPUT_STATES="$(absolute_project_path "$INPUT_STATES")"
+[[ -z "$INPUT_SUMMARY" ]] || INPUT_SUMMARY="$(absolute_project_path "$INPUT_SUMMARY")"
+[[ -z "$NOMINAL_STATES" ]] || NOMINAL_STATES="$(absolute_project_path "$NOMINAL_STATES")"
+
 ALIGNMENT_TARGET_DIR="$(with_target_dir "$ALIGNMENT_DIR")"
 NOMINAL_RECON_DIR="$(with_target_dir "$RECONSTRUCTION_DIR/nominal")"
 MISALIGNED_RECON_DIR="$(with_target_dir "$RECONSTRUCTION_DIR/misaligned")"
@@ -152,7 +170,6 @@ run_acts() {
     ) > "$log_file" 2>&1
 }
 
-relative_to_alignment_output() { realpath -m --relative-to="$ALIGNMENT_DIR" "$1"; }
 require_file() { [[ -f "$1" ]] || die "missing required file: $1"; }
 
 echo "surface relative tolerance : $SURFACE_REL_TOL"
@@ -207,7 +224,7 @@ for ((iteration=0; iteration<MAX_SURFACE_ITERS; iteration++)); do
     )
     run_conda "$surface_log" "${surface_cmd[@]}"
 
-    aligned_arg="$(relative_to_alignment_output "$output_geom")"
+    aligned_arg="$output_geom"
     recon_cmd=(
         python alignment_odd.py reconstruction --mode aligned --num-events "$EVENTS"
         --input-dir "$SIMULATION_DIR" --output-dir "$RECONSTRUCTION_DIR"
@@ -268,7 +285,7 @@ helix_states="$ALIGNED_RECON_DIR/trackstates_kf_${helix_label}.root"
 helix_recon_cmd=(
     python alignment_odd.py reconstruction --mode aligned --num-events "$EVENTS"
     --input-dir "$SIMULATION_DIR" --output-dir "$RECONSTRUCTION_DIR"
-    --aligned-file "$(relative_to_alignment_output "$helix_geometry")" --output-suffix "$helix_label"
+    --aligned-file "$helix_geometry" --output-suffix "$helix_label"
 )
 run_acts "$RUN_LOG_DIR/recon_${helix_label}.log" "${helix_recon_cmd[@]}"
 

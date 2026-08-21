@@ -4,7 +4,7 @@ import argparse
 import shlex
 from pathlib import Path
 
-from project_config import activate_cli_config, load_project_config
+from project_config import activate_cli_config, load_project_config, resolve_project_path
 
 
 activate_cli_config()
@@ -31,12 +31,12 @@ _LEGACY_DATA_ROOTS = {
 def data_path(value: str | Path) -> Path:
     path = Path(value).expanduser()
     if path.is_absolute():
-        return path
+        return resolve_project_path(path)
     if path == Path("odd_transforms.json"):
         return DATA_ROOT / "geometry" / path.name
     if path.parts and path.parts[0] in _LEGACY_DATA_ROOTS:
         return _LEGACY_DATA_ROOTS[path.parts[0]].joinpath(*path.parts[1:])
-    return PROJECT_CONFIG.repository_root / path
+    return resolve_project_path(path)
 
 
 def target_layers_spec(target_layers: tuple[tuple[int, int], ...] = TARGET_LAYERS) -> str:
@@ -120,8 +120,18 @@ def iteration_label(run_tag: str, iteration: int) -> str:
 
 def shell_exports() -> str:
     values = {
+        "ML_ALIGNMENT_REPOSITORY_ROOT": str(PROJECT_CONFIG.repository_root),
         "ML_ALIGNMENT_DATA_ROOT": str(DATA_ROOT),
         "ML_ALIGNMENT_ACTS_ROOT": str(ACTS_ROOT),
+        "ML_ALIGNMENT_ALIGN_DERIVLIB_ROOT": str(PROJECT_CONFIG.align_derivlib_root),
+        "ML_ALIGNMENT_ALIGN_DERIVLIB_BUILD_DIR": str(
+            PROJECT_CONFIG.align_derivlib_build_dir
+        ),
+        "ML_ALIGNMENT_ACTS_SETUP": str(PROJECT_CONFIG.acts_setup),
+        "ML_ALIGNMENT_ODD_ROOT": str(PROJECT_CONFIG.odd_root),
+        "ML_ALIGNMENT_ODD_MATERIAL_MAP": str(PROJECT_CONFIG.odd_material_map),
+        "ML_ALIGNMENT_ACTS_DIGI_CONFIG": str(PROJECT_CONFIG.odd_digi_config),
+        "ML_ALIGNMENT_CONDA_SETUP": str(PROJECT_CONFIG.conda_setup),
         "ALIGNMENT_ROOT": str(DATA_ROOT / "alignment"),
         "RECONSTRUCTION_ROOT": str(DATA_ROOT / "reconstruction"),
         "SIMULATION_ROOT": str(DATA_ROOT / "simulation"),

@@ -19,6 +19,19 @@ def load_plot_chi2ndf_module():
     return module
 
 
+def test_chi2_plot_cli_paths_are_anchored_to_repository(monkeypatch, tmp_path):
+    module = load_plot_chi2ndf_module()
+    repository_root = Path(__file__).resolve().parents[1]
+    monkeypatch.chdir(tmp_path)
+
+    args = module.build_argument_parser().parse_args(
+        ["--output", "outputs/chi2.png", "--recon-dir", "inputs/recon"]
+    )
+
+    assert args.output == str(repository_root / "outputs" / "chi2.png")
+    assert args.recon_dir == str(repository_root / "inputs" / "recon")
+
+
 def test_chi2_ndf_values_drop_non_positive_ndf(capsys):
     plot_chi2ndf = load_plot_chi2ndf_module()
 

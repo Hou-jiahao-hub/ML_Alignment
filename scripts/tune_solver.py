@@ -2,15 +2,15 @@
 report, per target layer, the correlation of the SOLVED delta with the true per-sensor
 misalignment.  Goal: lift corr from ~0.003 back toward the raw-residual level (~0.19)
 by not rejecting genuine-signal hits as outliers."""
-import os, re, json, sys
+import re, json
 import numpy as np
 import torch
 
 from alignment_artifact_layout import alignment_json_path, data_path, reconstruction_root_path
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "../../../../AlignDerivLib/build_pybind11"))
 import ml_alignment as M
+
+M.add_align_derivlib_to_path()
 
 INPUT_GEOM = str(alignment_json_path("alignment_output", "loop_geom_0"))
 STATES = str(reconstruction_root_path("reconstruction_output", "misaligned", "trackstates_kf"))
