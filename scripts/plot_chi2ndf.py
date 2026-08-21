@@ -10,7 +10,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from alignment_artifact_layout import TARGET_LAYER_DIR, artifact_filename
+from alignment_artifact_layout import TARGET_LAYER_DIR, artifact_filename, data_path
+from project_config import add_config_argument
 
 
 GEOMETRY_ORDER = ("Nominal", "Aligned", "Misaligned")
@@ -235,6 +236,7 @@ def plot_comparison(data_dict, output_path: Path, bins: int = 100, display_xmax:
 def main():
     parser = argparse.ArgumentParser(
         description="Plot chi2/NDF comparison from nominal, aligned, and misaligned tracksummary ROOT files.")
+    add_config_argument(parser)
     parser.add_argument("-o", "--output", required=True,
                         help="Path to output image file (e.g. chi2ndf.png)")
     parser.add_argument("--bins",  type=int,   default=100,
@@ -242,7 +244,7 @@ def main():
     parser.add_argument("--display-xmax", type=float, default=DEFAULT_DISPLAY_XMAX,
                         help="Optional override for the log x-axis upper bound "
                              "(default: largest positive value in the data)")
-    parser.add_argument("--recon-dir", type=str, default="reconstruction_output",
+    parser.add_argument("--recon-dir", type=str, default=str(data_path("reconstruction_output")),
                         help="Reconstruction output base directory for comparison mode")
     parser.add_argument("--tracksummary-name", type=str, default=DEFAULT_TRACKSUMMARY,
                         help=f"Tracksummary file name for comparison mode (default: {DEFAULT_TRACKSUMMARY})")
@@ -250,7 +252,7 @@ def main():
                         help="Aligned tracksummary file name override for comparison mode")
     args = parser.parse_args()
     
-    output_dir = Path("reconstruction_output/chi2_ndf") / TARGET_LAYER_DIR
+    output_dir = data_path("reconstruction_output/chi2_ndf") / TARGET_LAYER_DIR
     output_path = output_dir / Path(args.output)
 
     if args.bins <= 0:

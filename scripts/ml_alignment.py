@@ -17,11 +17,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from alignment_artifact_layout import (
+    ACTIVE_DOF as CONFIG_ACTIVE_DOF,
     TARGET_LAYERS,
     alignment_json_path,
+    data_path,
     reconstruction_root_path,
     target_layers_spec,
 )
+from project_config import add_config_argument
 
 EPS_COVARIANCE = 1e-8
 EPS_WEIGHT = 1e-12
@@ -31,7 +34,7 @@ FULL_MATRIX_TOLERANCE = 1e-4
 STRIP_VOLUMES = {23, 24, 25}
 STRIP_Y_FLOOR = 1.44  # (1.2 mm)^2
 DEFAULT_TARGET_LAYERS = TARGET_LAYERS
-DEFAULT_ACTIVE_DOF = (0, 1, 3, 4, 5)
+DEFAULT_ACTIVE_DOF = CONFIG_ACTIVE_DOF
 DEFAULT_EPOCHS = 300
 DEFAULT_JACOBIAN_UPDATE_INTERVAL = 20
 DEFAULT_LAMBDA_L2 = 1e-5
@@ -91,7 +94,7 @@ class AlignmentRunConfig:
             stem_prefix="ml",
         )
     )
-    nominal_file: str = "odd_transforms.json"
+    nominal_file: str = str(data_path("odd_transforms.json"))
     iter_label: str | None = None
     make_plot: bool = True
     active_dof: tuple[int, ...] | str = DEFAULT_ACTIVE_DOF
@@ -1117,6 +1120,7 @@ if __name__ == "__main__":
         description="ML alignment solver (Adam neural-network optimizer). "
                     "Reads current geometry + reconstruction residuals → writes updated geometry."
     )
+    add_config_argument(p)
     p.add_argument("--input-geom", default=str(alignment_json_path("alignment_output", "misalignment_applied")),
                    help="Current geometry G_k (correction base; delta is composed onto it).")
     p.add_argument("--states", dest="states_root",
@@ -1127,7 +1131,7 @@ if __name__ == "__main__":
                    help="tracksummary ROOT from reconstruction performed with G_k.")
     p.add_argument("--output-geom", default=str(alignment_json_path("alignment_output", "aligned_transforms", stem_prefix="ml")),
                    help="Updated geometry G_{k+1} = G_k compose delta.")
-    p.add_argument("--nominal", dest="nominal_file", default="odd_transforms.json",
+    p.add_argument("--nominal", dest="nominal_file", default=str(data_path("odd_transforms.json")),
                    help="Nominal/truth geometry for the convergence metric (|true|rms).")
     p.add_argument("--iter", dest="iter_label", default=None,
                    help="Iteration label for logging.")

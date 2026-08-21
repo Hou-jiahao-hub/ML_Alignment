@@ -5,7 +5,8 @@ import argparse
 import re
 from pathlib import Path
 
-from alignment_artifact_layout import TARGET_LAYERS, artifact_filename
+from alignment_artifact_layout import TARGET_LAYERS, artifact_filename, data_path
+from project_config import add_config_argument
 
 try:
     import ROOT
@@ -245,7 +246,8 @@ def histograms(data_dict, base_dir, var_name, layer_tag="", units="mm", plot_ran
 def main():
     parser = argparse.ArgumentParser(
         description="Save track residual distributions to ROOT files for the configured ODD target layers.")
-    parser.add_argument("--recon-dir", type=str, default="reconstruction_output",
+    add_config_argument(parser)
+    parser.add_argument("--recon-dir", type=str, default=str(data_path("reconstruction_output")),
                         help="Reconstruction output base directory")
     parser.add_argument("--residuals", nargs="+", default=["X", "Y"],
                         help="Residual axes to plot (X, Y, or both)")

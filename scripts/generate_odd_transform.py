@@ -7,6 +7,9 @@ from acts.examples.odd import getOpenDataDetector, getOpenDataDetectorDirectory
 import pathlib
 import argparse
 
+from alignment_artifact_layout import data_path
+from project_config import add_config_argument
+
 def extract_euler_angles(R):
     sy = math.sqrt(R[0,0] * R[0,0] + R[1,0] * R[1,0])
     singular = sy < 1e-6
@@ -32,6 +35,7 @@ def geoid_to_str(geo_id):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate ODD transform data")
+    add_config_argument(parser)
     parser.add_argument("--material-config", type=str, default=None, 
                         help="Custom path to ODD material map file")
     parser.add_argument("--digi-config", type=str, default=None,
@@ -107,7 +111,8 @@ def main():
                 "FullMatrix": full_matrix.tolist()
                 })
     
-    output_filename = "odd_transforms.json"
+    output_filename = data_path("odd_transforms.json")
+    output_filename.parent.mkdir(parents=True, exist_ok=True)
     with open(output_filename, "w")as f:
         json.dump(transform_data, f, indent=2)
 

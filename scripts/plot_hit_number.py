@@ -21,7 +21,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-from alignment_artifact_layout import TARGET_LAYER_DIR, TARGET_LAYER_SUFFIX, artifact_filename
+from alignment_artifact_layout import TARGET_LAYER_DIR, TARGET_LAYER_SUFFIX, artifact_filename, data_path
+from project_config import add_config_argument
 
 
 GEOMETRY_ORDER = ("Nominal", "Misaligned", "Aligned")
@@ -201,10 +202,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Plot reconstructed hit number distributions for nominal, misaligned, and aligned geometries."
     )
+    add_config_argument(parser)
     parser.add_argument(
         "-o",
         "--output",
-        default=f"reconstruction_output/hit_number/{TARGET_LAYER_DIR}/hit_number_{TARGET_LAYER_SUFFIX}.png",
+        default=str(data_path("reconstruction_output/hit_number") / TARGET_LAYER_DIR / f"hit_number_{TARGET_LAYER_SUFFIX}.png"),
         help="Path to output image file",
     )
     parser.add_argument("--bins", type=int, default=16, help="Number of histogram bins")
@@ -224,7 +226,7 @@ def main():
     parser.add_argument(
         "--recon-dir",
         type=str,
-        default="reconstruction_output",
+        default=str(data_path("reconstruction_output")),
         help="Reconstruction output base directory",
     )
     parser.add_argument(

@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ml-alignment"
+version = "0.1.0"
+description = "Detector alignment algorithms with an optional ACTS integration layer"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "awkward>=2.6",
+  "matplotlib>=3.8",
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "scipy>=1.11",
+  "tomli>=2.0; python_version < '3.11'",
+  "torch>=2.1",
+  "uproot>=5.3",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-timeout>=2.3"]
+bindings = ["cmake>=3.20", "ninja>=1.11", "pybind11>=2.12"]
+
+[tool.setuptools]
+py-modules = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -m 'not root_io'"
+markers = [
+  "acts: requires an activated ACTS/LCG runtime",
+  "root_io: exercises ROOT I/O and may expose environment-specific fsspec/uproot stalls",
+  "slow: numerical optimization regression that is unsuitable for a quick smoke run",
+]

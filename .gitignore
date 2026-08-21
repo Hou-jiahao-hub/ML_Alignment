@@ -1,13 +1,19 @@
 # Build artifacts
+build/
 AlignDerivLib/build/
 AlignDerivLib/build_pybind11/
 install/
 __pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
 *.pyc
 *.pyo
 
 # Large output / log files
 *.log
+data/*
+!data/README.md
 alignment_output/
 reconstruction_output/
 simulation_output/
@@ -17,6 +23,9 @@ ml_align_log*.txt
 
 # Large data files
 odd_transforms.json
+
+# Machine-local project configuration
+configs/local.toml
 
 # Editor temporaries
 *.swp

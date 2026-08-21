@@ -14,39 +14,44 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from alignment_artifact_layout import (
+    ACTIVE_DOF as CONFIG_ACTIVE_DOF,
     TARGET_LAYERS,
     alignment_json_path,
+    data_path,
     reconstruction_root_path,
     target_layers_spec,
 )
+from project_config import add_config_argument
 
 EPS_COVARIANCE = 1e-8
 EPS_WEIGHT = 1e-12
-MIN_HIT_ERROR = 1e-4
 EPS_DIRECTION_NORM = 1e-9
 FULL_MATRIX_TOLERANCE = 1e-4
 STRIP_VOLUMES = {23, 24, 25}
 STRIP_Y_FLOOR = 1.44  # (1.2 mm)^2
 DEFAULT_TARGET_LAYERS = TARGET_LAYERS
-DEFAULT_ACTIVE_DOF = (0, 1, 3, 4, 5)
+# Shared by both track modes.  tz is excluded (never injected and poorly
+# constrained by a planar residual); rz must stay in -- it is the only
+# rotation the current misalignment actually produces.
+DEFAULT_ACTIVE_DOF = CONFIG_ACTIVE_DOF
 DEFAULT_EPOCHS = 300
-DEFAULT_JACOBIAN_UPDATE_INTERVAL = 20
 DEFAULT_LAMBDA_L2 = 1e-5
 DEFAULT_ADAM_LR = 1e-2
 DEFAULT_ADAM_ETA_MIN = 1e-5
 ADAM_CLAMP_T = 1.5
 ADAM_CLAMP_R = 0.05
-RHO_EPS = 1e-8
 PLANE_PARALLEL_EPS = 1e-6
 PLANE_RESIDUAL_TOLERANCE = 1e-3
 S_MAX = 1200.0
 JOINT_ITERS = 1000
 JOINT_LR_TRANS = 1e-2
-JOINT_LR_ROT = JOINT_LR_TRANS / 15.0
 JOINT_LR_TRACK = 3e-2
 JOINT_CLAMP_T = 1.5
 JOINT_CLAMP_R = 0.05
-JOINT_DEFAULT_ACTIVE_DOF = (0, 1, 3, 4)
+JOINT_CHECKPOINT_INTERVAL = 10
+JOINT_PATIENCE = 200
+# EXPERIMENTAL: hit-quality weighting is temporarily disabled; no caller sets
+# use_hit_weights=True.  Kept so the experiment can be restarted.
 HIT_WEIGHT_FLOOR = 0.3
 HIT_QUALITY_INPUT_SIZE = 9
 HIT_QUALITY_HIDDEN_ONE = 32
@@ -58,6 +63,7 @@ class AlignmentInputs:
     hit_sensor_ids: torch.Tensor
     initial_residuals: torch.Tensor
     covariances: torch.Tensor
+    # EXPERIMENTAL: consumed only by the disabled hit-quality network.
     track_params: torch.Tensor
     track_chi2_ndf: torch.Tensor
     hit_global_positions: torch.Tensor
@@ -70,8 +76,9 @@ class AlignmentInputs:
     hit_track_ids: torch.Tensor
     measured_local: torch.Tensor | None = None
     loc1_valid: torch.Tensor | None = None
+    # Measurement variance BEFORE the STRIP_Y_FLOOR clip is applied; kept as an
+    # observable diagnostic and pinned by the ROOT loader contract test.
     raw_covariances: torch.Tensor | None = None
-    hit_order_key: torch.Tensor | None = None
     merged_df: pd.DataFrame | None = field(default=None, repr=False)
 
 
@@ -125,14 +132,13 @@ class AlignmentRunConfig:
             stem_prefix="ml",
         )
     )
-    nominal_file: str = "odd_transforms.json"
+    nominal_file: str = str(data_path("odd_transforms.json"))
     iter_label: str | None = None
     make_plot: bool = True
     active_dof: tuple[int, ...] | str | None = None
     target_layers: tuple[tuple[int, int], ...] | str = DEFAULT_TARGET_LAYERS
     fix_reference: bool = True
     epochs: int = DEFAULT_EPOCHS
-    jacobian_update_interval: int = DEFAULT_JACOBIAN_UPDATE_INTERVAL
     lambda_l2: float = DEFAULT_LAMBDA_L2
     track_mode: str = "surface"
     joint_iters: int = JOINT_ITERS
@@ -146,8 +152,63 @@ class AlignmentRunConfig:
     joint_lr_track: float = JOINT_LR_TRACK
     joint_clamp_t: float = JOINT_CLAMP_T
     joint_clamp_r: float = JOINT_CLAMP_R
-    nominal_full_geom: str = "odd_transforms.json"
+    nominal_full_geom: str = str(data_path("odd_transforms.json"))
     freeze_tracks: bool = False
+    joint_checkpoint_interval: int = JOINT_CHECKPOINT_INTERVAL
+    joint_patience: int = JOINT_PATIENCE
+    joint_min_delta: float = 0.0
+    joint_max_invalid_fraction: float = 0.05
+
+
+class JointBestCheckpoint:
+    """Track and restore the lowest evaluated joint objective."""
+
+    def __init__(self, parameters, patience=0, min_delta=0.0):
+        self.parameters = tuple(parameters)
+        self.patience = int(patience)
+        self.min_delta = float(min_delta)
+        self.best_loss = float("inf")
+        self.best_iteration = -1
+        self._state = None
+
+    def observe(self, loss, iteration):
+        loss = float(loss)
+        if loss < self.best_loss - self.min_delta:
+            self.best_loss = loss
+            self.best_iteration = int(iteration)
+            self._state = tuple(parameter.detach().clone() for parameter in self.parameters)
+        return (
+            self.patience > 0
+            and self._state is not None
+            and int(iteration) - self.best_iteration >= self.patience
+        )
+
+    def restore(self):
+        if self._state is None:
+            raise RuntimeError("No joint checkpoint has been observed.")
+        with torch.no_grad():
+            for parameter, value in zip(self.parameters, self._state):
+                parameter.copy_(value)
+
+
+def clamp_parameter_and_reset_adam(parameter, lower, upper, optimizer):
+    """Clamp a parameter and clear Adam moments for entries that hit a bound."""
+    with torch.no_grad():
+        saturated = (parameter < lower) | (parameter > upper)
+        parameter.clamp_(min=lower, max=upper)
+        state = optimizer.state.get(parameter, {})
+        for name in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+            moment = state.get(name)
+            if moment is not None:
+                moment.masked_fill_(saturated, 0.0)
+    return saturated
+
+
+def joint_checkpoint_score(total_loss, invalid_fraction, max_invalid_fraction):
+    """Reject checkpoints that reduce loss by dropping too many intersections."""
+    if float(invalid_fraction) > float(max_invalid_fraction):
+        return float("inf")
+    return float(total_loss)
 
 
 def _sinc(value):
@@ -173,7 +234,13 @@ def helix_tangent(track, s):
     return torch.stack((torch.cos(psi), torch.sin(psi), tanl * torch.ones_like(s)), dim=-1)
 
 
-def intersect_plane(track, center, normal, s0=None, n_newton=12):
+def accept_newton_candidate(previous, candidate, valid, candidate_ok):
+    """Accept feasible Newton steps without restarting failed paths at zero."""
+    updated_valid = valid & candidate_ok
+    return torch.where(updated_valid, candidate, previous), updated_valid
+
+
+def intersect_plane(track, center, normal, n_newton=12):
     """Intersect helices with planes and return ``(s, point, valid_mask)``."""
     tangent0 = helix_tangent(track, torch.zeros_like(track[..., 0]))
     denominator0 = torch.sum(tangent0 * normal, dim=-1)
@@ -183,10 +250,7 @@ def intersect_plane(track, center, normal, s0=None, n_newton=12):
         denominator0,
         torch.where(denominator0 >= 0, torch.ones_like(denominator0), -torch.ones_like(denominator0)),
     )
-    if s0 is None:
-        s = torch.sum((center - track[..., :3]) * normal, dim=-1) / safe_denominator
-    else:
-        s = s0
+    s = torch.sum((center - track[..., :3]) * normal, dim=-1) / safe_denominator
     tangent_at_initial = helix_tangent(track, s)
     initially_valid = (
         straight_valid
@@ -194,6 +258,7 @@ def intersect_plane(track, center, normal, s0=None, n_newton=12):
         & (torch.sum(tangent_at_initial * normal, dim=-1).abs() >= PLANE_PARALLEL_EPS)
     )
     s = torch.where(initially_valid, s, torch.zeros_like(s))
+    iteration_valid = initially_valid
 
     for _ in range(n_newton):
         point = helix_point(track, s)
@@ -212,12 +277,14 @@ def intersect_plane(track, center, normal, s0=None, n_newton=12):
             & (candidate.abs() <= S_MAX)
             & (derivative.abs() >= PLANE_PARALLEL_EPS)
         )
-        s = torch.where(initially_valid & candidate_ok, candidate, torch.zeros_like(candidate))
+        s, iteration_valid = accept_newton_candidate(
+            s, candidate, iteration_valid, candidate_ok
+        )
 
     point = helix_point(track, s)
     final_residual = torch.sum((point - center) * normal, dim=-1).abs()
     finite = torch.isfinite(s) & torch.isfinite(point).all(dim=-1)
-    valid = initially_valid & finite & (s.abs() <= S_MAX) & (final_residual <= PLANE_RESIDUAL_TOLERANCE)
+    valid = iteration_valid & finite & (s.abs() <= S_MAX) & (final_residual <= PLANE_RESIDUAL_TOLERANCE)
     point = torch.where(valid.unsqueeze(-1), point, helix_point(track, torch.zeros_like(s)))
     s = torch.where(valid, s, torch.zeros_like(s))
     return s, point, valid
@@ -225,8 +292,8 @@ def intersect_plane(track, center, normal, s0=None, n_newton=12):
 
 def build_track_batches(inputs, target_layers, min_hits=8, max_tracks=0):
     """Group flat hit tensors into deterministic padded per-track tensors."""
-    if inputs.measured_local is None or inputs.loc1_valid is None or inputs.raw_covariances is None:
-        raise ValueError("Joint mode requires measured_local, loc1_valid, and raw_covariances.")
+    if inputs.measured_local is None or inputs.loc1_valid is None:
+        raise ValueError("Joint mode requires measured_local and loc1_valid.")
     target_layers = set(parse_target_layers(target_layers))
     n_hits = len(inputs.hit_sensor_ids)
     positions = inputs.hit_global_positions.detach().cpu().numpy()
@@ -268,7 +335,7 @@ def build_track_batches(inputs, target_layers, min_hits=8, max_tracks=0):
     n_tracks = len(selected)
     max_hits = max(len(indices) for _, indices in selected)
     measured = torch.zeros((n_tracks, max_hits, 2), dtype=inputs.measured_local.dtype)
-    covariance = torch.ones((n_tracks, max_hits, 2), dtype=inputs.raw_covariances.dtype)
+    covariance = torch.ones((n_tracks, max_hits, 2), dtype=inputs.covariances.dtype)
     sensor_idx = torch.zeros((n_tracks, max_hits), dtype=torch.long)
     hit_mask = torch.zeros((n_tracks, max_hits), dtype=torch.bool)
     loc1_mask = torch.zeros((n_tracks, max_hits), dtype=torch.bool)
@@ -282,7 +349,7 @@ def build_track_batches(inputs, target_layers, min_hits=8, max_tracks=0):
         count = len(indices)
         index = torch.tensor(indices, dtype=torch.long)
         measured[track_index, :count] = inputs.measured_local[index]
-        covariance[track_index, :count] = inputs.raw_covariances[index]
+        covariance[track_index, :count] = inputs.covariances[index]
         sensor_idx[track_index, :count] = inputs.hit_sensor_ids[index]
         hit_mask[track_index, :count] = True
         loc1_mask[track_index, :count] = inputs.loc1_valid[index]
@@ -386,8 +453,7 @@ def closest_helix_points(track, points, n_newton=8):
         )
         candidate = s - first_derivative / safe
         step_valid = torch.isfinite(candidate) & (candidate.abs() <= S_MAX)
-        valid = valid & step_valid
-        s = torch.where(valid, candidate, torch.zeros_like(candidate))
+        s, valid = accept_newton_candidate(s, candidate, valid, step_valid)
     fitted = helix_point(track, s)
     valid = valid & torch.isfinite(fitted).all(dim=-1)
     fitted = torch.where(valid.unsqueeze(-1), fitted, track[..., :3])
@@ -471,7 +537,7 @@ def run_joint_alignment(
     batches,
     geometry,
     config,
-    active_dof=JOINT_DEFAULT_ACTIVE_DOF,
+    active_dof=DEFAULT_ACTIVE_DOF,
     initial_track_params=None,
 ):
     """Jointly optimize free per-track helices and target-surface alignment."""
@@ -507,7 +573,13 @@ def run_joint_alignment(
             {"params": [track_rho_scaled], "lr": config.joint_lr_track},
         ]
     optimizer = optim.Adam(parameter_groups)
+    checkpoint = JointBestCheckpoint(
+        (track_linear, track_rho_scaled, translation, rotation),
+        patience=config.joint_patience,
+        min_delta=config.joint_min_delta,
+    )
     history = []
+    checkpoint_history = []
     invalid_history = []
     n_tracks = len(track_linear)
     batch_size = (
@@ -521,7 +593,33 @@ def run_joint_alignment(
         initial_residuals, _initial_covariance, initial_component_mask, _initial_valid = (
             _joint_forward(initial_tracks, initial_alignment, batches, geometry)
         )
+        initial_weighted = initial_residuals.square() / torch.clamp(
+            _initial_covariance, min=EPS_COVARIANCE
+        )
+        initial_total_loss = float((torch.sum(torch.where(
+            initial_component_mask, initial_weighted, torch.zeros_like(initial_weighted)
+        )) / initial_component_mask.sum().clamp(min=1)).cpu())
+        initial_invalid_fraction = 1.0 - float(
+            _initial_valid[batches.hit_mask.to(device)].float().mean().item()
+        )
+    initial_checkpoint_loss = joint_checkpoint_score(
+        initial_total_loss,
+        initial_invalid_fraction,
+        config.joint_max_invalid_fraction,
+    )
+    if not np.isfinite(initial_checkpoint_loss):
+        raise ValueError(
+            "Initial helix seed has too many invalid intersections for a safe checkpoint: "
+            f"{initial_invalid_fraction:.2%} > {config.joint_max_invalid_fraction:.2%}."
+        )
+    checkpoint.observe(initial_checkpoint_loss, iteration=-1)
+    checkpoint_history.append((-1, initial_total_loss))
 
+    if config.joint_iters < 1:
+        raise ValueError("joint_iters must be at least 1.")
+    checkpoint_interval = max(1, int(config.joint_checkpoint_interval))
+    last_total_loss = float("inf")
+    stopped_early = False
     for iteration in range(config.joint_iters):
         start = (iteration * batch_size) % n_tracks
         track_indices = torch.arange(start, min(start + batch_size, n_tracks), device=device)
@@ -550,13 +648,56 @@ def run_joint_alignment(
         with torch.no_grad():
             translation.mul_(target_mask * dof_mask[:3])
             rotation.mul_(target_mask * dof_mask[3:])
-            translation.clamp_(-config.joint_clamp_t, config.joint_clamp_t)
-            rotation.clamp_(-config.joint_clamp_r, config.joint_clamp_r)
+        clamp_parameter_and_reset_adam(
+            translation, -config.joint_clamp_t, config.joint_clamp_t, optimizer
+        )
+        clamp_parameter_and_reset_adam(
+            rotation, -config.joint_clamp_r, config.joint_clamp_r, optimizer
+        )
         invalid_fraction = 1.0 - float(
             intersection_valid[batches.hit_mask.to(device)[track_indices]].float().mean().item()
         )
         history.append(float(data_loss.detach().cpu()))
         invalid_history.append(invalid_fraction)
+        evaluate_checkpoint = (
+            iteration == 0
+            or (iteration + 1) % checkpoint_interval == 0
+            or iteration == config.joint_iters - 1
+        )
+        if evaluate_checkpoint:
+            with torch.no_grad():
+                evaluated_tracks = assemble_joint_track_parameters(track_linear, track_rho_scaled)
+                evaluated_alignment = torch.cat((translation, rotation), dim=1)
+                evaluated_alignment = evaluated_alignment * target_mask * dof_mask
+                evaluated_residuals, evaluated_covariance, evaluated_mask, evaluated_valid = _joint_forward(
+                    evaluated_tracks, evaluated_alignment, batches, geometry
+                )
+                evaluated_weighted = evaluated_residuals.square() / torch.clamp(
+                    evaluated_covariance, min=EPS_COVARIANCE
+                )
+                evaluated_data_loss = torch.sum(torch.where(
+                    evaluated_mask, evaluated_weighted, torch.zeros_like(evaluated_weighted)
+                )) / evaluated_mask.sum().clamp(min=1)
+                evaluated_total_loss = (
+                    evaluated_data_loss + config.lambda_l2 * evaluated_alignment.square().sum()
+                )
+                last_total_loss = float(evaluated_total_loss.cpu())
+                evaluated_invalid_fraction = 1.0 - float(
+                    evaluated_valid[batches.hit_mask.to(device)].float().mean().item()
+                )
+            checkpoint_loss = joint_checkpoint_score(
+                last_total_loss,
+                evaluated_invalid_fraction,
+                config.joint_max_invalid_fraction,
+            )
+            checkpoint_history.append((iteration, last_total_loss))
+            if checkpoint.observe(checkpoint_loss, iteration):
+                stopped_early = True
+                print(
+                    f"Joint early stop at iteration {iteration}; "
+                    f"best={checkpoint.best_loss:.4f} at iteration {checkpoint.best_iteration}."
+                )
+                break
         if iteration % 100 == 0 or iteration == config.joint_iters - 1:
             warning = " WARNING: >5%" if invalid_fraction > 0.05 else ""
             print(
@@ -564,6 +705,7 @@ def run_joint_alignment(
                 f"invalid={invalid_fraction:.2%}{warning}"
             )
 
+    checkpoint.restore()
     with torch.no_grad():
         track_parameters = assemble_joint_track_parameters(track_linear, track_rho_scaled)
         predicted = torch.cat((translation, rotation), dim=1)
@@ -579,17 +721,23 @@ def run_joint_alignment(
         "initial_residuals": initial_residuals.detach().cpu(),
         "initial_component_mask": initial_component_mask.detach().cpu(),
         "history": history,
+        "checkpoint_history": checkpoint_history,
+        "best_total_loss": checkpoint.best_loss,
+        "last_total_loss": last_total_loss,
+        "best_iteration": checkpoint.best_iteration,
+        "stopped_early": stopped_early,
+        "initial_total_loss": initial_total_loss,
+        "initial_invalid_fraction": initial_invalid_fraction,
         "invalid_fraction": invalid_history[-1] if invalid_history else 0.0,
     }
-
-# =====================================================================
-# Milestone 1: PyTorch class
-# =====================================================================
 
 class AlignmentEngine(nn.Module):
     def __init__(self, num_sensors, use_hit_weights=False):
         super().__init__()
         self.num_sensors = num_sensors
+        # EXPERIMENTAL: temporarily disabled; no caller sets use_hit_weights=True.
+        # The network and its feature chain are kept so the experiment can be
+        # restarted, but the disabled path must stay free of its cost.
         self.use_hit_weights = use_hit_weights
 
         self.alignment_params = nn.Parameter(torch.zeros(num_sensors, 6))
@@ -614,6 +762,11 @@ class AlignmentEngine(nn.Module):
         hit_global_positions,
         hit_directions,
     ):
+        """Return ``(residuals, hit_weights)`` as ``tuple[Tensor, Tensor | None]``.
+
+        ``hit_weights`` is ``None`` when the experimental weighting is disabled,
+        which selects the unweighted loss path instead of multiplying by ones.
+        """
         residuals = compute_autograd_residuals(
             measured_local,
             hit_global_positions,
@@ -623,19 +776,15 @@ class AlignmentEngine(nn.Module):
             sensor_rotations,
             self.alignment_params,
         )
-        if self.use_hit_weights:
-            hit_sensor_center_positions = sensor_center_positions[hit_sensor_ids]
-            advanced_features = torch.cat([track_params, hit_sensor_center_positions, track_chi2_ndf], dim=-1)
-            raw_logits = self.hit_quality_net(advanced_features)
-            hit_weights = HIT_WEIGHT_FLOOR + (1.0 - HIT_WEIGHT_FLOOR) * torch.sigmoid(raw_logits)
-        else:
-            hit_weights = torch.ones(len(hit_sensor_ids), 1, device=residuals.device)
+        if not self.use_hit_weights:
+            return residuals, None
 
+        # EXPERIMENTAL: only reachable with use_hit_weights=True.
+        hit_sensor_center_positions = sensor_center_positions[hit_sensor_ids]
+        advanced_features = torch.cat([track_params, hit_sensor_center_positions, track_chi2_ndf], dim=-1)
+        raw_logits = self.hit_quality_net(advanced_features)
+        hit_weights = HIT_WEIGHT_FLOOR + (1.0 - HIT_WEIGHT_FLOOR) * torch.sigmoid(raw_logits)
         return residuals, hit_weights
-
-# =====================================================================
-# Milestone 1.2: Physics unsupervised Loss (Introducing ML dynamic weights)
-# =====================================================================
 
 def normalize_hit_weights(hit_weights, hit_volume_ids=None, hit_layer_ids=None):
     if hit_volume_ids is None and hit_layer_ids is None:
@@ -659,55 +808,28 @@ def normalize_hit_weights(hit_weights, hit_volume_ids=None, hit_layer_ids=None):
     return normalized
 
 
-def physics_informed_loss(
-    initial_residuals,
-    residual_shift,
-    covariances,
-    hit_weights,
-    hit_mask=None,
-    hit_volume_ids=None,
-    hit_layer_ids=None,
-):
-    new_residuals = initial_residuals + residual_shift
-    raw_chi2 = (new_residuals ** 2) / torch.clamp(covariances, min=EPS_COVARIANCE)
-
-    if hit_mask is not None:
-        raw_chi2 = raw_chi2[hit_mask]
-        hit_weights = hit_weights[hit_mask]
-        if hit_volume_ids is not None:
-            hit_volume_ids = hit_volume_ids[hit_mask]
-        if hit_layer_ids is not None:
-            hit_layer_ids = hit_layer_ids[hit_mask]
-
-    w_normalized = normalize_hit_weights(hit_weights, hit_volume_ids, hit_layer_ids)
-    chi2_loss = torch.mean(w_normalized * raw_chi2)
-    return chi2_loss
-
-
 def physics_informed_residual_loss(
     residuals,
     covariances,
     hit_weights,
-    hit_mask=None,
+    component_mask=None,
     hit_volume_ids=None,
     hit_layer_ids=None,
 ):
+    """``hit_weights=None`` selects the unweighted path (no normalisation)."""
     raw_chi2 = (residuals ** 2) / torch.clamp(covariances, min=EPS_COVARIANCE)
 
-    if hit_mask is not None:
-        raw_chi2 = raw_chi2[hit_mask]
-        hit_weights = hit_weights[hit_mask]
-        if hit_volume_ids is not None:
-            hit_volume_ids = hit_volume_ids[hit_mask]
-        if hit_layer_ids is not None:
-            hit_layer_ids = hit_layer_ids[hit_mask]
+    if hit_weights is None:
+        weighted_chi2 = raw_chi2
+    else:
+        w_normalized = normalize_hit_weights(hit_weights, hit_volume_ids, hit_layer_ids)
+        weighted_chi2 = w_normalized * raw_chi2
+    if component_mask is None:
+        return torch.mean(weighted_chi2)
+    return torch.sum(torch.where(component_mask, weighted_chi2, torch.zeros_like(weighted_chi2))) / (
+        component_mask.sum().clamp(min=1)
+    )
 
-    w_normalized = normalize_hit_weights(hit_weights, hit_volume_ids, hit_layer_ids)
-    return torch.mean(w_normalized * raw_chi2)
-
-# =====================================================================
-# Milestone 2: Simulate pybind11 Data
-# =====================================================================
 def load_geometry_from_json(filepath):
     with open(filepath, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -832,6 +954,10 @@ def load_variable_information(
     # Load true measurement errors separately: err_x_hit / err_y_hit are per-measurement
     # (N_meas ≤ N_states per track).  Expand them to per-state length by inserting NaN
     # at hole states, keyed by the per-state l_x_hit NaN pattern.
+    # Both branches are required: the variance columns below consume them
+    # unconditionally, so there is no posterior-variance fallback to degrade to.
+    # A length mismatch used to leave the whole entry as NaN, after which the
+    # affected hits were dropped silently by the dropna() further down.
     try:
         lx_jagged = states_tree["l_x_hit"].array(library="ak", entry_stop=max_track_entries)
         errx_jagged = states_tree["err_x_hit"].array(library="ak", entry_stop=max_track_entries)
@@ -842,20 +968,30 @@ def load_variable_information(
             lx_tr  = ak.to_numpy(lx_jagged[i])
             is_meas = ~np.isnan(lx_tr)
             n_st = len(lx_tr)
+            n_meas = int(is_meas.sum())
             ex = np.full(n_st, np.nan)
             ey = np.full(n_st, np.nan)
             em_x = ak.to_numpy(errx_jagged[i])
             em_y = ak.to_numpy(erry_jagged[i])
-            if len(em_x) == int(is_meas.sum()):
-                ex[is_meas] = em_x
-                ey[is_meas] = em_y
+            for name, values in (("err_x_hit", em_x), ("err_y_hit", em_y)):
+                if len(values) != n_meas:
+                    raise ValueError(
+                        f"{name} length mismatch at entry {i}: "
+                        f"got {len(values)}, expected {n_meas}"
+                    )
+            ex[is_meas] = em_x
+            ey[is_meas] = em_y
             errx_flat.extend(ex.tolist())
             erry_flat.extend(ey.tolist())
         states_df["err_x_hit"] = errx_flat
         states_df["err_y_hit"] = erry_flat
         print("  Loaded true measurement errors (err_x_hit / err_y_hit) via per-state expansion.")
-    except Exception as _e:
-        print(f"  Could not load err_x/y_hit ({_e}); will use smoothed posterior variance.")
+    except (uproot.KeyInFileError, KeyError, ValueError) as exc:
+        # Interpolate the cause so the entry/length detail stays visible at the
+        # top level; `raise ... from exc` alone would hide it behind __cause__.
+        raise ValueError(
+            f"Required err_x_hit/err_y_hit measurement errors could not be loaded: {exc}"
+        ) from exc
 
     # 3. Broadcast per-event event_nr / track_nr to per-state level.
     vol_jagged = states_tree["volume_id"].array(library="ak", entry_stop=max_track_entries)
@@ -961,9 +1097,6 @@ def load_variable_information(
     measured_local = torch.tensor(
         merged_df[["l_x_hit", "measured_loc1"]].values, dtype=torch.float32)
     loc1_valid = torch.tensor(merged_df["loc1_valid"].values, dtype=torch.bool)
-    hit_order_key = torch.tensor(
-        merged_df[["r_xy", "abs_g_z"]].values, dtype=torch.float64
-    )
 
     # Smoothed track parameters as neural-net input features.
     # Jacobian is also evaluated at the smoothed position/direction (consistent
@@ -1003,7 +1136,6 @@ def load_variable_information(
         measured_local=measured_local,
         loc1_valid=loc1_valid,
         raw_covariances=raw_covariances,
-        hit_order_key=hit_order_key,
         merged_df=merged_df,
     )
     return inputs
@@ -1147,7 +1279,6 @@ def update_geometry_to_json(transforms_list, predicted_deltas, output_filepath):
         json.dump(transforms_list, f_out, indent=4)
 
 
-Update_geometry_to_json = update_geometry_to_json
 
 
 def build_target_mask(num_sensors, id_to_idx_map, target_layers):
@@ -1159,67 +1290,169 @@ def build_target_mask(num_sensors, id_to_idx_map, target_layers):
     return target_mask
 
 
-def print_target_residual_stats(initial_residuals, hit_volume_ids, hit_layer_ids, target_layers):
-    res_np = initial_residuals.detach().cpu().numpy()
-    vols_np = hit_volume_ids.detach().cpu().numpy()
-    lays_np = hit_layer_ids.detach().cpu().numpy()
-    print("\n=== Target-layer ACTS-like residuals before solve ===")
-    print(f"  {'Layer':<20}  {'N':>8}  {'mean LOC0':>12}  {'RMS LOC0':>10}  {'mean LOC1':>12}  {'RMS LOC1':>10}")
+def combine_component_masks(hit_mask, initial_component_mask, final_component_mask):
+    """Intersect before/after component validity and report per-side exclusions.
+
+    Comparing "before" residuals selected by the *final* mask is unfair: a hit
+    whose initial intersection failed had its residual zeroed, so it would enter
+    the before statistics as an artificial 0.0.
+
+    LOC0 is the gate because ``_joint_forward`` builds the component mask as
+    ``(valid, valid & loc1_mask)`` — a valid LOC1 always implies a valid LOC0.
+    The exclusion counts are taken on LOC0 and intersected with ``hit_mask`` so
+    padding never contributes and neither side is counted twice.
+    """
+    both = initial_component_mask & final_component_mask
+    hit_valid = hit_mask & both[..., 0]
+    initial_only = hit_mask & initial_component_mask[..., 0] & ~final_component_mask[..., 0]
+    final_only = hit_mask & ~initial_component_mask[..., 0] & final_component_mask[..., 0]
+    return hit_valid, both[hit_valid], int(initial_only.sum()), int(final_only.sum())
+
+
+def _as_numpy(values):
+    """Detach torch tensors without forcing a dtype promotion.
+
+    Callers mix torch tensors and ndarrays; converting only some of them would
+    leave `ndarray & Tensor` mixed operations whose semantics depend on the
+    conversion rules.  No `dtype=` is passed: numpy's `float` is float64 and the
+    surface residuals are float32, so promoting here would change the reported
+    statistics.
+    """
+    if hasattr(values, "detach"):
+        values = values.detach().cpu()
+    return np.asarray(values)
+
+
+def _stat_pair(values):
+    """(mean, RMS) of a 1-D array, or (nan, nan) when it is empty.
+
+    RMS is sqrt(mean(x^2)) — not np.std.  A detector misalignment shows up as a
+    non-zero residual *mean*, which np.std subtracts away.
+    """
+    if values.size == 0:
+        return float("nan"), float("nan")
+    return float(np.mean(values)), float(np.sqrt(np.mean(values ** 2)))
+
+
+def _fmt_mm(value):
+    return "       N/A" if not np.isfinite(value) else f"{value:>9.4f}mm"
+
+
+def print_target_residual_stats(
+    initial_residuals, hit_volume_ids, hit_layer_ids, target_layers, loc1_valid=None
+):
+    res_np = _as_numpy(initial_residuals)
+    vols_np = _as_numpy(hit_volume_ids)
+    lays_np = _as_numpy(hit_layer_ids)
+    if loc1_valid is None:
+        loc1_np = np.ones(len(res_np), dtype=bool)
+    else:
+        loc1_np = _as_numpy(loc1_valid).astype(bool)
+
+    print("\n=== Target-layer ACTS KF-smoothed residuals before solve ===")
+    print(f"  {'Layer':<20}  {'N0':>8}  {'N1':>8}  {'mean LOC0':>12}  {'RMS LOC0':>10}"
+          f"  {'mean LOC1':>12}  {'RMS LOC1':>10}")
     for vol, lay in parse_target_layers(target_layers):
         mask = (vols_np == vol) & (lays_np == lay)
         if mask.sum() == 0:
             print(f"  vol={vol} lay={lay:<6}  no valid hits")
             continue
-        vals = res_np[mask]
-        mean0 = float(np.mean(vals[:, 0]))
-        rms0 = float(np.sqrt(np.mean(vals[:, 0] ** 2)))
-        mean1 = float(np.mean(vals[:, 1]))
-        rms1 = float(np.sqrt(np.mean(vals[:, 1] ** 2)))
+        mask1 = mask & loc1_np
+        mean0, rms0 = _stat_pair(res_np[mask, 0])
+        mean1, rms1 = _stat_pair(res_np[mask1, 1])
         label = f"vol={vol} lay={lay}"
-        print(f"  {label:<20}  {int(mask.sum()):>8}  {mean0:>12.5f}  {rms0:>10.5f}  {mean1:>12.5f}  {rms1:>10.5f}")
+        cell = lambda v, w: f"{'N/A':>{w}}" if not np.isfinite(v) else f"{v:>{w}.5f}"
+        print(f"  {label:<20}  {int(mask.sum()):>8}  {int(mask1.sum()):>8}  "
+              f"{cell(mean0, 12)}  {cell(rms0, 10)}  {cell(mean1, 12)}  {cell(rms1, 10)}")
 
 
 def print_per_layer_residual_diagnostics(
-    init_res_np, final_res, vols_np, lays_np, target_layers, return_metrics=False
+    init_res_np, final_res, vols_np, lays_np, target_layers,
+    return_metrics=False,
+    component_mask=None,
 ):
+    """Per-layer before/after residual tables.
+
+    ``component_mask`` is an ``(N, 2)`` boolean array marking which residual
+    components are real measurements.  Without it the zeros written into LOC1
+    for 1-D strip hits are averaged in and dilute the Y statistics.
+    New parameters are appended so existing positional calls keep working.
+    """
+    init_res_np = _as_numpy(init_res_np)
+    final_res = _as_numpy(final_res)
+    vols_np = _as_numpy(vols_np)
+    lays_np = _as_numpy(lays_np)
+
+    if init_res_np.shape != final_res.shape:
+        raise ValueError(
+            f"init_res_np shape {init_res_np.shape} != final_res shape {final_res.shape}"
+        )
+    if init_res_np.ndim != 2 or init_res_np.shape[1] != 2:
+        raise ValueError(f"residuals must have shape (N, 2), got {init_res_np.shape}")
+    for name, array in (("init_res_np", init_res_np), ("final_res", final_res)):
+        if not np.issubdtype(array.dtype, np.number):
+            raise ValueError(f"{name} must be numeric, got dtype {array.dtype}")
+    n_hits = init_res_np.shape[0]
+    if len(vols_np) != n_hits or len(lays_np) != n_hits:
+        raise ValueError(
+            f"vols_np ({len(vols_np)}) and lays_np ({len(lays_np)}) must both have "
+            f"length {n_hits}"
+        )
+
+    if component_mask is None:
+        component_mask = np.ones(init_res_np.shape, dtype=bool)
+    else:
+        component_mask = _as_numpy(component_mask).astype(bool)
+    if component_mask.shape != init_res_np.shape:
+        raise ValueError(
+            f"component_mask shape {component_mask.shape} != residual shape "
+            f"{init_res_np.shape}"
+        )
+
+    header = (f"  {'Layer':<20}  {'X_before':>10}  {'X_after':>10}"
+              f"  {'Y_before':>10}  {'Y_after':>10}")
     metrics = {}
-    print("\n=== Per-layer residual mean (training data) ===")
-    print(f"  {'Layer':<20}  {'X_before':>10}  {'X_after':>10}  {'Y_before':>10}  {'Y_after':>10}")
+    layer_masks = {}
     for vol, lay in target_layers:
-        mask = (vols_np == vol) & (lays_np == lay)
-        if mask.sum() == 0:
-            print(f"  vol={vol} lay={lay}  — no hits in training set")
-            continue
-        x_bef = float(np.mean(init_res_np[mask, 0]))
-        x_aft = float(np.mean(final_res[mask, 0]))
-        y_bef = float(np.mean(init_res_np[mask, 1]))
-        y_aft = float(np.mean(final_res[mask, 1]))
-        label = f"vol={vol} lay={lay} (n={mask.sum()})"
-        print(f"  {label:<28}  {x_bef:>9.4f}mm  {x_aft:>9.4f}mm  {y_bef:>9.4f}mm  {y_aft:>9.4f}mm")
-        metrics[(vol, lay)] = {"n_hits": int(mask.sum()),
+        layer = (vols_np == vol) & (lays_np == lay)
+        layer_masks[(vol, lay)] = (layer & component_mask[:, 0], layer & component_mask[:, 1])
+
+    print("\n=== Per-layer residual mean (training data) ===")
+    print(header)
+    for vol, lay in target_layers:
+        mask0, mask1 = layer_masks[(vol, lay)]
+        n0, n1 = int(mask0.sum()), int(mask1.sum())
+        x_bef, rms_x_bef = _stat_pair(init_res_np[mask0, 0])
+        x_aft, rms_x_aft = _stat_pair(final_res[mask0, 0])
+        y_bef, rms_y_bef = _stat_pair(init_res_np[mask1, 1])
+        y_aft, rms_y_aft = _stat_pair(final_res[mask1, 1])
+        label = f"vol={vol} lay={lay} (n0={n0}, n1={n1})"
+        print(f"  {label:<28}  {_fmt_mm(x_bef)}  {_fmt_mm(x_aft)}"
+              f"  {_fmt_mm(y_bef)}  {_fmt_mm(y_aft)}")
+        metrics[(vol, lay)] = {
+            "n_hits": n0,          # retained alias for existing callers
+            "n_hits_loc0": n0,
+            "n_hits_loc1": n1,
             "mean_before_loc0": x_bef, "mean_after_loc0": x_aft,
-            "mean_before_loc1": y_bef, "mean_after_loc1": y_aft}
+            "mean_before_loc1": y_bef, "mean_after_loc1": y_aft,
+            "rms_before_loc0": rms_x_bef, "rms_after_loc0": rms_x_aft,
+            "rms_before_loc1": rms_y_bef, "rms_after_loc1": rms_y_aft,
+        }
 
     print("\n=== Per-layer residual RMS (training data) ===")
-    print(f"  {'Layer':<20}  {'X_before':>10}  {'X_after':>10}  {'Y_before':>10}  {'Y_after':>10}")
+    print(header)
     for vol, lay in target_layers:
-        mask = (vols_np == vol) & (lays_np == lay)
-        if mask.sum() == 0:
-            print(f"  vol={vol} lay={lay}  — no hits in training set")
-            continue
-        x_bef = float(np.std(init_res_np[mask, 0]))
-        x_aft = float(np.std(final_res[mask, 0]))
-        y_bef = float(np.std(init_res_np[mask, 1]))
-        y_aft = float(np.std(final_res[mask, 1]))
-        label = f"vol={vol} lay={lay} (n={mask.sum()})"
-        print(f"  {label:<28}  {x_bef:>9.4f}mm  {x_aft:>9.4f}mm  {y_bef:>9.4f}mm  {y_aft:>9.4f}mm")
-        metrics[(vol, lay)].update({"rms_before_loc0": x_bef, "rms_after_loc0": x_aft,
-            "rms_before_loc1": y_bef, "rms_after_loc1": y_aft})
+        entry = metrics[(vol, lay)]
+        label = f"vol={vol} lay={lay} (n0={entry['n_hits_loc0']}, n1={entry['n_hits_loc1']})"
+        print(f"  {label:<28}  {_fmt_mm(entry['rms_before_loc0'])}"
+              f"  {_fmt_mm(entry['rms_after_loc0'])}"
+              f"  {_fmt_mm(entry['rms_before_loc1'])}"
+              f"  {_fmt_mm(entry['rms_after_loc1'])}")
     print()
     return metrics if return_metrics else None
 
 def validate_against_truth(transforms_list, predicted_deltas, nominal_json,
-                           target_layers, id_to_idx_map):
+                           target_layers):
     """Compare ML correction against the TRUE misalignment per sensor (Iteration 4).
 
     The real ground truth: applying δα to the misaligned surface must recover the
@@ -1304,7 +1537,8 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
         load_summary=False,
     )
     print_target_residual_stats(
-        inputs.initial_residuals, inputs.hit_volume_ids, inputs.hit_layer_ids, target_layers
+        inputs.initial_residuals, inputs.hit_volume_ids, inputs.hit_layer_ids, target_layers,
+        loc1_valid=inputs.loc1_valid,
     )
     batches = build_track_batches(
         inputs,
@@ -1312,25 +1546,6 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
         min_hits=config.min_hits,
         max_tracks=config.max_tracks,
     )
-    n_print = min(10, len(batches.event_track_ids))
-
-    for i in range(n_print):
-      # 去掉 padding，只保留真实 hit
-        valid = batches.hit_mask[i]
-
-        event_id, track_id = batches.event_track_ids[i].tolist()
-
-        print(f"\nTrack {i}: event={event_id}, track={track_id}")
-        print(f"  number of hits: {int(valid.sum())}")
-        print(f"  sensor_idx:\n{batches.sensor_idx[i][valid]}")
-        print(f"  volume_id:\n{batches.volume_id[i][valid]}")
-        print(f"  layer_id:\n{batches.layer_id[i][valid]}")
-        print(f"  measured_local:\n{batches.measured_local[i][valid]}")
-        print(f"  covariances:\n{batches.covariances[i][valid]}")
-        print(f"  global positions:\n{batches.g_smt[i][valid]}")
-        print(f"  directions:\n{batches.p_smt[i][valid]}")
-        print(f"  loc1 valid:\n{batches.loc1_mask[i][valid]}")
-        print(f"  target hit:\n{batches.is_target[i][valid]}")
     print(
         f"Joint track selection: {len(batches.event_track_ids)} tracks, "
         f"{int(batches.hit_mask.sum())} hits, padded width {batches.hit_mask.shape[1]}."
@@ -1344,7 +1559,6 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
         predicted_deltas,
         config.nominal_file,
         target_layers,
-        geometry.id_to_idx,
     )
     Path(config.output_geom).parent.mkdir(parents=True, exist_ok=True)
     export_joint_geometry(geometry, predicted_deltas, config.output_geom)
@@ -1367,11 +1581,18 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
 
     initial_residuals = result["initial_residuals"].numpy()
     final_residuals = result["final_residuals"].numpy()
-    valid = batches.hit_mask.numpy() & result["final_component_mask"].numpy()[..., 0]
+    hit_valid, component_mask, initial_only, final_only = combine_component_masks(
+        batches.hit_mask,
+        result["initial_component_mask"],
+        result["final_component_mask"],
+    )
+    print(f"Diagnostics hit selection: initial_only={initial_only} "
+          f"final_only={final_only} (excluded from the before/after comparison)")
+    valid = hit_valid.numpy()
     target_metrics = print_per_layer_residual_diagnostics(
-        initial_residuals[..., :][valid], final_residuals[..., :][valid],
+        initial_residuals[valid], final_residuals[valid],
         batches.volume_id.numpy()[valid], batches.layer_id.numpy()[valid],
-        target_layers, return_metrics=True,
+        target_layers, return_metrics=True, component_mask=component_mask,
     )
 
     result.update({
@@ -1384,24 +1605,18 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
     return result
 
 
-# =====================================================================
-# Milestone 3: Core logic
-# =====================================================================
+def resolve_active_dof(config):
+    """Both track modes share one default; parse_active_dof handles None and ''."""
+    return parse_active_dof(config.active_dof)
 
-def run_alignment_pipeline(config=None, **legacy_kwargs):
+
+def run_alignment_pipeline(config=None):
     if config is None:
-        config = AlignmentRunConfig(**legacy_kwargs)
-    elif legacy_kwargs:
-        raise ValueError("Pass either AlignmentRunConfig or keyword arguments, not both.")
+        config = AlignmentRunConfig()
 
     if config.track_mode not in {"surface", "free"}:
         raise ValueError("track_mode must be 'surface' or 'free'.")
-    if config.active_dof is None:
-        ACTIVE_DOF = (
-            JOINT_DEFAULT_ACTIVE_DOF if config.track_mode == "free" else DEFAULT_ACTIVE_DOF
-        )
-    else:
-        ACTIVE_DOF = parse_active_dof(config.active_dof)
+    ACTIVE_DOF = resolve_active_dof(config)
     DOF_NAMES = ["tx", "ty", "tz", "rx", "ry", "rz"]
     print(f"Active alignment DOF: {[DOF_NAMES[d] for d in ACTIVE_DOF]}")
     TARGET_LAYERS = parse_target_layers(config.target_layers)
@@ -1421,9 +1636,9 @@ def run_alignment_pipeline(config=None, **legacy_kwargs):
         return run_free_alignment_pipeline(config, TARGET_LAYERS, ACTIVE_DOF)
 
     print("======================================================")
-    print(" Activate the ML-Deriven detector closed alignment engine ")
+    print(" Activate the ML-Driven detector alignment engine ")
     if config.iter_label is not None:
-        print(f" Route-A closed loop — iteration {config.iter_label}")
+        print(f" Iteration {config.iter_label}")
     print("======================================================")
 
     if not os.path.exists(IDEAL_JSON_FILE):
@@ -1448,9 +1663,12 @@ def run_alignment_pipeline(config=None, **legacy_kwargs):
         STATES_ROOT_FILE,
         id_to_idx_map,
     )
+    if inputs.measured_local is None or inputs.loc1_valid is None:
+        raise ValueError("Surface mode requires measured_local and loc1_valid.")
 
     print_target_residual_stats(
-        inputs.initial_residuals, inputs.hit_volume_ids, inputs.hit_layer_ids, TARGET_LAYERS
+        inputs.initial_residuals, inputs.hit_volume_ids, inputs.hit_layer_ids, TARGET_LAYERS,
+        loc1_valid=inputs.loc1_valid,
     )
 
     training_hit_mask = torch.zeros(len(inputs.hit_sensor_ids), dtype=torch.bool)
@@ -1465,12 +1683,14 @@ def run_alignment_pipeline(config=None, **legacy_kwargs):
     train_hit_sensor_ids = inputs.hit_sensor_ids[training_hit_mask]
     train_track_params = inputs.track_params[training_hit_mask]
     train_track_chi2_ndf = inputs.track_chi2_ndf[training_hit_mask]
-    train_initial_residuals = inputs.initial_residuals[training_hit_mask]
-    train_measured_local = train_track_params[:, :2] + train_initial_residuals
+    train_measured_local = inputs.measured_local[training_hit_mask]
+    train_loc1_valid = inputs.loc1_valid[training_hit_mask]
+    train_component_mask = torch.stack(
+        (torch.ones_like(train_loc1_valid), train_loc1_valid), dim=1
+    )
     train_covariances = inputs.covariances[training_hit_mask]
     train_hit_global_positions = inputs.hit_global_positions[training_hit_mask]
     train_hit_directions = inputs.hit_directions[training_hit_mask]
-    train_hit_qoverp = inputs.hit_qoverp[training_hit_mask]
     train_hit_volume_ids = inputs.hit_volume_ids[training_hit_mask]
     train_hit_layer_ids = inputs.hit_layer_ids[training_hit_mask]
 
@@ -1512,6 +1732,7 @@ def run_alignment_pipeline(config=None, **legacy_kwargs):
         chi2_loss = physics_informed_residual_loss(
             cur_res, train_covariances,
             hit_weights,
+            component_mask=train_component_mask,
             hit_volume_ids=train_hit_volume_ids,
             hit_layer_ids=train_hit_layer_ids,
         )
@@ -1532,12 +1753,17 @@ def run_alignment_pipeline(config=None, **legacy_kwargs):
 
         with torch.no_grad():
             engine.alignment_params[:, ~dof_mask] = 0.0
-            engine.alignment_params[:, :3].clamp_(-ADAM_CLAMP_T, ADAM_CLAMP_T)
-            engine.alignment_params[:, 3:].clamp_(-ADAM_CLAMP_R, ADAM_CLAMP_R)
-
             if target_mask is not None:
                 engine.alignment_params[~target_mask] = 0.0
+        alignment_lower = engine.alignment_params.new_tensor(
+            [-ADAM_CLAMP_T] * 3 + [-ADAM_CLAMP_R] * 3
+        )
+        alignment_upper = -alignment_lower
+        clamp_parameter_and_reset_adam(
+            engine.alignment_params, alignment_lower, alignment_upper, optimizer
+        )
 
+        with torch.no_grad():
             if epoch % 10 == 0 or epoch == 1:
                 current_lr = scheduler.get_last_lr()[0]
                 cur_res = compute_autograd_residuals(
@@ -1552,56 +1778,82 @@ def run_alignment_pipeline(config=None, **legacy_kwargs):
                 cur_chi2_per_hit = (cur_res ** 2) / torch.clamp(
                     train_covariances, min=EPS_COVARIANCE
                 )
+                cur_chi2_per_hit = torch.where(
+                    train_component_mask,
+                    cur_chi2_per_hit,
+                    torch.zeros_like(cur_chi2_per_hit),
+                )
                 layer_info = []
                 for vl, ll in TARGET_LAYERS:
                     vmask = (train_hit_volume_ids == vl) & (train_hit_layer_ids == ll)
                     if vmask.any():
                         lchi2 = cur_chi2_per_hit[vmask].mean().item()
                         layer_info.append(f"v{vl}l{ll}={lchi2:.2f}")
-                tw = hit_weights.detach()
-                twn = normalize_hit_weights(
-                    hit_weights, train_hit_volume_ids, train_hit_layer_ids
-                ).detach()
-                layer_weight_info = []
-                for vl, ll in TARGET_LAYERS:
-                    vmask = (train_hit_volume_ids == vl) & (train_hit_layer_ids == ll)
-                    if vmask.any():
-                        raw_mean = tw[vmask].mean()
-                        norm_mean = twn[vmask].mean()
-                        layer_weight_info.append(
-                            f"Wv{vl}l{ll}: raw={raw_mean:.3f} norm={norm_mean:.3f}"
-                        )
-                w_info = f"W: mean={tw.mean():.3f} std={tw.std(unbiased=False):.3f} min={tw.min():.3f}"
+                # EXPERIMENTAL: weight diagnostics only when the network is on.
+                # Keeping them conditional preserves observability for a future
+                # restart while costing the disabled path nothing -- and
+                # hit_weights is None here, so detach()/normalize() would crash.
+                weight_info = []
+                if engine.use_hit_weights:
+                    tw = hit_weights.detach()
+                    twn = normalize_hit_weights(
+                        hit_weights, train_hit_volume_ids, train_hit_layer_ids
+                    ).detach()
+                    weight_info.append(
+                        f"W: mean={tw.mean():.3f} std={tw.std(unbiased=False):.3f} min={tw.min():.3f}"
+                    )
+                    for vl, ll in TARGET_LAYERS:
+                        vmask = (train_hit_volume_ids == vl) & (train_hit_layer_ids == ll)
+                        if vmask.any():
+                            weight_info.append(
+                                f"Wv{vl}l{ll}: raw={tw[vmask].mean():.3f} "
+                                f"norm={twn[vmask].mean():.3f}"
+                            )
+                # The Epoch line itself is never conditional: the invariant
+                # extractor and the acceptance criteria both depend on it.
                 print(f"Epoch [{epoch:03d}/{config.epochs}] | LR: {current_lr:.6f} | "
                       f"Chi2: {chi2_loss.item():.4f} | L2: {l2_reg.item():.6f} | "
-                      f"Total: {loss.item():.4f} | {w_info} | "
-                      + " | ".join(layer_info + layer_weight_info))
+                      f"Total: {loss.item():.4f} | "
+                      + " | ".join(layer_info + weight_info))
 
     predicted_deltas = engine.alignment_params.detach().cpu().numpy()
 
     predicted_delta_tensor = torch.tensor(predicted_deltas, dtype=torch.float32)
 
     # ── Per-layer residual diagnostics ──────────────────────────────────────
-    with torch.no_grad():
-        final_residuals = compute_autograd_residuals(
+    # Before and after must share one residual definition.  The ROOT/KF residual
+    # (l_x/y_hit - eLOC0/1_smt) and the geometric projection only agree
+    # approximately at delta=0, so using the former as the baseline would fold
+    # that discrepancy into the reported improvement.  Evaluate the same
+    # projection at delta=0 instead.
+    def _masked_residuals(deltas):
+        residuals = compute_autograd_residuals(
             train_measured_local,
             train_hit_global_positions,
             train_hit_directions,
             train_hit_sensor_ids,
             initial_positions,
             initial_rotations,
-            predicted_delta_tensor,
+            deltas,
         )
-        final_res = final_residuals.numpy()
-    init_res_np = train_initial_residuals.numpy()
+        return torch.where(
+            train_component_mask, residuals, torch.zeros_like(residuals)
+        ).numpy()
+
+    with torch.no_grad():
+        init_res_np = _masked_residuals(torch.zeros_like(predicted_delta_tensor))
+        final_res = _masked_residuals(predicted_delta_tensor)
     vols_np  = train_hit_volume_ids.numpy()
     lays_np  = train_hit_layer_ids.numpy()
 
-    print_per_layer_residual_diagnostics(init_res_np, final_res, vols_np, lays_np, TARGET_LAYERS)
+    target_metrics = print_per_layer_residual_diagnostics(
+        init_res_np, final_res, vols_np, lays_np, TARGET_LAYERS,
+        return_metrics=True, component_mask=train_component_mask,
+    )
 
     # The decisive check vs TRUE misalignment.
-    validate_against_truth(
-        transforms_list, predicted_deltas, config.nominal_file, TARGET_LAYERS, id_to_idx_map
+    truth_metrics = validate_against_truth(
+        transforms_list, predicted_deltas, config.nominal_file, TARGET_LAYERS
     )
 
     Path(ALIGNED_JSON_FILE).parent.mkdir(parents=True, exist_ok=True)
@@ -1625,36 +1877,22 @@ def run_alignment_pipeline(config=None, **legacy_kwargs):
         plt.savefig(plot_filepath, dpi=300, bbox_inches='tight')
         print(f"Training convergence plot saved: '{plot_filepath}'")
 
-    target_metrics = {}
-    for vol, lay in TARGET_LAYERS:
-        mask = (vols_np == vol) & (lays_np == lay)
-        if mask.sum() == 0:
-            continue
-        target_metrics[(vol, lay)] = {
-            "n_hits": int(mask.sum()),
-            "mean_before_loc0": float(np.mean(init_res_np[mask, 0])),
-            "mean_after_loc0": float(np.mean(final_res[mask, 0])),
-            "mean_before_loc1": float(np.mean(init_res_np[mask, 1])),
-            "mean_after_loc1": float(np.mean(final_res[mask, 1])),
-            "rms_before_loc0": float(np.sqrt(np.mean(init_res_np[mask, 0] ** 2))),
-            "rms_after_loc0": float(np.sqrt(np.mean(final_res[mask, 0] ** 2))),
-            "rms_before_loc1": float(np.sqrt(np.mean(init_res_np[mask, 1] ** 2))),
-            "rms_after_loc1": float(np.sqrt(np.mean(final_res[mask, 1] ** 2))),
-        }
     return {
         "output_geom": ALIGNED_JSON_FILE,
         "target_metrics": target_metrics,
+        "truth_metrics": truth_metrics,
         "predicted_deltas": predicted_deltas,
     }
 
 
-if __name__ == "__main__":
+def build_argument_parser():
     import argparse
 
     p = argparse.ArgumentParser(
         description="ML alignment solver (Adam neural-network optimizer). "
                     "Reads current geometry + reconstruction residuals → writes updated geometry."
     )
+    add_config_argument(p)
     p.add_argument("--input-geom", default=str(alignment_json_path("alignment_output", "misalignment_applied")),
                    help="Current geometry G_k (correction base; delta is composed onto it).")
     p.add_argument("--states", dest="states_root",
@@ -1665,23 +1903,27 @@ if __name__ == "__main__":
                    help="tracksummary ROOT from reconstruction performed with G_k.")
     p.add_argument("--output-geom", default=str(alignment_json_path("alignment_output", "aligned_transforms", stem_prefix="ml")),
                    help="Updated geometry G_{k+1} = G_k compose delta.")
-    p.add_argument("--nominal", dest="nominal_file", default="odd_transforms.json",
+    p.add_argument("--nominal", dest="nominal_file", default=str(data_path("odd_transforms.json")),
                    help="Nominal/truth geometry for the convergence metric (|true|rms).")
     p.add_argument("--iter", dest="iter_label", default=None,
                    help="Iteration label for logging.")
     p.add_argument("--active-dof", default=None,
-                   help="Comma-separated active DOF. Defaults: surface=0,1,3,4,5; free=0,1,3,4.")
+                   help="Comma-separated active DOF. Default: 0,1,3,4,5 for both track modes.")
     p.add_argument("--target-layers", default=target_layers_spec(),
                    help=f"Comma-separated target layers as volume:layer. Default: {target_layers_spec()}.")
     p.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS,
                    help=f"Number of Adam training epochs. Default: {DEFAULT_EPOCHS}.")
-    p.add_argument("--jacobian-update-interval", type=int, default=DEFAULT_JACOBIAN_UPDATE_INTERVAL,
-                   help="Accepted for CLI compatibility; ignored by the autograd solver.")
     p.add_argument("--lambda-l2", type=float, default=DEFAULT_LAMBDA_L2,
                    help=f"L2 regularisation weight. Default: {DEFAULT_LAMBDA_L2}.")
     p.add_argument("--track-mode", choices=("surface", "free"), default="surface",
                    help="Track treatment: fixed smoothed surface solve or free joint helices.")
     p.add_argument("--joint-iters", type=int, default=JOINT_ITERS)
+    p.add_argument("--joint-checkpoint-interval", type=int, default=JOINT_CHECKPOINT_INTERVAL,
+                   help="Full-dataset objective evaluation interval for best checkpointing.")
+    p.add_argument("--joint-patience", type=int, default=JOINT_PATIENCE,
+                   help="Stop after this many iterations without full-objective improvement; 0 disables.")
+    p.add_argument("--joint-min-delta", type=float, default=0.0,
+                   help="Minimum full-objective improvement required to reset patience.")
     p.add_argument("--min-hits", type=int, default=8)
     p.add_argument("--max-tracks", type=int, default=0, help="0 keeps all selected tracks.")
     p.add_argument("--track-batch-size", type=int, default=0, help="0 uses full-batch.")
@@ -1692,12 +1934,16 @@ if __name__ == "__main__":
     p.add_argument("--joint-lr-track", type=float, default=JOINT_LR_TRACK)
     p.add_argument("--joint-clamp-t", type=float, default=JOINT_CLAMP_T)
     p.add_argument("--joint-clamp-r", type=float, default=JOINT_CLAMP_R)
-    p.add_argument("--nominal-full-geom", default="odd_transforms.json",
+    p.add_argument("--nominal-full-geom", default=str(data_path("odd_transforms.json")),
                    help="Full nominal geometry used to anchor non-target hits in free mode.")
+    p.add_argument("--freeze-tracks", action="store_true",
+                   help="Freeze seeded helices and optimize geometry only in free mode.")
     p.add_argument("--no-plot", action="store_true", help="Skip the loss-curve PNG.")
-    a = p.parse_args()
+    return p
 
-    run_alignment_pipeline(AlignmentRunConfig(
+
+def alignment_config_from_args(a):
+    return AlignmentRunConfig(
         input_geom=a.input_geom,
         states_root=a.states_root,
         summary_root=a.summary_root,
@@ -1708,10 +1954,12 @@ if __name__ == "__main__":
         active_dof=a.active_dof,
         target_layers=a.target_layers,
         epochs=a.epochs,
-        jacobian_update_interval=a.jacobian_update_interval,
         lambda_l2=a.lambda_l2,
         track_mode=a.track_mode,
         joint_iters=a.joint_iters,
+        joint_checkpoint_interval=a.joint_checkpoint_interval,
+        joint_patience=a.joint_patience,
+        joint_min_delta=a.joint_min_delta,
         min_hits=a.min_hits,
         max_tracks=a.max_tracks,
         track_batch_size=a.track_batch_size,
@@ -1723,4 +1971,10 @@ if __name__ == "__main__":
         joint_clamp_t=a.joint_clamp_t,
         joint_clamp_r=a.joint_clamp_r,
         nominal_full_geom=a.nominal_full_geom,
-    ))
+        freeze_tracks=a.freeze_tracks,
+    )
+
+
+if __name__ == "__main__":
+    args = build_argument_parser().parse_args()
+    run_alignment_pipeline(alignment_config_from_args(args))

@@ -1,0 +1,6 @@
+# Copy to configs/local.toml for machine-specific paths. The copied file is ignored.
+[project]
+data_root = "data"
+
+[acts]
+root = "/home/houjiahao/alignTest"

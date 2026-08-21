@@ -17,9 +17,11 @@ from alignment_artifact_layout import (
     TARGET_LAYER_DIR,
     TARGET_LAYER_SUFFIX,
     artifact_filename,
+    data_path,
     target_subdir,
     target_volume_map,
 )
+from project_config import add_config_argument
 
 u = acts.UnitConstants
 
@@ -539,21 +541,14 @@ def setupMisalignment(
 
         # ===== Apply LocalRotation using AlignmentGenerator =====
         # LocalRotation applies rotation around local axes
-        # IMPORTANT: The axis parameter must be the local axis direction in GLOBAL coordinates
-        # We need to extract the local axes from the current transform's rotation matrix
-        current_rotation = trf.rotation
+        # The axis parameter is expressed in the transform's local coordinates because
+        # AlignmentGeneratorLocalRotation applies the rotation by right multiplication.
 
         if rz != 0:
             lRotZ = acts.examples.alignment.AlignmentGeneratorLocalRotation()
-            # Local Z axis in global coordinates = third column of rotation matrix
-            local_z_axis = acts.Vector3(
-                current_rotation[0, 2], current_rotation[1, 2], current_rotation[2, 2]
-            )
-            lRotZ.axis = local_z_axis
+            lRotZ.axis = acts.Vector3(0.0, 0.0, 1.0)
             lRotZ.angle = rot_local_z
             lRotZ(trf)  # Apply rotation around local Z axis
-            # Update rotation matrix after applying rotation
-            current_rotation = trf.rotation
 
         # Store the misaligned transform
         geoIdMap[gid] = trf
@@ -640,7 +635,7 @@ def runAlignment(
     logger = acts.logging.getLogger("Alignment")
 
     # Load odd_transforms.json
-    json_path = Path(__file__).resolve().parent / "odd_transforms.json"
+    json_path = data_path("odd_transforms.json")
     print(f"Loading detector transforms from: {json_path}")
 
     with open(json_path, "r") as f:
@@ -988,8 +983,10 @@ def runReconstruction(
     ----------
     mode : str
         - "nominal": Use nominal geometry (no alignment decorator)
-        - "misaligned": Use misaligned geometry (loads from misalignment_applied_v17l8_v24l4.json)
-        - "aligned": Use aligned geometry (loads from aligned_transforms_v17l8_v24l4.json)
+        - "misaligned": Use misaligned geometry (loads misalignment_applied_<suffix>.json)
+        - "aligned": Use aligned geometry (loads aligned_transforms_<suffix>.json)
+        The <suffix> and the target-layer subdirectory both come from
+        alignment_artifact_layout; do not hardcode layer numbers here.
     alignmentDir : Path
         Directory containing alignment output files (default: alignment_output)
     """
@@ -1018,7 +1015,7 @@ def runReconstruction(
 
     # Determine alignment directory
     if alignmentDir is None:
-        alignmentDir = target_subdir(Path(__file__).resolve().parent / "alignment_output")
+        alignmentDir = target_subdir(data_path("alignment_output"))
     else:
         alignmentDir = target_subdir(alignmentDir)
 
@@ -1244,6 +1241,7 @@ if "__main__" == __name__:
             python alignment_odd.py reconstruction --mode aligned
         """,
     )
+    add_config_argument(parser)
 
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
@@ -1368,17 +1366,17 @@ if "__main__" == __name__:
         simulationDir = (
             Path(args.simulation_dir)
             if args.simulation_dir
-            else Path.cwd() / "simulation_output"
+            else data_path("simulation_output")
         )
         alignmentDir = target_subdir(
             Path(args.alignment_dir)
             if args.alignment_dir
-            else Path.cwd() / "alignment_output"
+            else data_path("alignment_output")
         )
         reconstructionDir = (
             Path(args.reconstruction_dir)
             if args.reconstruction_dir
-            else Path.cwd() / "reconstruction_output"
+            else data_path("reconstruction_output")
         )
 
         # Step 1: Simulation (NOMINAL geometry — controlled experiment)
@@ -1495,7 +1493,7 @@ if "__main__" == __name__:
         outputDir = (
             Path(args.output_dir)
             if args.output_dir
-            else Path.cwd() / "simulation_output"
+            else data_path("simulation_output")
         )
         detector = getOpenDataDetector(misaligned=True)
         trackingGeometry = detector.trackingGeometry()
@@ -1511,12 +1509,12 @@ if "__main__" == __name__:
 
     elif args.command == "alignment":
         inputDir = (
-            Path(args.input_dir) if args.input_dir else Path.cwd() / "simulation_output"
+            Path(args.input_dir) if args.input_dir else data_path("simulation_output")
         )
         outputDir = (
             Path(args.output_dir)
             if args.output_dir
-            else Path.cwd() / "alignment_output"
+            else data_path("alignment_output")
         )
         outputDir.mkdir(parents=True, exist_ok=True)
 
@@ -1540,18 +1538,18 @@ if "__main__" == __name__:
 
     elif args.command == "reconstruction":
         inputDir = (
-            Path(args.input_dir) if args.input_dir else Path.cwd() / "simulation_output"
+            Path(args.input_dir) if args.input_dir else data_path("simulation_output")
         )
 #        outputDir = (
 #            Path(args.output_dir)
 #            if args.output_dir
-#            else Path.cwd() / "reconstruction_output"
+#            else data_path("reconstruction_output")
 #        )
 #        outputDir.mkdir(exist_ok=True)
         baseoutputDir = (
             Path(args.output_dir)
             if args.output_dir
-            else Path.cwd() / "reconstruction_output"
+            else data_path("reconstruction_output")
         )
         outputDir = target_subdir(baseoutputDir / args.mode)
         outputDir.mkdir(parents=True, exist_ok=True)

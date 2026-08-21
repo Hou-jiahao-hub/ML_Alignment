@@ -1,0 +1,9 @@
+[project]
+data_root = "data"
+
+[acts]
+root = "../alignTest"
+
+[alignment]
+target_layers = ["17:8", "24:4"]
+active_dof = [0, 1, 5]

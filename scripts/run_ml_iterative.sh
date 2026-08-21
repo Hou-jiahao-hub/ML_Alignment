@@ -17,14 +17,29 @@ set -eo pipefail
 JOB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$JOB_DIR"
 
-eval "$(python alignment_artifact_layout.py --shell)"
+CONFIG_PATH=""
+PRE_ARGS=("$@")
+for ((idx = 0; idx < ${#PRE_ARGS[@]}; idx++)); do
+    if [[ "${PRE_ARGS[$idx]}" == "--config" ]]; then
+        ((idx + 1 < ${#PRE_ARGS[@]})) || { echo "ERROR: --config requires a path" >&2; exit 1; }
+        CONFIG_PATH="${PRE_ARGS[$((idx + 1))]}"
+    elif [[ "${PRE_ARGS[$idx]}" == --config=* ]]; then
+        CONFIG_PATH="${PRE_ARGS[$idx]#--config=}"
+    fi
+done
+if [[ -n "$CONFIG_PATH" ]]; then
+    eval "$(python alignment_artifact_layout.py --config "$CONFIG_PATH" --shell)"
+else
+    eval "$(python alignment_artifact_layout.py --shell)"
+fi
 
 ITERS=3
 EVENTS=100000
 START_ITER=0
 TARGET_LAYERS="$TARGET_LAYERS_SPEC"
-ACTIVE_DOF="0,1,3,4,5"
+ACTIVE_DOF="$ACTIVE_DOF_SPEC"
 EPOCHS=300
+JOINT_ITERS=1000
 JACOBIAN_UPDATE_INTERVAL=20
 LAMBDA_L2=1e-5
 SUFFIX="$TARGET_LAYER_SUFFIX"
@@ -34,25 +49,35 @@ SUFFIX="$TARGET_LAYER_SUFFIX"
 #   autograd -> ml_alignment_autograd.py
 # Edit RUN_TAG with the solver so complete iteration outputs do not overwrite each other.
 ALIGNMENT_SOLVER="autograd"
-RUN_TAG="autograd"
+RUN_TAG="autograd_free"
 
-ALIGNMENT_DIR="alignment_output"
-SIMULATION_DIR="simulation_output"
-RECONSTRUCTION_DIR="reconstruction_output"
-LOG_DIR="iterative_ml_logs"
+# Track handling for the autograd solver.
+#   surface -> keep the ACTS KF-smoothed tracks frozen, uses EPOCHS
+#   free    -> refit helix track parameters jointly with the geometry, uses JOINT_ITERS
+# surface leaves the strip v direction unrecoverable because the KF absorbs that
+# misalignment into the track parameters; free breaks that degeneracy.
+TRACK_MODE="free"
+
+ALIGNMENT_DIR="$ALIGNMENT_ROOT"
+SIMULATION_DIR="$SIMULATION_ROOT"
+RECONSTRUCTION_DIR="$RECONSTRUCTION_ROOT"
+LOG_DIR="$ITERATIVE_LOG_ROOT"
 
 INPUT_GEOM=""
 INPUT_STATES=""
 INPUT_SUMMARY=""
 
-ACTS_SETUP="$HOME/alignTest/setup_acts.sh"
+ACTS_SETUP="$ML_ALIGNMENT_ACTS_ROOT/setup_acts.sh"
 CONDA_SH="$HOME/miniconda3/etc/profile.d/conda.sh"
 CONDA_ENV="pytorch"
 DRY_RUN=0
 PLOT_RESIDUALS=1
 
 usage() {
-    cat <<'EOF'
+    # Unquoted heredoc so target-layer values come from alignment_artifact_layout.
+    # Every literal backslash below is doubled: in an unquoted heredoc a trailing
+    # `\` would be consumed as a line continuation and join the example lines.
+    cat <<EOF
 Usage:
   ./run_ml_iterative.sh [options]
 
@@ -63,13 +88,13 @@ Options:
   --input-geom PATH      Iteration-0 geometry input
   --states PATH          Iteration-0 trackstates ROOT input
   --summary PATH         Iteration-0 tracksummary ROOT input
-  --target-layers SPEC   Target layers, e.g. 17:8,24:4 (default: 17:8,24:4)
-  --active-dof SPEC      Active DOF list passed to the hardcoded ML solver (default: 0,1,3,4,5)
+  --target-layers SPEC   Target layers (must remain $TARGET_LAYERS_SPEC)
+  --active-dof SPEC      Active DOF list passed to the hardcoded ML solver (default: 0,1,5)
   --epochs N             Number of Adam training epochs (default: 300)
   --jacobian-update-interval N
                           Recompute Jacobians every N epochs for cpp solver only (default: 20)
   --lambda-l2 VALUE      L2 regularisation weight passed to the ML solver (default: 1e-5)
-  --suffix NAME          File suffix base (must remain v17l8_v24l4)
+  --suffix NAME          File suffix base (must remain $TARGET_LAYER_SUFFIX)
   --alignment-dir PATH   Alignment output directory (default: alignment_output)
   --simulation-dir PATH  Simulation input directory (default: simulation_output)
   --reconstruction-dir PATH
@@ -83,17 +108,17 @@ Options:
   -h, --help             Show this help
 
 Default iteration-0 inputs:
-  --input-geom alignment_output/Vol17_Lay8__Vol24_Lay4/misalignment_applied_v17l8_v24l4.json
-  --states reconstruction_output/misaligned/Vol17_Lay8__Vol24_Lay4/trackstates_kf_v17l8_v24l4.root
-  --summary reconstruction_output/misaligned/Vol17_Lay8__Vol24_Lay4/tracksummary_kf_v17l8_v24l4.root
+  --input-geom alignment_output/$TARGET_LAYER_DIR/misalignment_applied_$TARGET_LAYER_SUFFIX.json
+  --states reconstruction_output/misaligned/$TARGET_LAYER_DIR/trackstates_kf_$TARGET_LAYER_SUFFIX.root
+  --summary reconstruction_output/misaligned/$TARGET_LAYER_DIR/tracksummary_kf_$TARGET_LAYER_SUFFIX.root
 
 Resume example:
-  ./run_ml_iterative.sh \
-    --iters 3 \
-    --start-iter 4 \
-    --input-geom alignment_output/Vol17_Lay8__Vol24_Lay4/aligned_transforms_autograd_ml_v17l8_v24l4_iter3.json \
-    --states reconstruction_output/aligned/Vol17_Lay8__Vol24_Lay4/trackstates_kf_autograd_ml_v17l8_v24l4_iter3.root \
-    --summary reconstruction_output/aligned/Vol17_Lay8__Vol24_Lay4/tracksummary_kf_autograd_ml_v17l8_v24l4_iter3.root
+  ./run_ml_iterative.sh \\
+    --iters 3 \\
+    --start-iter 4 \\
+    --input-geom alignment_output/$TARGET_LAYER_DIR/aligned_transforms_autograd_ml_${TARGET_LAYER_SUFFIX}_iter3.json \\
+    --states reconstruction_output/aligned/$TARGET_LAYER_DIR/trackstates_kf_autograd_ml_${TARGET_LAYER_SUFFIX}_iter3.root \\
+    --summary reconstruction_output/aligned/$TARGET_LAYER_DIR/tracksummary_kf_autograd_ml_${TARGET_LAYER_SUFFIX}_iter3.root
 
 Hardcoded derivative solver selection:
   Edit ALIGNMENT_SOLVER and RUN_TAG near the top of this script.
@@ -109,6 +134,8 @@ die() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --config) shift 2 ;;
+        --config=*) shift ;;
         --iters) ITERS="$2"; shift 2 ;;
         --events) EVENTS="$2"; shift 2 ;;
         --start-iter) START_ITER="$2"; shift 2 ;;
@@ -140,10 +167,18 @@ done
 [[ "$START_ITER" =~ ^[0-9]+$ ]] || die "--start-iter must be a non-negative integer"
 [[ "$EPOCHS" =~ ^[0-9]+$ ]] || die "--epochs must be a non-negative integer"
 [[ "$JACOBIAN_UPDATE_INTERVAL" =~ ^[0-9]+$ ]] || die "--jacobian-update-interval must be a non-negative integer"
+[[ "$JOINT_ITERS" =~ ^[0-9]+$ ]] || die "hardcoded JOINT_ITERS must be a non-negative integer"
+
+case "$TRACK_MODE" in
+    surface|free) ;;
+    *) die "unknown hardcoded TRACK_MODE: $TRACK_MODE (expected surface or free)" ;;
+esac
 
 case "$ALIGNMENT_SOLVER" in
     cpp)
         ALIGNMENT_SCRIPT="ml_alignment.py"
+        [[ "$TRACK_MODE" == "surface" ]] || \
+            die "ALIGNMENT_SOLVER=cpp does not support TRACK_MODE=$TRACK_MODE; ml_alignment.py has no --track-mode"
         ;;
     autograd)
         ALIGNMENT_SCRIPT="ml_alignment_autograd.py"
@@ -248,7 +283,7 @@ fi
 if [[ "$DRY_RUN" -eq 0 ]]; then
     require_file "$ACTS_SETUP"
     require_file "$CONDA_SH"
-    require_file "odd_transforms.json"
+    require_file "$GEOMETRY_ROOT/odd_transforms.json"
     require_file "$INPUT_GEOM"
     require_file "$INPUT_STATES"
     require_file "$INPUT_SUMMARY"
@@ -266,14 +301,18 @@ echo "  events       : $EVENTS"
 echo "  start iter   : $START_ITER"
 echo "  target layers: $TARGET_LAYERS"
 echo "  active dof   : $ACTIVE_DOF"
-echo "  epochs       : $EPOCHS"
+if [[ "$ALIGNMENT_SOLVER" != "cpp" && "$TRACK_MODE" == "free" ]]; then
+    echo "  track mode   : $TRACK_MODE (joint iters: $JOINT_ITERS)"
+else
+    echo "  track mode   : $TRACK_MODE (epochs: $EPOCHS)"
+fi
 echo "  alignment solver: $ALIGNMENT_SOLVER"
 echo "  alignment script: $ALIGNMENT_SCRIPT"
 echo "  run tag      : $RUN_TAG"
+# The Jacobian interval only exists for the cpp solver; the autograd solver has
+# no such setting, so nothing about it is reported for that run.
 if [[ "$ALIGNMENT_SOLVER" == "cpp" ]]; then
     echo "  jacobian int.: $JACOBIAN_UPDATE_INTERVAL"
-else
-    echo "  jacobian int.: ignored for autograd solver"
 fi
 echo "  lambda l2    : $LAMBDA_L2"
 echo "  input geom   : $INPUT_GEOM"
@@ -305,13 +344,20 @@ for ((offset=0; offset<ITERS; offset++)); do
         --output-geom "$output_geom"
         --active-dof "$ACTIVE_DOF"
         --target-layers "$TARGET_LAYERS"
-        --epochs "$EPOCHS"
         --lambda-l2 "$LAMBDA_L2"
         --iter "$iter"
         --no-plot
     )
     if [[ "$ALIGNMENT_SOLVER" == "cpp" ]]; then
+        ml_cmd+=(--epochs "$EPOCHS")
         ml_cmd+=(--jacobian-update-interval "$JACOBIAN_UPDATE_INTERVAL")
+    else
+        ml_cmd+=(--track-mode "$TRACK_MODE")
+        if [[ "$TRACK_MODE" == "free" ]]; then
+            ml_cmd+=(--joint-iters "$JOINT_ITERS")
+        else
+            ml_cmd+=(--epochs "$EPOCHS")
+        fi
     fi
     echo "[$iter] ML solve"
     run_conda "$LOG_DIR/${iter_label}.log" "${ml_cmd[@]}" || die "ML solve failed; see $LOG_DIR/${iter_label}.log"
@@ -339,47 +385,47 @@ for ((offset=0; offset<ITERS; offset++)); do
     if [[ "$PLOT_RESIDUALS" -eq 1 ]]; then
         PLOT_OUT_DIR="$RESIDUALS_DIR/$iter_label"
 
-        plot_v17_cmd=(
-            python plot_residuals.py
-            --recon-dir "$RECONSTRUCTION_DIR"
-            --output-dir "$PLOT_OUT_DIR"
-            --aligned-trackstates "$aligned_trackstates"
-            --label "${iter_label}_v17l8"
-            --volume_id 17
-            --layer_id 8
-            --range -1.0 1.0
-            --residuals X Y
-        )
-        echo "[$iter] Residual plots for vol=17 lay=8"
-        run_conda "$LOG_DIR/plot_${iter_label}_v17l8.log" "${plot_v17_cmd[@]}" || die "plot_residuals failed; see $LOG_DIR/plot_${iter_label}_v17l8.log"
+        # Plot commands are generated from TARGET_LAYERS_SPEC so the plotted
+        # layers can never drift away from the layers actually being solved.
+        # Local IFS only: a global IFS change would leak into the rest of the run.
+        IFS=',' read -r -a target_pairs <<< "$TARGET_LAYERS_SPEC"
+        for pair in "${target_pairs[@]}"; do
+            IFS=':' read -r vol lay <<< "$pair"
+            plot_label="${iter_label}_v${vol}l${lay}"
 
-        plot_v24x_cmd=(
-            python plot_residuals.py
-            --recon-dir "$RECONSTRUCTION_DIR"
-            --output-dir "$PLOT_OUT_DIR"
-            --aligned-trackstates "$aligned_trackstates"
-            --label "${iter_label}_v24l4"
-            --volume_id 24
-            --layer_id 4
-            --range -1.0 1.0
-            --residuals X
-        )
-        echo "[$iter] Residual plots for vol=24 lay=4 (X)"
-        run_conda "$LOG_DIR/plot_${iter_label}_v24l4_X.log" "${plot_v24x_cmd[@]}" || die "plot_residuals failed; see $LOG_DIR/plot_${iter_label}_v24l4_X.log"
+            case "$vol" in
+                16|17|18)
+                    # Pixel: both projections share the same fine range.
+                    plot_specs=("X Y|-1.0 1.0|")
+                    ;;
+                23|24|25)
+                    # ShortStrip: intrinsic Y resolution is ~1.2 mm, so Y needs a
+                    # much wider range and is plotted separately from X.
+                    plot_specs=("X|-1.0 1.0|_X" "Y|-6.0 6.0|_Y")
+                    ;;
+                *)
+                    die "unsupported plotting volume: $vol (only Pixel 16/17/18 and ShortStrip 23/24/25 supported)"
+                    ;;
+            esac
 
-        plot_v24y_cmd=(
-            python plot_residuals.py
-            --recon-dir "$RECONSTRUCTION_DIR"
-            --output-dir "$PLOT_OUT_DIR"
-            --aligned-trackstates "$aligned_trackstates"
-            --label "${iter_label}_v24l4"
-            --volume_id 24
-            --layer_id 4
-            --range -6.0 6.0
-            --residuals Y
-        )
-        echo "[$iter] Residual plots for vol=24 lay=4 (Y)"
-        run_conda "$LOG_DIR/plot_${iter_label}_v24l4_Y.log" "${plot_v24y_cmd[@]}" || die "plot_residuals failed; see $LOG_DIR/plot_${iter_label}_v24l4_Y.log"
+            for spec in "${plot_specs[@]}"; do
+                IFS='|' read -r residuals range log_tag <<< "$spec"
+                plot_cmd=(
+                    python plot_residuals.py
+                    --recon-dir "$RECONSTRUCTION_DIR"
+                    --output-dir "$PLOT_OUT_DIR"
+                    --aligned-trackstates "$aligned_trackstates"
+                    --label "$plot_label"
+                    --volume_id "$vol"
+                    --layer_id "$lay"
+                    --range $range
+                    --residuals $residuals
+                )
+                plot_log="$LOG_DIR/plot_${plot_label}${log_tag}.log"
+                echo "[$iter] Residual plots for vol=$vol lay=$lay (${residuals// /})"
+                run_conda "$plot_log" "${plot_cmd[@]}" || die "plot_residuals failed; see $plot_log"
+            done
+        done
     fi
 
     current_geom="$output_geom"

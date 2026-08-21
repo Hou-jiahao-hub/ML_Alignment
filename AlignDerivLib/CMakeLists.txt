@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.14)
 project(AlignDerivLib VERSION 0.1.0 LANGUAGES CXX)
 
+include(CTest)
+
 find_package(Eigen3 REQUIRED NO_MODULE)
 
 # Header-only interface library — nothing to compile, just propagate includes
@@ -18,14 +20,17 @@ if(ALIGNDERIV_BUILD_TESTS)
     add_executable(alignderiv_smoke_test tests/smoke_test.cpp)
     target_link_libraries(alignderiv_smoke_test PRIVATE AlignDeriv)
     target_compile_features(alignderiv_smoke_test PRIVATE cxx_std_17)
+    add_test(NAME alignderiv_smoke COMMAND alignderiv_smoke_test)
 
     add_executable(alignderiv_test_jacobians tests/test_jacobians.cpp)
     target_link_libraries(alignderiv_test_jacobians PRIVATE AlignDeriv)
     target_compile_features(alignderiv_test_jacobians PRIVATE cxx_std_17)
+    add_test(NAME alignderiv_jacobians COMMAND alignderiv_test_jacobians)
 
     add_executable(alignderiv_test_surfaces tests/test_surfaces.cpp)
     target_link_libraries(alignderiv_test_surfaces PRIVATE AlignDeriv)
     target_compile_features(alignderiv_test_surfaces PRIVATE cxx_std_17)
+    add_test(NAME alignderiv_surfaces COMMAND alignderiv_test_surfaces)
 endif()
 
 # ── Python bindings via pybind11 (requires pybind11 >= 2.12 for numpy 2.x) ───
