@@ -104,6 +104,31 @@ def test_aligned_tracksummary_override_uses_its_vol_lay_directory(tmp_path):
     )
 
 
+def test_aligned_tracksummary_absolute_path_is_used_directly(tmp_path):
+    plot_hit_number = load_plot_hit_number_module()
+    aligned_path = tmp_path / "external" / "tracksummary.root"
+
+    files = plot_hit_number.comparison_files(
+        tmp_path / "reconstruction",
+        "tracksummary_kf_v17l8_v24l4.root",
+        aligned_tracksummary=aligned_path,
+    )
+
+    assert files["Aligned"] == aligned_path
+
+
+def test_aligned_tracksummary_relative_path_is_resolved_below_aligned_dir(tmp_path):
+    plot_hit_number = load_plot_hit_number_module()
+
+    files = plot_hit_number.comparison_files(
+        tmp_path,
+        "tracksummary_kf_v17l8_v24l4.root",
+        aligned_tracksummary="custom/tracksummary.root",
+    )
+
+    assert files["Aligned"] == tmp_path / "aligned" / "custom" / "tracksummary.root"
+
+
 def test_plot_comparison_uses_step_histograms_and_reference_labels(monkeypatch, tmp_path):
     plot_hit_number = load_plot_hit_number_module()
 

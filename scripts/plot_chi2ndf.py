@@ -10,7 +10,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from alignment_artifact_layout import TARGET_LAYER_DIR, artifact_filename, data_path
+from alignment_artifact_layout import artifact_filename, data_path
 from project_config import absolute_project_path, add_config_argument
 
 
@@ -72,23 +72,30 @@ def load_chi2_ndf(input_path: Path, label=""):
     return chi2_ndf_values(chi2, ndf, label=label)
 
 
-def vol_lay_directory_name(file_name: str):
+def vol_lay_directory_name(file_name: str | Path):
     import re
 
-    pairs = re.findall(r"v(\d+)_?l(\d+)", file_name)
+    pairs = re.findall(r"v(\d+)_?l(\d+)", Path(file_name).name)
     if not pairs:
         raise ValueError(f"Cannot infer vol/lay directory from file name: {file_name}")
     return "__".join(f"Vol{vol}_Lay{lay}" for vol, lay in pairs)
 
 
+def _tracksummary_path(recon_dir: Path, mode: str, file_name: str | Path):
+    path = Path(file_name)
+    if path.is_absolute():
+        return path
+    if len(path.parts) > 1:
+        return recon_dir / mode / path
+    return recon_dir / mode / vol_lay_directory_name(path.name) / path
+
+
 def comparison_files(recon_dir: Path, tracksummary_name: str, aligned_tracksummary=None):
     aligned_name = aligned_tracksummary or tracksummary_name
-    tracksummary_dir = vol_lay_directory_name(tracksummary_name)
-    aligned_dir = vol_lay_directory_name(aligned_name)
     return {
-        "Nominal": recon_dir / "nominal" / tracksummary_dir / tracksummary_name,
-        "Aligned": recon_dir / "aligned" / aligned_dir / aligned_name,
-        "Misaligned": recon_dir / "misaligned" / tracksummary_dir / tracksummary_name,
+        "Nominal": _tracksummary_path(recon_dir, "nominal", tracksummary_name),
+        "Aligned": _tracksummary_path(recon_dir, "aligned", aligned_name),
+        "Misaligned": _tracksummary_path(recon_dir, "misaligned", tracksummary_name),
     }
 
 
@@ -249,7 +256,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tracksummary-name", type=str, default=DEFAULT_TRACKSUMMARY,
                         help=f"Tracksummary file name for comparison mode (default: {DEFAULT_TRACKSUMMARY})")
     parser.add_argument("--aligned-tracksummary", type=absolute_project_path, default=None,
-                        help="Aligned tracksummary file name override for comparison mode")
+                        help="Path to the aligned tracksummary ROOT file")
     return parser
 
 
@@ -257,8 +264,7 @@ def main():
     parser = build_argument_parser()
     args = parser.parse_args()
     
-    output_dir = data_path("reconstruction_output/chi2_ndf") / TARGET_LAYER_DIR
-    output_path = output_dir / Path(args.output)
+    output_path = Path(args.output)
 
     if args.bins <= 0:
         sys.exit(f"error: invalid bins value: {args.bins}")
