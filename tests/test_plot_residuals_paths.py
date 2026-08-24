@@ -111,6 +111,50 @@ def test_write_residual_png_skips_empty_and_out_of_range_data(tmp_path):
     assert not empty_png.exists()
 
 
+def test_residual_png_legend_uses_two_lines_and_clears_central_peak(
+    monkeypatch, tmp_path
+):
+    plot_residuals = load_plot_residuals_module()
+    captured_figures = []
+    real_close = plot_residuals.plt.close
+    monkeypatch.setattr(
+        plot_residuals.plt, "close", lambda figure: captured_figures.append(figure)
+    )
+
+    plot_residuals.write_residual_png(
+        {
+            "Nominal": np.array([-1.0, 1.0]),
+            "Aligned": np.array([0.0, 0.0]),
+            "Misaligned": np.array([-2.0, 2.0]),
+        },
+        tmp_path / "legend.png",
+        var_name="res_X",
+        layer_tag="Vol17_Lay8",
+        plot_range=(-3.0, 3.0),
+        bins=20,
+    )
+
+    figure = captured_figures[0]
+    try:
+        figure.canvas.draw()
+        axis = figure.axes[0]
+        legend = axis.get_legend()
+        assert [text.get_text() for text in legend.get_texts()] == [
+            "Nominal\nMean: 0.0000 mm, Std: 1.0000 mm",
+            "Aligned\nMean: 0.0000 mm, Std: 0.0000 mm",
+            "Misaligned\nMean: 0.0000 mm, Std: 2.0000 mm",
+        ]
+
+        legend_bounds = legend.get_window_extent()
+        axis_bounds = axis.get_window_extent()
+        central_peak_x = axis.transData.transform((0.0, 0.0))[0]
+        assert legend_bounds.x0 > central_peak_x
+        assert legend_bounds.x1 <= axis_bounds.x1
+        assert legend_bounds.y1 <= axis_bounds.y1
+    finally:
+        real_close(figure)
+
+
 def test_histograms_writes_png_when_pyroot_is_available(tmp_path):
     plot_residuals = load_plot_residuals_module()
     if plot_residuals.ROOT is None:

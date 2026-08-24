@@ -171,8 +171,8 @@ def write_residual_png(
                 continue
             values, counts, bin_edges = plotted[label]
             legend_label = (
-                f"{label} (Mean: {np.mean(values):.4f} {units}, "
-                f"Std: {np.std(values):.4f} {units})"
+                f"{label}\nMean: {np.mean(values):.4f} {units}, "
+                f"Std: {np.std(values):.4f} {units}"
             )
             ax.stairs(
                 counts,
@@ -206,7 +206,7 @@ def write_residual_png(
         ax.set_xlim(*plot_range)
         ax.minorticks_on()
         ax.tick_params(direction="in", which="both", top=True, right=True)
-        ax.legend(fontsize=9)
+        ax.legend(fontsize=9, loc="upper right")
 
         output_png.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(output_png, dpi=150, bbox_inches="tight")
