@@ -2,8 +2,15 @@ import uproot
 import awkward as ak
 import numpy as np
 import argparse
+import os
 import re
 from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from alignment_artifact_layout import TARGET_LAYERS, artifact_filename, data_path
 from project_config import absolute_project_path, add_config_argument
@@ -16,6 +23,8 @@ except ImportError:
     ROOT = None
 
 ROOT_COLORS = {"Nominal": ROOT.kBlue, "Aligned": ROOT.kGreen+2, "Misaligned": ROOT.kRed} if ROOT else {}
+PLOT_COLORS = {"Nominal": "blue", "Aligned": "green", "Misaligned": "red"}
+GEOMETRY_ORDER = ("Nominal", "Aligned", "Misaligned")
 
 DEFAULT_TRACKSTATES = artifact_filename("trackstates_kf", ".root")
 
@@ -126,12 +135,95 @@ def get_branch_data(file_path: Path, tree_name: str, branch_meas: str, branch_pr
         return None
 
 
+def write_residual_png(
+    data_dict,
+    output_png: Path,
+    var_name,
+    layer_tag="",
+    units="mm",
+    plot_range=(-1.0, 1.0),
+    bins=100,
+    odd_resolution=None,
+    output_label="",
+):
+    plotted = {}
+    for label in GEOMETRY_ORDER:
+        data = data_dict.get(label)
+        if data is None:
+            continue
+        values = np.asarray(data, dtype=np.float64)
+        values = values[np.isfinite(values)]
+        if len(values) == 0:
+            continue
+        counts, bin_edges = np.histogram(values, bins=bins, range=plot_range)
+        if np.all(counts == 0):
+            continue
+        plotted[label] = (values, counts, bin_edges)
+
+    if not plotted:
+        print(f"Warning: No valid residual data for PNG output: {output_png.name}")
+        return False
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    try:
+        for label in GEOMETRY_ORDER:
+            if label not in plotted:
+                continue
+            values, counts, bin_edges = plotted[label]
+            legend_label = (
+                f"{label} (Mean: {np.mean(values):.4f} {units}, "
+                f"Std: {np.std(values):.4f} {units})"
+            )
+            ax.stairs(
+                counts,
+                bin_edges,
+                color=PLOT_COLORS.get(label, "black"),
+                linewidth=2.0,
+                label=legend_label,
+            )
+
+        if odd_resolution is not None:
+            reference_label = f"± ODD σ = {odd_resolution * 1e3:.1f} μm"
+            ax.axvline(
+                odd_resolution,
+                color="violet",
+                linestyle="--",
+                linewidth=1.8,
+                label=reference_label,
+            )
+            ax.axvline(
+                -odd_resolution,
+                color="violet",
+                linestyle="--",
+                linewidth=1.8,
+            )
+
+        label_suffix = f"-{output_label.upper()}" if output_label else ""
+        layer_suffix = f"_{layer_tag}" if layer_tag else ""
+        ax.set_title(f"({var_name}{layer_suffix}) Comparison{label_suffix}")
+        ax.set_xlabel(f"Residual [{units}]")
+        ax.set_ylabel("Number of hits")
+        ax.set_xlim(*plot_range)
+        ax.minorticks_on()
+        ax.tick_params(direction="in", which="both", top=True, right=True)
+        ax.legend(fontsize=9)
+
+        output_png.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_png, dpi=150, bbox_inches="tight")
+    finally:
+        plt.close(fig)
+
+    print(f" saved PNG: {output_png}")
+    return True
+
+
 def histograms(data_dict, base_dir, var_name, layer_tag="", units="mm", plot_range=(-1.0, 1.0), bins=100, odd_resolution=None, output_label=""):
     base_dir.mkdir(parents=True, exist_ok=True)
     file_suffix = f"{layer_tag}" if layer_tag else ""
     label_prefix = f"{output_label}_" if output_label else ""
     output_root = base_dir / f"{label_prefix}{var_name}_{file_suffix}_comparison.root"
-    print(f"\n Generating ROOT file: {output_root.name}")
+    output_png = output_root.with_suffix(".png")
+    print(f"\n Generating ROOT and PNG files: {output_root.stem}")
 
     try:
         f = ROOT.TFile(str(output_root), "RECREATE")
@@ -242,10 +334,22 @@ def histograms(data_dict, base_dir, var_name, layer_tag="", units="mm", plot_ran
                 counts, bin_edges = np.histogram(data, bins=bins, range=plot_range)
                 root_file[f"hist_{label.lower()}"] = (counts, bin_edges, f"{label};Residual [{units}];Hits")
 
+    write_residual_png(
+        data_dict,
+        output_png,
+        var_name=var_name,
+        layer_tag=layer_tag,
+        units=units,
+        plot_range=plot_range,
+        bins=bins,
+        odd_resolution=odd_resolution,
+        output_label=output_label,
+    )
+
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Save track residual distributions to ROOT files for the configured ODD target layers.")
+        description="Save track residual distributions to ROOT and PNG files for the configured ODD target layers.")
     add_config_argument(parser)
     parser.add_argument("--recon-dir", type=absolute_project_path, default=str(data_path("reconstruction_output")),
                         help="Reconstruction output base directory")
@@ -266,7 +370,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--label", type=str, default="",
                         help="Label appended to output file name and title (e.g. 'ml' → ml_res_X_..._comparison.root, title Comparison-ML)")
     parser.add_argument("--output-dir", type=absolute_project_path, default=None,
-                        help="Directory to save output ROOT files (default: same as --recon-dir)")
+                        help="Directory to save output ROOT and PNG files (default: same as --recon-dir)")
 
     return parser
 

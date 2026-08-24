@@ -4,6 +4,12 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import numpy as np
+import pytest
+
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
 
 def load_plot_residuals_module():
     module_path = Path(__file__).resolve().parents[1] / "scripts" / "plot_residuals.py"
@@ -64,3 +70,81 @@ def test_comparison_files_use_target_layer_subdirectories(tmp_path):
         / "Vol17_Lay8__Vol24_Lay4"
         / "trackstates_kf_v17l8_v24l4.root",
     }
+
+
+def test_write_residual_png_creates_valid_image_with_three_geometries(tmp_path):
+    plot_residuals = load_plot_residuals_module()
+    output_png = tmp_path / "trial-004_res_X_Vol17_Lay8_comparison.png"
+
+    written = plot_residuals.write_residual_png(
+        {
+            "Nominal": np.array([-0.02, 0.00, 0.01]),
+            "Aligned": np.array([-0.01, 0.00, 0.01]),
+            "Misaligned": np.array([0.03, 0.04, 0.05]),
+        },
+        output_png,
+        var_name="res_X",
+        layer_tag="Vol17_Lay8",
+        plot_range=(-0.1, 0.1),
+        bins=20,
+        odd_resolution=0.015,
+        output_label="trial-004",
+    )
+
+    assert written is True
+    assert output_png.read_bytes().startswith(PNG_SIGNATURE)
+
+
+def test_write_residual_png_skips_empty_and_out_of_range_data(tmp_path):
+    plot_residuals = load_plot_residuals_module()
+    empty_png = tmp_path / "empty.png"
+    written = plot_residuals.write_residual_png(
+        {"Nominal": np.array([]), "Aligned": None, "Misaligned": np.array([1.0])},
+        empty_png,
+        var_name="res_X",
+        layer_tag="Vol17_Lay8",
+        plot_range=(-0.1, 0.1),
+        bins=20,
+    )
+
+    assert written is False
+    assert not empty_png.exists()
+
+
+def test_histograms_writes_png_when_pyroot_is_available(tmp_path):
+    plot_residuals = load_plot_residuals_module()
+    if plot_residuals.ROOT is None:
+        pytest.skip("PyROOT is unavailable")
+
+    plot_residuals.histograms(
+        {"Nominal": np.array([-0.02, 0.00]), "Aligned": np.array([-0.01, 0.01])},
+        tmp_path,
+        "res_X",
+        layer_tag="Vol17_Lay8",
+        plot_range=(-0.1, 0.1),
+        bins=20,
+        output_label="trial-004",
+    )
+
+    output_stem = tmp_path / "trial-004_res_X_Vol17_Lay8_comparison"
+    assert output_stem.with_suffix(".root").exists()
+    assert output_stem.with_suffix(".png").read_bytes().startswith(PNG_SIGNATURE)
+
+
+def test_histograms_writes_png_without_pyroot(monkeypatch, tmp_path):
+    plot_residuals = load_plot_residuals_module()
+    monkeypatch.setattr(plot_residuals, "ROOT", None)
+
+    plot_residuals.histograms(
+        {"Nominal": np.array([-0.02, 0.00]), "Misaligned": np.array([0.03, 0.04])},
+        tmp_path,
+        "res_X",
+        layer_tag="Vol17_Lay8",
+        plot_range=(-0.1, 0.1),
+        bins=20,
+        output_label="trial-004",
+    )
+
+    output_stem = tmp_path / "trial-004_res_X_Vol17_Lay8_comparison"
+    assert output_stem.with_suffix(".root").exists()
+    assert output_stem.with_suffix(".png").read_bytes().startswith(PNG_SIGNATURE)
