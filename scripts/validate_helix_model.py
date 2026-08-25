@@ -1,8 +1,11 @@
-"""Validate the standalone helix model against nominal ACTS smoothed states.
+"""Validate helix interpolation/extrapolation against nominal measurements.
 
 The helix parameter order and geometry conventions intentionally mirror
 ``ml_alignment_autograd.py``: ``[x0, y0, z0, psi0, tanl, rho]`` and local
 coordinates obtained with ``rotation.T @ (global - center)``.
+
+SMT positions seed the helix fit, while held-out measurements are used only as
+the final prediction reference: ``predicted_local - measured_local``.
 """
 
 from __future__ import annotations
@@ -28,14 +31,39 @@ from alignment_artifact_layout import (
     reconstruction_root_path,
     target_layers_spec,
 )
-from project_config import absolute_project_path, add_config_argument
+from experiment_manifest import (
+    finalize_experiment_manifest,
+    write_experiment_manifest,
+)
+from project_config import (
+    absolute_project_path,
+    add_config_argument,
+    load_project_config,
+)
+try:
+    from .helix_model import (
+        S_MAX,
+        accept_newton_candidate,
+        closest_helix_points,
+        helix_point,
+        helix_tangent,
+        intersect_plane,
+    )
+except ImportError:  # Direct script execution.
+    from helix_model import (
+        S_MAX,
+        accept_newton_candidate,
+        closest_helix_points,
+        helix_point,
+        helix_tangent,
+        intersect_plane,
+    )
 
 
-S_MAX = 1200.0
-PLANE_PARALLEL_EPS = 1e-6
-PLANE_RESIDUAL_TOLERANCE = 1e-3
 DEFAULT_MIN_FIT_HITS = 8
 DEFAULT_MIN_FIT_SPAN = 300.0
+DEFAULT_MIN_EXTRAPOLATION_FIT_HITS = 4
+DEFAULT_MIN_EXTRAPOLATION_FIT_SPAN = 100.0
 DEFAULT_MAX_TRACKS = 1000
 DEFAULT_FIT_ITERS = 200
 DEFAULT_GEOMETRY_TOLERANCE = 1e-3
@@ -61,6 +89,8 @@ class HelixValidationConfig:
     holdout_layers: tuple[tuple[int, int], ...] | str = TARGET_LAYERS
     min_fit_hits: int = DEFAULT_MIN_FIT_HITS
     min_fit_span: float = DEFAULT_MIN_FIT_SPAN
+    min_extrapolation_fit_hits: int = DEFAULT_MIN_EXTRAPOLATION_FIT_HITS
+    min_extrapolation_fit_span: float = DEFAULT_MIN_EXTRAPOLATION_FIT_SPAN
     max_tracks: int = DEFAULT_MAX_TRACKS
     fit_iters: int = DEFAULT_FIT_ITERS
     gpu: bool = False
@@ -110,6 +140,11 @@ class TrackBatches:
     module_id: torch.Tensor
     event_track_ids: torch.Tensor
     fit_span: torch.Tensor
+    prediction_mode: tuple[str, ...]
+    context_hits_before: torch.Tensor
+    context_hits_after: torch.Tensor
+    nearest_context_distance: torch.Tensor
+    farthest_context_distance: torch.Tensor
 
 
 @dataclass
@@ -129,6 +164,31 @@ class HelixEvaluation:
     local_difference: torch.Tensor
     tangent_angle: torch.Tensor
     intersection_valid: torch.Tensor
+
+
+PREDICTION_MODES = (
+    "interpolation",
+    "forward_extrapolation",
+    "backward_extrapolation",
+)
+
+
+def measurement_residuals(
+    predicted_local: torch.Tensor,
+    measured_local: torch.Tensor,
+    measurement_variance: torch.Tensor,
+    loc1_valid: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return prediction-minus-measurement residuals and sigma normalization."""
+    residual = predicted_local - measured_local
+    component_valid = torch.stack(
+        (torch.ones_like(loc1_valid, dtype=torch.bool), loc1_valid), dim=-1
+    )
+    residual = torch.where(
+        component_valid, residual, torch.full_like(residual, torch.nan)
+    )
+    normalized = residual / torch.sqrt(measurement_variance.clamp_min(EPS_VARIANCE))
+    return residual, normalized
 
 
 def parse_layers(value) -> tuple[tuple[int, int], ...]:
@@ -512,157 +572,6 @@ def load_nominal_states(
     return _load_nominal_states_pyroot(path, id_to_idx, max_track_entries)
 
 
-def _sinc(value: torch.Tensor) -> torch.Tensor:
-    """Return sin(value) / value with a differentiable zero limit."""
-    return torch.sinc(value / torch.pi)
-
-
-def helix_point(track: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-    """Evaluate signed-curvature helices at transverse arc length ``s``."""
-    x0, y0, z0, psi0, tanl, rho = track.unbind(-1)
-    angle = rho * s
-    half_sinc = _sinc(angle / 2.0)
-    x = x0 + s * torch.cos(psi0 + angle / 2.0) * half_sinc
-    y = y0 + s * torch.sin(psi0 + angle / 2.0) * half_sinc
-    z = z0 + tanl * s
-    return torch.stack((x, y, z), dim=-1)
-
-
-def helix_tangent(track: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-    """Differentiate :func:`helix_point` with respect to transverse arc length."""
-    _x0, _y0, _z0, psi0, tanl, rho = track.unbind(-1)
-    psi = psi0 + rho * s
-    return torch.stack(
-        (torch.cos(psi), torch.sin(psi), tanl * torch.ones_like(s)), dim=-1
-    )
-
-
-def accept_newton_candidate(
-    previous: torch.Tensor,
-    candidate: torch.Tensor,
-    valid: torch.Tensor,
-    candidate_ok: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    updated_valid = valid & candidate_ok
-    return torch.where(updated_valid, candidate, previous), updated_valid
-
-
-def closest_helix_points(
-    track: torch.Tensor, points: torch.Tensor, n_newton: int = 8
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return closest points on each helix to reference global points."""
-    delta = points - track[..., :3]
-    s = delta[..., 0] * torch.cos(track[..., 3]) + delta[..., 1] * torch.sin(
-        track[..., 3]
-    )
-    valid = torch.isfinite(s)
-    s = torch.where(valid, s, torch.zeros_like(s))
-    for _ in range(n_newton):
-        position = helix_point(track, s)
-        tangent = helix_tangent(track, s)
-        displacement = position - points
-        rho = track[..., 5]
-        psi = track[..., 3] + rho * s
-        second = torch.stack(
-            (
-                -rho * torch.sin(psi),
-                rho * torch.cos(psi),
-                torch.zeros_like(rho),
-            ),
-            dim=-1,
-        )
-        first_derivative = torch.sum(displacement * tangent, dim=-1)
-        second_derivative = torch.sum(
-            tangent * tangent + displacement * second, dim=-1
-        )
-        safe = torch.where(
-            second_derivative.abs() > 1e-9,
-            second_derivative,
-            torch.where(
-                second_derivative >= 0,
-                torch.full_like(second_derivative, 1e-9),
-                torch.full_like(second_derivative, -1e-9),
-            ),
-        )
-        candidate = s - first_derivative / safe
-        candidate_ok = torch.isfinite(candidate) & (candidate.abs() <= S_MAX)
-        s, valid = accept_newton_candidate(s, candidate, valid, candidate_ok)
-    fitted = helix_point(track, s)
-    valid = valid & torch.isfinite(fitted).all(dim=-1)
-    fitted = torch.where(valid.unsqueeze(-1), fitted, track[..., :3])
-    return fitted, s, valid
-
-
-def intersect_plane(
-    track: torch.Tensor,
-    center: torch.Tensor,
-    normal: torch.Tensor,
-    n_newton: int = 12,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Intersect helices with detector planes using the joint solver convention."""
-    tangent0 = helix_tangent(track, torch.zeros_like(track[..., 0]))
-    denominator0 = torch.sum(tangent0 * normal, dim=-1)
-    straight_valid = denominator0.abs() >= PLANE_PARALLEL_EPS
-    safe_denominator = torch.where(
-        straight_valid,
-        denominator0,
-        torch.where(
-            denominator0 >= 0,
-            torch.ones_like(denominator0),
-            -torch.ones_like(denominator0),
-        ),
-    )
-    s = torch.sum((center - track[..., :3]) * normal, dim=-1) / safe_denominator
-    tangent_at_initial = helix_tangent(track, s)
-    initially_valid = (
-        straight_valid
-        & torch.isfinite(s)
-        & (
-            torch.sum(tangent_at_initial * normal, dim=-1).abs()
-            >= PLANE_PARALLEL_EPS
-        )
-    )
-    s = torch.where(initially_valid, s, torch.zeros_like(s))
-    iteration_valid = initially_valid
-    for _ in range(n_newton):
-        point = helix_point(track, s)
-        tangent = helix_tangent(track, s)
-        residual = torch.sum((point - center) * normal, dim=-1)
-        derivative = torch.sum(tangent * normal, dim=-1)
-        derivative_safe = torch.where(
-            derivative.abs() >= PLANE_PARALLEL_EPS,
-            derivative,
-            torch.where(
-                derivative >= 0,
-                torch.full_like(derivative, PLANE_PARALLEL_EPS),
-                torch.full_like(derivative, -PLANE_PARALLEL_EPS),
-            ),
-        )
-        candidate = s - residual / derivative_safe
-        candidate_ok = (
-            torch.isfinite(candidate)
-            & (candidate.abs() <= S_MAX)
-            & (derivative.abs() >= PLANE_PARALLEL_EPS)
-        )
-        s, iteration_valid = accept_newton_candidate(
-            s, candidate, iteration_valid, candidate_ok
-        )
-    point = helix_point(track, s)
-    final_residual = torch.sum((point - center) * normal, dim=-1).abs()
-    finite = torch.isfinite(s) & torch.isfinite(point).all(dim=-1)
-    valid = (
-        iteration_valid
-        & finite
-        & (s.abs() <= S_MAX)
-        & (final_residual <= PLANE_RESIDUAL_TOLERANCE)
-    )
-    point = torch.where(
-        valid.unsqueeze(-1), point, helix_point(track, torch.zeros_like(s))
-    )
-    s = torch.where(valid, s, torch.zeros_like(s))
-    return s, point, valid
-
-
 def validate_geometry_consistency(
     inputs: HelixInputs, geometry: NominalGeometry, tolerance: float = 1e-3
 ) -> dict[str, float]:
@@ -752,6 +661,79 @@ def _distribution(values: torch.Tensor) -> dict[str, float]:
         "mae": float(torch.mean(values.abs()).cpu()),
         "p95": float(torch.quantile(values.abs(), 0.95).cpu()),
     }
+
+
+def _signed_distribution(
+    values: torch.Tensor, normalized: torch.Tensor
+) -> dict[str, float | int | None]:
+    finite = torch.isfinite(values) & torch.isfinite(normalized)
+    values = values[finite]
+    normalized = normalized[finite]
+    if values.numel() == 0:
+        return {
+            "count": 0,
+            "bias": None,
+            "std": None,
+            "rmse": None,
+            "mae": None,
+            "p95": None,
+            "normalized_mean": None,
+            "normalized_rms": None,
+        }
+    return {
+        "count": int(values.numel()),
+        "bias": float(values.mean().cpu()),
+        "std": float(values.std(correction=0).cpu()),
+        "rmse": float(torch.sqrt(values.square().mean()).cpu()),
+        "mae": float(values.abs().mean().cpu()),
+        "p95": float(torch.quantile(values.abs(), 0.95).cpu()),
+        "normalized_mean": float(normalized.mean().cpu()),
+        "normalized_rms": float(torch.sqrt(normalized.square().mean()).cpu()),
+    }
+
+
+def summarize_measurement_evaluation(
+    evaluation: HelixEvaluation,
+    batches: TrackBatches,
+    selection_mask: torch.Tensor,
+) -> dict[str, float | int | None]:
+    """Summarize prediction-minus-measurement accuracy for selected hits."""
+    device = evaluation.local_position.device
+    requested = selection_mask.to(device=device)
+    requested_count = int(requested.sum().item())
+    if requested_count == 0:
+        raise ValueError("The requested measurement evaluation selection is empty.")
+    valid = requested & evaluation.intersection_valid
+    residual, normalized = measurement_residuals(
+        evaluation.local_position,
+        batches.measured_local.to(device=device, dtype=evaluation.local_position.dtype),
+        batches.measurement_variance.to(
+            device=device, dtype=evaluation.local_position.dtype
+        ),
+        batches.loc1_valid.to(device=device),
+    )
+    loc0 = _signed_distribution(residual[..., 0][valid], normalized[..., 0][valid])
+    loc1 = _signed_distribution(residual[..., 1][valid], normalized[..., 1][valid])
+    direction = _distribution(evaluation.tangent_angle[valid])
+    result: dict[str, float | int | None] = {
+        "count": requested_count,
+        "valid_count": int(valid.sum().item()),
+        "intersection_failure_rate": 1.0
+        - int(valid.sum().item()) / requested_count,
+        "direction_angle_rms_rad": direction["rmse"],
+        "direction_angle_mae_rad": direction["mae"],
+        "direction_angle_p95_rad": direction["p95"],
+    }
+    for component, stats in (("local0", loc0), ("local1", loc1)):
+        result[f"{component}_count"] = stats["count"]
+        result[f"{component}_bias_mm"] = stats["bias"]
+        result[f"{component}_std_mm"] = stats["std"]
+        result[f"{component}_rmse_mm"] = stats["rmse"]
+        result[f"{component}_mae_mm"] = stats["mae"]
+        result[f"{component}_p95_mm"] = stats["p95"]
+        result[f"{component}_normalized_mean"] = stats["normalized_mean"]
+        result[f"{component}_normalized_rms"] = stats["normalized_rms"]
+    return result
 
 
 def summarize_evaluation(
@@ -924,10 +906,26 @@ def build_track_batches(
     max_tracks: int = 0,
     context_hits_before: int = 0,
     context_hits_after: int = 0,
+    min_extrapolation_fit_hits: int | None = None,
+    min_extrapolation_fit_span: float | None = None,
 ) -> TrackBatches:
     """Build one local fit window for every held-out measurement state."""
     if context_hits_before < 0 or context_hits_after < 0:
         raise ValueError("Context hit counts must be non-negative.")
+    extrapolation_hits = (
+        min_fit_hits
+        if min_extrapolation_fit_hits is None
+        else min_extrapolation_fit_hits
+    )
+    extrapolation_span = (
+        min_fit_span
+        if min_extrapolation_fit_span is None
+        else min_extrapolation_fit_span
+    )
+    if extrapolation_hits < 2:
+        raise ValueError("min_extrapolation_fit_hits must be at least 2.")
+    if extrapolation_span < 0:
+        raise ValueError("min_extrapolation_fit_span must be non-negative.")
     holdout_layers = {tuple(map(int, layer)) for layer in holdout_layers}
     positions = inputs.hit_global_positions.detach().cpu().numpy()
     event_ids = inputs.hit_event_ids.detach().cpu().numpy()
@@ -960,7 +958,7 @@ def build_track_batches(
         (ordered_events[1:] != ordered_events[:-1])
         | (ordered_tracks[1:] != ordered_tracks[:-1])
     ) + 1
-    selected = []
+    selected_by_mode = {mode: [] for mode in PREDICTION_MODES}
     for indices in np.split(order, boundaries):
         if supplied_path is not None:
             indices = indices[np.argsort(supplied_path[indices], kind="stable")]
@@ -989,34 +987,81 @@ def build_track_batches(
         key = (int(event_ids[indices[0]]), int(track_ids[indices[0]]))
         for holdout_index in holdout_indices:
             holdout_path = path_values[holdout_index]
-            before = [
+            before_all = [
                 index for index in all_fit_indices if path_values[index] < holdout_path
             ]
-            after = [
+            after_all = [
                 index for index in all_fit_indices if path_values[index] > holdout_path
             ]
-            if context_hits_before > 0:
-                before = before[-context_hits_before:]
-            if context_hits_after > 0:
-                after = after[:context_hits_after]
-            fit_indices = before + after
-            if len(fit_indices) < min_fit_hits:
-                continue
-            fit_paths = path_values[fit_indices]
-            fit_span = float(np.max(fit_paths) - np.min(fit_paths))
-            if fit_span < min_fit_span:
-                continue
-            row_indices = sorted(
-                fit_indices + [holdout_index], key=lambda index: path_values[index]
+            interpolation_before = (
+                before_all[-context_hits_before:]
+                if context_hits_before > 0
+                else before_all
             )
-            selected.append((key, row_indices, fit_span))
-    if max_tracks > 0:
-        selected = selected[:max_tracks]
+            interpolation_after = (
+                after_all[:context_hits_after]
+                if context_hits_after > 0
+                else after_all
+            )
+            candidates = (
+                (
+                    "interpolation",
+                    interpolation_before,
+                    interpolation_after,
+                ),
+                (
+                    "forward_extrapolation",
+                    before_all[-extrapolation_hits:],
+                    [],
+                ),
+                (
+                    "backward_extrapolation",
+                    [],
+                    after_all[:extrapolation_hits],
+                ),
+            )
+            for mode, before, after in candidates:
+                if mode == "interpolation" and (not before or not after):
+                    continue
+                fit_indices = before + after
+                required_hits = (
+                    min_fit_hits if mode == "interpolation" else extrapolation_hits
+                )
+                required_span = (
+                    min_fit_span if mode == "interpolation" else extrapolation_span
+                )
+                if len(fit_indices) < required_hits:
+                    continue
+                fit_paths = path_values[fit_indices]
+                fit_span = float(np.max(fit_paths) - np.min(fit_paths))
+                if fit_span < required_span:
+                    continue
+                row_indices = sorted(
+                    fit_indices + [holdout_index], key=lambda index: path_values[index]
+                )
+                selected_by_mode[mode].append(
+                    (
+                        key,
+                        row_indices,
+                        fit_span,
+                        mode,
+                        len(before),
+                        len(after),
+                        float(np.min(np.abs(fit_paths - holdout_path))),
+                        float(np.max(np.abs(fit_paths - holdout_path))),
+                    )
+                )
+    selected = []
+    for mode in PREDICTION_MODES:
+        mode_rows = selected_by_mode[mode]
+        if max_tracks > 0:
+            mode_rows = mode_rows[:max_tracks]
+        selected.extend(mode_rows)
     if not selected:
         raise ValueError("No tracks satisfy the helix validation selection.")
 
     n_tracks = len(selected)
-    max_hits = max(len(indices) for _key, indices, _span in selected)
+    max_hits = max(len(item[1]) for item in selected)
     dtype = inputs.hit_global_positions.dtype
     smt_local = torch.full((n_tracks, max_hits, 2), torch.nan, dtype=inputs.smt_local.dtype)
     measured_local = torch.zeros(
@@ -1037,7 +1082,21 @@ def build_track_batches(
     module_id = torch.zeros((n_tracks, max_hits), dtype=torch.long)
     event_track_ids = torch.zeros((n_tracks, 2), dtype=torch.long)
     fit_span = torch.zeros(n_tracks, dtype=dtype)
-    for row, (key, indices, span) in enumerate(selected):
+    prediction_mode = []
+    selected_before = torch.zeros(n_tracks, dtype=torch.long)
+    selected_after = torch.zeros(n_tracks, dtype=torch.long)
+    nearest_context_distance = torch.zeros(n_tracks, dtype=dtype)
+    farthest_context_distance = torch.zeros(n_tracks, dtype=dtype)
+    for row, (
+        key,
+        indices,
+        span,
+        mode,
+        before_count,
+        after_count,
+        nearest_distance,
+        farthest_distance,
+    ) in enumerate(selected):
         count = len(indices)
         index = torch.tensor(indices, dtype=torch.long)
         sensor_idx[row, :count] = inputs.hit_sensor_ids[index]
@@ -1062,6 +1121,11 @@ def build_track_batches(
         fit_mask[row, :count] = ~is_holdout
         event_track_ids[row] = torch.tensor(key)
         fit_span[row] = span
+        prediction_mode.append(mode)
+        selected_before[row] = before_count
+        selected_after[row] = after_count
+        nearest_context_distance[row] = nearest_distance
+        farthest_context_distance[row] = farthest_distance
     return TrackBatches(
         measured_local=measured_local,
         measurement_variance=measurement_variance,
@@ -1078,6 +1142,11 @@ def build_track_batches(
         module_id=module_id,
         event_track_ids=event_track_ids,
         fit_span=fit_span,
+        prediction_mode=tuple(prediction_mode),
+        context_hits_before=selected_before,
+        context_hits_after=selected_after,
+        nearest_context_distance=nearest_context_distance,
+        farthest_context_distance=farthest_context_distance,
     )
 
 
@@ -1126,6 +1195,68 @@ def _comparison_metrics(
         - float((requested & initial_valid).sum()) / requested_count,
         "fitted_intersection_failure_rate": 1.0
         - float((requested & fitted_valid).sum()) / requested_count,
+        "initial": initial_metrics,
+        "fitted": fitted_metrics,
+    }
+
+
+def _empty_measurement_metrics() -> dict[str, float | int | None]:
+    metrics: dict[str, float | int | None] = {
+        "count": 0,
+        "valid_count": 0,
+        "intersection_failure_rate": None,
+        "direction_angle_rms_rad": None,
+        "direction_angle_mae_rad": None,
+        "direction_angle_p95_rad": None,
+    }
+    for component in ("local0", "local1"):
+        metrics[f"{component}_count"] = 0
+        for suffix in (
+            "bias_mm",
+            "std_mm",
+            "rmse_mm",
+            "mae_mm",
+            "p95_mm",
+            "normalized_mean",
+            "normalized_rms",
+        ):
+            metrics[f"{component}_{suffix}"] = None
+    return metrics
+
+
+def _measurement_comparison_metrics(
+    initial: HelixEvaluation,
+    fitted: HelixEvaluation,
+    batches: TrackBatches,
+    selection_mask: torch.Tensor,
+) -> dict:
+    requested = selection_mask.cpu()
+    requested_count = int(requested.sum().item())
+    if requested_count == 0:
+        return {
+            "requested_count": 0,
+            "common_valid_count": 0,
+            "initial_intersection_failure_rate": None,
+            "fitted_intersection_failure_rate": None,
+            "initial": _empty_measurement_metrics(),
+            "fitted": _empty_measurement_metrics(),
+        }
+    initial_valid = initial.intersection_valid.cpu()
+    fitted_valid = fitted.intersection_valid.cpu()
+    common = requested & initial_valid & fitted_valid
+    if common.any():
+        initial_metrics = summarize_measurement_evaluation(initial, batches, common)
+        fitted_metrics = summarize_measurement_evaluation(fitted, batches, common)
+    else:
+        initial_metrics = _empty_measurement_metrics()
+        fitted_metrics = _empty_measurement_metrics()
+    return {
+        "requested_count": requested_count,
+        "common_valid_count": int(common.sum().item()),
+        "initial_intersection_failure_rate": 1.0
+        - float((requested & initial_valid).sum().item()) / requested_count,
+        "fitted_intersection_failure_rate": 1.0
+        - float((requested & fitted_valid).sum().item()) / requested_count,
         "initial": initial_metrics,
         "fitted": fitted_metrics,
     }
@@ -1197,6 +1328,55 @@ def _validation_pass(
     return not reasons, reasons
 
 
+def _measurement_validation_pass(
+    holdout_by_layer_and_mode: dict[str, dict[str, dict]],
+    max_failure_rate: float,
+    layer_local_limits: dict[str, tuple[float, float]],
+    max_direction_angle_rms: float,
+) -> tuple[bool, list[str]]:
+    """Apply absolute measurement-accuracy gates to every layer and mode."""
+    reasons: list[str] = []
+    for layer, by_mode in holdout_by_layer_and_mode.items():
+        for mode in PREDICTION_MODES:
+            scope = f"holdout layer {layer} {mode}"
+            metrics = by_mode.get(mode)
+            if metrics is None or metrics.get("requested_count", 0) < 1:
+                reasons.append(f"{scope} has no selected measurement")
+                continue
+            if metrics.get("common_valid_count", 0) < 1:
+                reasons.append(f"{scope} has no common valid intersection")
+                continue
+            failure_rate = float(metrics["fitted_intersection_failure_rate"])
+            if failure_rate > max_failure_rate:
+                reasons.append(
+                    f"{scope} intersection failure rate {failure_rate:.2%} exceeds "
+                    f"{max_failure_rate:.2%}"
+                )
+            fitted = metrics["fitted"]
+            limits = layer_local_limits[layer]
+            for index, component in enumerate(("LOC0", "LOC1")):
+                count = int(fitted.get(f"local{index}_count", 0))
+                value = fitted.get(f"local{index}_rmse_mm")
+                if count < 1 or value is None:
+                    continue
+                if not np.isfinite(value) or value > limits[index]:
+                    reasons.append(
+                        f"{scope} {component} RMSE {value:.6g} mm exceeds "
+                        f"{limits[index]:.6g} mm"
+                    )
+            angle = fitted.get("direction_angle_rms_rad")
+            if (
+                angle is None
+                or not np.isfinite(angle)
+                or angle > max_direction_angle_rms
+            ):
+                reasons.append(
+                    f"{scope} direction-angle RMS {angle} rad exceeds "
+                    f"{max_direction_angle_rms:.6g} rad"
+                )
+    return not reasons, reasons
+
+
 def _as_numpy(tensor: torch.Tensor) -> np.ndarray:
     return tensor.detach().cpu().numpy()
 
@@ -1228,9 +1408,42 @@ def build_comparison_frame(
     fitted_global_diff = selected(fitted.global_difference)
     initial_local_diff = selected(initial.local_difference)
     fitted_local_diff = selected(fitted.local_difference)
+    measured_local = selected(batches.measured_local)
+    measurement_variance = selected(batches.measurement_variance)
+    loc1_valid = selected(batches.loc1_valid).astype(bool)
+    initial_measurement_residual, initial_measurement_normalized = measurement_residuals(
+        initial.local_position,
+        batches.measured_local.to(
+            device=initial.local_position.device, dtype=initial.local_position.dtype
+        ),
+        batches.measurement_variance.to(
+            device=initial.local_position.device, dtype=initial.local_position.dtype
+        ),
+        batches.loc1_valid.to(device=initial.local_position.device),
+    )
+    fitted_measurement_residual, fitted_measurement_normalized = measurement_residuals(
+        fitted.local_position,
+        batches.measured_local.to(
+            device=fitted.local_position.device, dtype=fitted.local_position.dtype
+        ),
+        batches.measurement_variance.to(
+            device=fitted.local_position.device, dtype=fitted.local_position.dtype
+        ),
+        batches.loc1_valid.to(device=fitted.local_position.device),
+    )
+    row_modes = np.asarray(batches.prediction_mode, dtype=object)
+    context_before = _as_numpy(batches.context_hits_before)[track_rows]
+    context_after = _as_numpy(batches.context_hits_after)[track_rows]
+    nearest_context_distance = _as_numpy(batches.nearest_context_distance)[track_rows]
+    farthest_context_distance = _as_numpy(batches.farthest_context_distance)[track_rows]
     frame = pd.DataFrame(
         {
             "split": np.where(selected(batches.holdout_mask), "holdout", "fit"),
+            "prediction_mode": row_modes[track_rows],
+            "context_hits_before": context_before,
+            "context_hits_after": context_after,
+            "nearest_context_distance_mm": nearest_context_distance,
+            "farthest_context_distance_mm": farthest_context_distance,
             "event_nr": event_track[track_rows, 0],
             "track_nr": event_track[track_rows, 1],
             "volume_id": selected(batches.volume_id),
@@ -1242,6 +1455,15 @@ def build_comparison_frame(
             "g_z_smt": smt_global[:, 2],
             "eLOC0_smt": smt_local[:, 0],
             "eLOC1_smt": smt_local[:, 1],
+            "measurement_LOC0": measured_local[:, 0],
+            "measurement_LOC1": np.where(
+                loc1_valid, measured_local[:, 1], np.nan
+            ),
+            "measurement_sigma_LOC0": np.sqrt(measurement_variance[:, 0]),
+            "measurement_sigma_LOC1": np.where(
+                loc1_valid, np.sqrt(measurement_variance[:, 1]), np.nan
+            ),
+            "measurement_LOC1_valid": loc1_valid,
             "initial_g_x": initial_global[:, 0],
             "initial_g_y": initial_global[:, 1],
             "initial_g_z": initial_global[:, 2],
@@ -1262,6 +1484,30 @@ def build_comparison_frame(
             "initial_dLOC1": initial_local_diff[:, 1],
             "fitted_dLOC0": fitted_local_diff[:, 0],
             "fitted_dLOC1": fitted_local_diff[:, 1],
+            "initial_measurement_residual_LOC0": selected(
+                initial_measurement_residual[..., 0]
+            ),
+            "initial_measurement_residual_LOC1": selected(
+                initial_measurement_residual[..., 1]
+            ),
+            "fitted_measurement_residual_LOC0": selected(
+                fitted_measurement_residual[..., 0]
+            ),
+            "fitted_measurement_residual_LOC1": selected(
+                fitted_measurement_residual[..., 1]
+            ),
+            "initial_measurement_normalized_LOC0": selected(
+                initial_measurement_normalized[..., 0]
+            ),
+            "initial_measurement_normalized_LOC1": selected(
+                initial_measurement_normalized[..., 1]
+            ),
+            "fitted_measurement_normalized_LOC0": selected(
+                fitted_measurement_normalized[..., 0]
+            ),
+            "fitted_measurement_normalized_LOC1": selected(
+                fitted_measurement_normalized[..., 1]
+            ),
             "initial_direction_angle_rad": selected(initial.tangent_angle),
             "fitted_direction_angle_rad": selected(fitted.tangent_angle),
             "initial_intersection_valid": selected(initial.intersection_valid),
@@ -1287,6 +1533,10 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
         raise ValueError("min_fit_hits must be at least 2.")
     if config.min_fit_span < 0:
         raise ValueError("min_fit_span must be non-negative.")
+    if config.min_extrapolation_fit_hits < 2:
+        raise ValueError("min_extrapolation_fit_hits must be at least 2.")
+    if config.min_extrapolation_fit_span < 0:
+        raise ValueError("min_extrapolation_fit_span must be non-negative.")
     if config.fit_iters < 1:
         raise ValueError("fit_iters must be at least 1.")
     if config.max_tracks < 0:
@@ -1312,6 +1562,47 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
     ):
         if not Path(input_path).exists():
             raise FileNotFoundError(f"{label} does not exist: {input_path}")
+
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = write_experiment_manifest(
+        output_dir,
+        run_id=f"helix-validation-{output_dir.name}",
+        command=[sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+        config=load_project_config(),
+        inputs={
+            "nominal_trackstates": config.states,
+            "current_geometry": config.geometry,
+            "nominal_full_geometry": config.nominal_full_geometry,
+        },
+        outputs={
+            "summary": output_dir / "helix_validation_summary.json",
+            "measurement_comparison": output_dir
+            / "helix_measurement_comparison.csv",
+            "smt_comparison": output_dir / "helix_smt_comparison.csv",
+            "plots": output_dir / "plots",
+        },
+        metrics={
+            "effective_validation_config": {
+                "states": str(config.states),
+                "geometry": str(config.geometry),
+                "nominal_full_geometry": str(config.nominal_full_geometry),
+                "holdout_layers": [
+                    f"{volume}:{layer}" for volume, layer in holdout_layers
+                ],
+                "min_fit_hits": config.min_fit_hits,
+                "min_fit_span_mm": config.min_fit_span,
+                "min_extrapolation_fit_hits": config.min_extrapolation_fit_hits,
+                "min_extrapolation_fit_span_mm": config.min_extrapolation_fit_span,
+                "max_tracks_per_mode": config.max_tracks,
+                "fit_iters": config.fit_iters,
+                "context_hits_before": config.context_hits_before,
+                "context_hits_after": config.context_hits_after,
+                "rng_seed": config.rng_seed,
+            }
+        },
+        status="running",
+    )
 
     use_cuda = bool(config.gpu and torch.cuda.is_available())
     if config.gpu and not use_cuda:
@@ -1346,6 +1637,8 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
         max_tracks=config.max_tracks,
         context_hits_before=config.context_hits_before,
         context_hits_after=config.context_hits_after,
+        min_extrapolation_fit_hits=config.min_extrapolation_fit_hits,
+        min_extrapolation_fit_span=config.min_extrapolation_fit_span,
     )
     initial_parameters = initialize_helices(batches, device=device, dtype=dtype)
     seeded_parameters = seed_helices(
@@ -1363,20 +1656,48 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
         initial_parameters, batches, geometry
     )
     fitted = evaluate_helix_on_surfaces(fitted_parameters, batches, geometry)
-    fit_metrics = _comparison_metrics(initial, fitted, batches.fit_mask)
-    holdout_metrics = _comparison_metrics(initial, fitted, batches.holdout_mask)
+    fit_metrics = _measurement_comparison_metrics(
+        initial, fitted, batches, batches.fit_mask
+    )
+    holdout_metrics = _measurement_comparison_metrics(
+        initial, fitted, batches, batches.holdout_mask
+    )
+    smt_diagnostics = {
+        "fit_surfaces": _comparison_metrics(initial, fitted, batches.fit_mask),
+        "holdout_overall": _comparison_metrics(
+            initial, fitted, batches.holdout_mask
+        ),
+    }
+    mode_rows = {
+        mode: torch.tensor(
+            [value == mode for value in batches.prediction_mode], dtype=torch.bool
+        )[:, None].expand_as(batches.holdout_mask)
+        for mode in PREDICTION_MODES
+    }
+    holdout_by_mode = {
+        mode: _measurement_comparison_metrics(
+            initial, fitted, batches, batches.holdout_mask & mode_rows[mode]
+        )
+        for mode in PREDICTION_MODES
+    }
     holdout_by_layer = {}
+    holdout_by_layer_and_mode = {}
     for volume, layer in holdout_layers:
         mask = (
             batches.holdout_mask
             & (batches.volume_id == volume)
             & (batches.layer_id == layer)
         )
-        if not mask.any():
-            raise ValueError(f"Holdout layer {volume}:{layer} has no selected SMT states.")
-        holdout_by_layer[f"{volume}:{layer}"] = _comparison_metrics(
-            initial, fitted, mask
+        layer_key = f"{volume}:{layer}"
+        holdout_by_layer[layer_key] = _measurement_comparison_metrics(
+            initial, fitted, batches, mask
         )
+        holdout_by_layer_and_mode[layer_key] = {
+            mode: _measurement_comparison_metrics(
+                initial, fitted, batches, mask & mode_rows[mode]
+            )
+            for mode in PREDICTION_MODES
+        }
     layer_local_limits = {}
     for volume, layer in holdout_layers:
         if volume in {16, 17, 18}:
@@ -1390,9 +1711,8 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
                 config.max_strip_loc1_rmse,
             )
         layer_local_limits[f"{volume}:{layer}"] = limits
-    passed, failure_reasons = _validation_pass(
-        holdout_metrics,
-        holdout_by_layer,
+    passed, failure_reasons = _measurement_validation_pass(
+        holdout_by_layer_and_mode,
         config.max_intersection_failure_rate,
         layer_local_limits=layer_local_limits,
         max_direction_angle_rms=config.max_direction_angle_rms,
@@ -1402,7 +1722,7 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
         "failure_reasons": failure_reasons,
         "seed_source": "smt",
         "fit_source": "measurement",
-        "validation_reference": "smt",
+        "validation_reference": "measurement",
         "comparison_baseline": "unrefined_smt_initialization",
         "config": {
             "states": str(config.states),
@@ -1411,6 +1731,8 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
             "holdout_layers": [f"{volume}:{layer}" for volume, layer in holdout_layers],
             "min_fit_hits": config.min_fit_hits,
             "min_fit_span_mm": config.min_fit_span,
+            "min_extrapolation_fit_hits": config.min_extrapolation_fit_hits,
+            "min_extrapolation_fit_span_mm": config.min_extrapolation_fit_span,
             "max_tracks": config.max_tracks,
             "root_entry_stop": entry_stop,
             "fit_iters": config.fit_iters,
@@ -1435,10 +1757,11 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
         },
         "fit_surfaces": fit_metrics,
         "holdout_overall": holdout_metrics,
+        "holdout_by_mode": holdout_by_mode,
         "holdout_by_layer": holdout_by_layer,
+        "holdout_by_layer_and_mode": holdout_by_layer_and_mode,
+        "smt_diagnostics": smt_diagnostics,
     }
-    output_dir = Path(config.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     comparison_frame = build_comparison_frame(
         batches,
         initial_parameters,
@@ -1450,6 +1773,10 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
         output_dir / "helix_smt_comparison.csv",
         comparison_frame,
     )
+    write_comparison_csv(
+        output_dir / "helix_measurement_comparison.csv",
+        comparison_frame.loc[comparison_frame["split"] == "holdout"],
+    )
     with open(output_dir / "helix_validation_summary.json", "w", encoding="utf-8") as stream:
         json.dump(summary, stream, indent=2, allow_nan=False)
     from helix_validation_plots import write_residual_plots
@@ -1459,34 +1786,49 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
         output_dir / "plots",
         holdout_layers,
     )
+    finalize_experiment_manifest(
+        manifest_path,
+        status="completed",
+        outputs={
+            "summary": output_dir / "helix_validation_summary.json",
+            "measurement_comparison": output_dir
+            / "helix_measurement_comparison.csv",
+            "smt_comparison": output_dir / "helix_smt_comparison.csv",
+            "plots": output_dir / "plots",
+        },
+        metrics={"validation_summary": summary},
+    )
     print_validation_summary(summary, output_dir)
     return summary
 
 
 def print_validation_summary(summary: dict, output_dir: Path) -> None:
-    print("\n=== Nominal helix validation ===")
+    print("\n=== Nominal helix measurement validation ===")
     print(
         f"Tracks={summary['n_tracks']} fit_hits={summary['n_fit_hits']} "
         f"holdout_hits={summary['n_holdout_hits']}"
     )
     print(
-        f"{'Selection':<16} {'Global RMSE':>14} {'Local RMSE':>14} "
+        f"{'Selection':<38} {'LOC0 RMSE':>14} {'LOC1 RMSE':>14} "
         f"{'Angle RMS':>14} {'Fail rate':>12}"
     )
-    rows = [("holdout overall", summary["holdout_overall"])] + list(
-        summary["holdout_by_layer"].items()
+    rows = [("holdout overall", summary["holdout_overall"])]
+    rows.extend(
+        (f"{layer} {mode}", metrics)
+        for layer, by_mode in summary["holdout_by_layer_and_mode"].items()
+        for mode, metrics in by_mode.items()
     )
     for name, comparison in rows:
         fitted = comparison["fitted"]
-        global_text = (
+        loc0_text = (
             "n/a"
-            if fitted["global_rmse_mm"] is None
-            else f"{fitted['global_rmse_mm']:.6f}mm"
+            if fitted["local0_rmse_mm"] is None
+            else f"{fitted['local0_rmse_mm']:.6f}mm"
         )
-        local_text = (
+        loc1_text = (
             "n/a"
-            if fitted["local_rmse_mm"] is None
-            else f"{fitted['local_rmse_mm']:.6f}mm"
+            if fitted["local1_rmse_mm"] is None
+            else f"{fitted['local1_rmse_mm']:.6f}mm"
         )
         angle_text = (
             "n/a"
@@ -1494,10 +1836,10 @@ def print_validation_summary(summary: dict, output_dir: Path) -> None:
             else f"{fitted['direction_angle_rms_rad']:.6g}rad"
         )
         print(
-            f"{name:<16} {global_text:>14} "
-            f"{local_text:>14} "
+            f"{name:<38} {loc0_text:>14} "
+            f"{loc1_text:>14} "
             f"{angle_text:>14} "
-            f"{comparison['fitted_intersection_failure_rate']:>11.2%}"
+            f"{comparison['fitted_intersection_failure_rate'] or 0.0:>11.2%}"
         )
     state = "PASS" if summary["passed"] else "FAIL"
     print(f"Result: {state}")
@@ -1524,6 +1866,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--holdout-layers", default=target_layers_spec())
     parser.add_argument("--min-fit-hits", type=int, default=defaults.min_fit_hits)
     parser.add_argument("--min-fit-span", type=float, default=defaults.min_fit_span)
+    parser.add_argument(
+        "--min-extrapolation-fit-hits",
+        type=int,
+        default=defaults.min_extrapolation_fit_hits,
+    )
+    parser.add_argument(
+        "--min-extrapolation-fit-span",
+        type=float,
+        default=defaults.min_extrapolation_fit_span,
+    )
     parser.add_argument("--max-tracks", type=int, default=defaults.max_tracks)
     parser.add_argument("--fit-iters", type=int, default=defaults.fit_iters)
     parser.add_argument(
@@ -1574,6 +1926,8 @@ def config_from_args(args: argparse.Namespace) -> HelixValidationConfig:
         holdout_layers=args.holdout_layers,
         min_fit_hits=args.min_fit_hits,
         min_fit_span=args.min_fit_span,
+        min_extrapolation_fit_hits=args.min_extrapolation_fit_hits,
+        min_extrapolation_fit_span=args.min_extrapolation_fit_span,
         max_tracks=args.max_tracks,
         fit_iters=args.fit_iters,
         context_hits_before=args.context_hits_before,
@@ -1592,9 +1946,17 @@ def config_from_args(args: argparse.Namespace) -> HelixValidationConfig:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
+    config = config_from_args(args)
     try:
-        summary = run_helix_validation(config_from_args(args))
+        summary = run_helix_validation(config)
     except Exception as exc:
+        manifest_path = Path(config.output_dir) / "manifest.json"
+        if manifest_path.exists():
+            finalize_experiment_manifest(
+                manifest_path,
+                status="failed",
+                metrics={"error": f"{type(exc).__name__}: {exc}"},
+            )
         print(f"Helix validation error: {exc}", file=sys.stderr)
         return 2
     return 0 if summary["passed"] else 1

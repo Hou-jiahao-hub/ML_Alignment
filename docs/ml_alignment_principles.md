@@ -791,3 +791,41 @@ python ml_alignment_autograd.py --track-mode free \
 - 几何修正在 local frame 中表达，写回 JSON 时平移使用 `R_old @ δt_local` 转到 global frame。
 - 1D strip hit 的 LOC1 被显式置零权重，不参与训练。
 - ShortStrip volume `23, 24, 25` 的 LOC1 方差下限是当前代码中的经验物理约束。
+
+## 9. Surface warm-start + joint free-helix 固定流程
+
+生产编排器 `run_surface_helix_experiment.sh` 不再使用 nominal RMS 比值、候选层筛选或
+frozen-helix 控制流。固定阶段为：两轮 surface 校准及同事件重建；排除
+`Vol17_Lay8`、`Vol24_Lay4` 后，以至少 8 个非目标 hit 和 300 mm 路径跨度选择轨迹；
+先对非目标 SMT 全局点拟合六参数 helix，再以当前工作几何上的非目标 local
+measurement χ²精拟合。refit 的位置、方向、缩放曲率使用独立学习率并保存初始/最佳
+checkpoint。随后固定轨迹，只由目标层 measurement 联合求解两个目标层的
+`(tx,ty,rz)`；目标层 measurement 不再反向更新轨迹。
+
+公共数学位于 `helix_model.py`。两个调用脚本共享参数顺序
+`(x0,y0,z0,psi0,tan_lambda,rho)`、`rho/1e-4` 优化缩放、Newton 最近点/平面求交、
+`|s|<=1200 mm` 和数值容差。初始化禁止回退到目标层数据；任一初始化阶段无有效轨迹
+或求交失败率超过 5% 时直接失败。
+
+几何 block 使用逐 sensor 阻尼 Gauss--Newton/LM。参数按
+`(1 mm,1 mm,0.01 rad)` 归一化，Fisher 最小特征值下限为最大特征值的 `1e-4`；
+候选步只在实际 measurement χ²下降且求交失败率不超过 5% 时接受。该 Fisher
+正则用于约束 ShortStrip `ty` 等弱可观测模，并在 solver summary 中记录条件数、
+正则强度与实际步长。
+
+全部事件按固定 seed `6006` 哈希切成 train/calibration/validation = 80/10/10。
+surface、SMT seed、measurement refit 和 block-LM 只读 train；joint/polish 候选只在
+calibration 上选择；最终 validation 只运行一次，不得据此继续调参。
+
+联合输出必须经 ACTS 使用同一模拟数据重新重建。`reconstruction_acceptance.py` 以
+`measurement - eLOC_smt` 和物理 measurement variance 计算逐层 LOC0/LOC1
+`chi2/N`；ShortStrip LOC1 使用 `1.2 mm` 分辨率下限。nominal calibration 事件通过
+固定 bootstrap 生成逐层逐分量 99% 预测上界，冻结阈值取该上界与 `1.0` 的较大值。
+验收比较 `normalized_chi2 = chi2 / threshold <= 1`，缺层、零有效分量、字段缺失或
+非有限指标均失败。失败时最多尝试两轮 surface polish，且只
+放开失败层 `(tx,ty,rz)`，写出修正乘以 0.2 的独立候选。候选仅在
+`(失败分量数, 最大normalized_chi2, 超阈值总量)` 字典序严格改善时保留。
+
+nominal geometry/truth recovery 仍标为 `diagnostic_only`；nominal states 仅允许在运行
+开始时生成带输入哈希的冻结验收 profile，不参与候选层选择或几何优化。每次运行从开始
+即写 manifest，并在正常、失败或中止退出时完成状态更新。

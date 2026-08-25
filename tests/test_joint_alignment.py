@@ -151,11 +151,14 @@ def test_build_track_batches_is_deterministic_and_preserves_1d_mask():
                 )
             )
     frame = pd.DataFrame(rows)
-    a = m.build_track_batches(_make_inputs(m, frame), ((17, 8),), min_hits=3)
+    a = m.build_track_batches(
+        _make_inputs(m, frame), ((17, 8),), min_hits=2, min_span=0.0
+    )
     b = m.build_track_batches(
         _make_inputs(m, frame.sample(frac=1.0, random_state=7).reset_index(drop=True)),
         ((17, 8),),
-        min_hits=3,
+        min_hits=2,
+        min_span=0.0,
     )
 
     assert a.measured_local.shape == (2, 3, 2)
@@ -165,6 +168,219 @@ def test_build_track_batches_is_deterministic_and_preserves_1d_mask():
     assert a.sensor_idx[0].tolist() == [1, 2, 0]
     assert a.loc1_mask[0].tolist() == [True, False, True]
     assert torch.allclose(a.covariances[a.hit_mask][:, 1], torch.ones(6))
+
+
+def test_alignment_inputs_filter_uses_only_requested_event_partition():
+    m = load_module()
+    rows = []
+    for event_nr in (0, 2, 5):
+        rows.append(
+            dict(
+                event_nr=event_nr, track_nr=1, sensor_idx=0, volume_id=10,
+                layer_id=1, module_id=1, g_x_smt=1.0, g_y_smt=0.0,
+                g_z_smt=0.0, l_x_hit=0.0, l_y_filled=0.0,
+                loc1_valid=True, var0=1.0, var1=1.0,
+            )
+        )
+    inputs = _make_inputs(m, pd.DataFrame(rows))
+
+    filtered = m.filter_alignment_inputs_by_event_partition(
+        inputs, "train", split_seed=6006
+    )
+
+    assert filtered.hit_event_ids.tolist() == [0]
+    assert len(filtered.hit_sensor_ids) == 1
+
+
+def _initialization_frame(target_x=200.0, target_measurement=0.0):
+    rows = []
+    for index, x in enumerate(np.linspace(0.0, 400.0, 9)):
+        rows.append(
+            dict(
+                event_nr=1,
+                track_nr=7,
+                sensor_idx=index,
+                volume_id=10,
+                layer_id=index + 1,
+                module_id=index + 1,
+                g_x_smt=x,
+                g_y_smt=0.0,
+                g_z_smt=0.0,
+                l_x_hit=0.0,
+                l_y_filled=0.0,
+                loc1_valid=True,
+                var0=0.01,
+                var1=0.04,
+            )
+        )
+    rows.append(
+        dict(
+            event_nr=1,
+            track_nr=7,
+            sensor_idx=9,
+            volume_id=17,
+            layer_id=8,
+            module_id=10,
+            g_x_smt=target_x,
+            g_y_smt=1000.0,
+            g_z_smt=0.0,
+            l_x_hit=target_measurement,
+            l_y_filled=target_measurement,
+            loc1_valid=True,
+            var0=0.01,
+            var1=0.04,
+        )
+    )
+    return pd.DataFrame(rows)
+
+
+def test_joint_initialization_mask_excludes_targets_and_enforces_span():
+    m = load_module()
+    batches = m.build_track_batches(
+        _make_inputs(m, _initialization_frame()),
+        ((17, 8),),
+        min_hits=8,
+        min_span=300.0,
+    )
+
+    assert batches.fit_mask.sum().item() == 9
+    assert not (batches.fit_mask & batches.is_target).any()
+    assert batches.fit_span.tolist() == pytest.approx([400.0])
+    assert batches.selection_stats == {
+        "input_tracks": 1,
+        "retained_tracks": 1,
+        "excluded_tracks": 0,
+    }
+
+    short = _initialization_frame()
+    short.loc[short.volume_id == 10, "g_x_smt"] *= 0.5
+    with pytest.raises(ValueError, match="No tracks satisfy"):
+        m.build_track_batches(
+            _make_inputs(m, short), ((17, 8),), min_hits=8, min_span=300.0
+        )
+
+
+def test_smt_seed_ignores_target_layer_points():
+    m = load_module()
+    original = m.build_track_batches(
+        _make_inputs(m, _initialization_frame()),
+        ((17, 8),),
+        min_hits=8,
+        min_span=300.0,
+    )
+    shifted_frame = _initialization_frame()
+    shifted_frame.loc[shifted_frame.volume_id == 17, ["g_y_smt", "g_z_smt"]] = [
+        -5000.0,
+        9000.0,
+    ]
+    shifted = m.build_track_batches(
+        _make_inputs(m, shifted_frame),
+        ((17, 8),),
+        min_hits=8,
+        min_span=300.0,
+    )
+
+    seed_a = m.seed_helices(original, n_iter=5, dtype=torch.float64)
+    seed_b = m.seed_helices(shifted, n_iter=5, dtype=torch.float64)
+
+    torch.testing.assert_close(seed_a, seed_b, rtol=0.0, atol=0.0)
+
+
+def test_joint_initializers_fail_closed_without_non_target_fit_mask():
+    m = load_module()
+    batches = m.build_track_batches(
+        _make_inputs(m, _initialization_frame()),
+        ((17, 8),),
+        min_hits=8,
+        min_span=300.0,
+    )
+    batches.fit_mask = None
+
+    with pytest.raises(ValueError, match="fit_mask"):
+        m.seed_helices(batches, n_iter=1, dtype=torch.float64)
+    with pytest.raises(ValueError, match="fit_mask"):
+        m._measurement_refit_objective(
+            torch.zeros((1, 6), dtype=torch.float64),
+            batches,
+            None,
+        )
+
+
+def test_measurement_refit_ignores_target_measurements_and_reports_chi2():
+    m = load_module()
+    batches_a = m.build_track_batches(
+        _make_inputs(m, _initialization_frame(target_measurement=0.0)),
+        ((17, 8),),
+        min_hits=8,
+        min_span=300.0,
+    )
+    batches_b = m.build_track_batches(
+        _make_inputs(m, _initialization_frame(target_measurement=5000.0)),
+        ((17, 8),),
+        min_hits=8,
+        min_span=300.0,
+    )
+    x_positions = torch.cat(
+        (torch.linspace(0.0, 400.0, 9, dtype=torch.float64), torch.tensor([200.0]))
+    )
+    rotation = torch.tensor(
+        [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=torch.float64,
+    )
+    geometry = m.JointGeometry(
+        transforms=[],
+        input_transforms=[],
+        centers=torch.stack(
+            (x_positions, torch.zeros_like(x_positions), torch.zeros_like(x_positions)),
+            dim=1,
+        ),
+        rotations=rotation.expand(10, -1, -1).clone(),
+        target_mask=torch.tensor([False] * 9 + [True]),
+        id_to_idx={},
+        input_indices=[9],
+    )
+    initial = torch.zeros((1, 6), dtype=torch.float64)
+
+    fitted_a, stats_a = m.fit_helices_to_measurements(
+        batches_a, geometry, initial, n_iter=3, dtype=torch.float64
+    )
+    fitted_b, stats_b = m.fit_helices_to_measurements(
+        batches_b, geometry, initial, n_iter=3, dtype=torch.float64
+    )
+
+    torch.testing.assert_close(fitted_a, fitted_b, rtol=0.0, atol=0.0)
+    assert stats_a["chi2_per_component"] == pytest.approx(0.0)
+    assert stats_a["initial_chi2_per_component"] == pytest.approx(0.0)
+    assert stats_a["best_iteration"] == -1
+    assert stats_a["improved"] is False
+    assert stats_a["parameter_updates"]["position_rms"] == pytest.approx(0.0)
+    assert stats_a["parameter_updates"]["direction_rms"] == pytest.approx(0.0)
+    assert stats_a["parameter_updates"]["rho_rms"] == pytest.approx(0.0)
+    assert stats_a["first_step"]["loss_before"] == pytest.approx(0.0)
+    assert stats_a["first_step"]["loss_after"] == pytest.approx(0.0)
+    assert stats_a["first_step"]["gradient_norms"] == pytest.approx(
+        {"position": 0.0, "direction": 0.0, "rho_scaled": 0.0}
+    )
+    assert stats_a["first_step"]["update_max"] == pytest.approx(
+        {"position": 0.0, "direction": 0.0, "rho_scaled": 0.0}
+    )
+    assert stats_a["invalid_fraction"] == pytest.approx(0.0)
+    assert stats_b == stats_a
+
+
+def test_joint_seed_cli_defaults_to_non_target_measurement_refit():
+    m = load_module()
+    args = m.build_argument_parser().parse_args(["--track-mode", "free"])
+    config = m.alignment_config_from_args(args)
+
+    assert config.joint_seed_mode == "non-target-measurement"
+    assert config.joint_seed_min_hits == 8
+    assert config.joint_seed_min_span == 300.0
+    assert config.joint_smt_seed_iters == 200
+    assert config.joint_measurement_refit_iters == 200
+    assert config.measurement_refit_lr_position == pytest.approx(1e-3)
+    assert config.measurement_refit_lr_direction == pytest.approx(1e-5)
+    assert config.measurement_refit_lr_rho_scaled == pytest.approx(1e-3)
 
 
 def test_joint_config_defaults_keep_surface_mode_compatible():
@@ -177,6 +393,109 @@ def test_joint_config_defaults_keep_surface_mode_compatible():
     assert config.track_batch_size == 0
     assert config.rng_seed == 42
     assert config.nominal_full_geom.endswith("data/geometry/odd_transforms.json")
+
+
+def test_block_lm_is_the_default_free_geometry_solver():
+    m = load_module()
+    args = m.build_argument_parser().parse_args(["--track-mode", "free"])
+    config = m.alignment_config_from_args(args)
+
+    assert config.joint_solver == "block-lm"
+    assert config.lm_max_iters == 20
+    assert config.fisher_eigen_floor == pytest.approx(1e-4)
+
+
+def test_fisher_regularization_floors_weak_normalized_mode():
+    m = load_module()
+    fisher = torch.diag(torch.tensor([100.0, 1e-8], dtype=torch.float64))
+
+    regularized, stats = m.regularize_fisher_matrix(
+        fisher, damping=0.0, eigen_floor_ratio=1e-4
+    )
+
+    eigenvalues = torch.linalg.eigvalsh(regularized)
+    assert eigenvalues[0].item() == pytest.approx(0.01, rel=1e-10)
+    assert stats["condition_number"] == pytest.approx(1e10)
+    assert stats["regularization"] == pytest.approx(0.01 - 1e-8)
+
+
+def _block_lm_translation_problem(m, non_target_measurement=0.0):
+    dtype = torch.float64
+    n_tracks = 12
+    plane_x = torch.tensor([5.0, 10.0], dtype=dtype)
+    rotation = torch.tensor(
+        [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=dtype
+    )
+    rotations = rotation.expand(2, -1, -1).clone()
+    centers = torch.stack((plane_x, torch.tensor([0.0, 0.4]), torch.zeros(2)), dim=1)
+    target_mask = torch.tensor([False, True])
+    geometry = m.JointGeometry(
+        transforms=[_surface(10, 1, 1, 5.0), _surface(17, 8, 2, 10.0)],
+        input_transforms=[_surface(17, 8, 2, 10.0)],
+        centers=centers,
+        rotations=rotations,
+        target_mask=target_mask,
+        id_to_idx={},
+        input_indices=[1],
+    )
+    y0 = torch.linspace(-1.0, 1.0, n_tracks, dtype=dtype)
+    z0 = torch.linspace(0.5, -0.5, n_tracks, dtype=dtype)
+    tracks = torch.stack(
+        (torch.zeros_like(y0), y0, z0, torch.zeros_like(y0), torch.zeros_like(y0), torch.zeros_like(y0)),
+        dim=1,
+    )
+    measured = torch.stack((y0, z0), dim=1)[:, None, :].expand(-1, 2, -1).clone()
+    measured[:, 0, 0] = non_target_measurement
+    batches = m.TrackBatches(
+        measured_local=measured,
+        covariances=torch.full((n_tracks, 2, 2), 0.01, dtype=dtype),
+        sensor_idx=torch.tensor([0, 1]).expand(n_tracks, -1),
+        hit_mask=torch.ones((n_tracks, 2), dtype=torch.bool),
+        loc1_mask=torch.ones((n_tracks, 2), dtype=torch.bool),
+        g_smt=torch.zeros((n_tracks, 2, 3), dtype=dtype),
+        p_smt=torch.zeros((n_tracks, 2, 3), dtype=dtype),
+        volume_id=torch.tensor([10, 17]).expand(n_tracks, -1),
+        layer_id=torch.tensor([1, 8]).expand(n_tracks, -1),
+        is_target=target_mask.expand(n_tracks, -1),
+        event_track_ids=torch.stack((torch.zeros(n_tracks, dtype=torch.long), torch.arange(n_tracks)), dim=1),
+        fit_mask=(~target_mask).expand(n_tracks, -1),
+    )
+    return batches, geometry, tracks
+
+
+def test_block_lm_recovers_target_translation_without_changing_tracks():
+    m = load_module()
+    batches, geometry, tracks = _block_lm_translation_problem(m)
+    config = m.AlignmentRunConfig(
+        track_mode="free", joint_solver="block-lm", lm_max_iters=8,
+        lambda_l2=0.0, make_plot=False,
+    )
+
+    result = m.run_block_lm_alignment(
+        batches, geometry, config, active_dof=(0,), initial_track_params=tracks
+    )
+
+    assert result["solver"] == "block-lm"
+    assert result["best_iteration"] >= 0
+    assert result["best_total_loss"] < result["initial_total_loss"]
+    assert result["predicted_deltas"][1, 0] == pytest.approx(-0.4, abs=1e-5)
+    np.testing.assert_array_equal(result["track_params"], tracks.numpy())
+    assert result["fisher_diagnostics"]
+
+
+def test_block_lm_geometry_is_independent_of_non_target_measurements():
+    m = load_module()
+    a_batches, geometry, tracks = _block_lm_translation_problem(m, 0.0)
+    b_batches, _, _ = _block_lm_translation_problem(m, 1.0e6)
+    config = m.AlignmentRunConfig(
+        track_mode="free", joint_solver="block-lm", lm_max_iters=4,
+        lambda_l2=0.0, make_plot=False,
+    )
+
+    a = m.run_block_lm_alignment(a_batches, geometry, config, (0,), tracks)
+    b = m.run_block_lm_alignment(b_batches, geometry, config, (0,), tracks)
+
+    np.testing.assert_array_equal(a["predicted_deltas"], b["predicted_deltas"])
 
 
 def test_cli_freeze_tracks_reaches_alignment_config():
@@ -268,6 +587,34 @@ def test_joint_checkpoint_score_rejects_excess_invalid_intersections():
 
     assert accepted == 12.0
     assert rejected == float("inf")
+
+
+def test_joint_layer_chi2_counts_only_valid_components():
+    m = load_module()
+    residuals = torch.tensor([[[1.0, 2.0], [3.0, 999.0], [4.0, 5.0]]])
+    covariance = torch.tensor([[[1.0, 4.0], [9.0, 1.0], [4.0, 25.0]]])
+    component_mask = torch.tensor([[[True, True], [True, False], [True, True]]])
+    volume = torch.tensor([[17, 17, 24]])
+    layer = torch.tensor([[8, 8, 4]])
+
+    metrics = m.summarize_joint_layer_chi2(
+        residuals,
+        covariance,
+        component_mask,
+        volume,
+        layer,
+        ((17, 8), (24, 4)),
+    )
+
+    assert metrics["17:8"]["LOC0"] == {
+        "chi2_per_component": pytest.approx(1.0),
+        "n_components": 2,
+    }
+    assert metrics["17:8"]["LOC1"] == {
+        "chi2_per_component": pytest.approx(1.0),
+        "n_components": 1,
+    }
+    assert metrics["24:4"]["LOC0"]["chi2_per_component"] == pytest.approx(4.0)
 
 
 def test_joint_checkpoint_patience_counts_from_initial_baseline():
@@ -362,10 +709,11 @@ def test_seed_helices_fits_smoothed_points():
         loc1_mask=torch.ones((1, 10), dtype=torch.bool),
         g_smt=points,
         p_smt=m.helix_tangent(truth.expand(10, -1), s).unsqueeze(0),
-        volume_id=torch.full((1, 10), 17, dtype=torch.long),
-        layer_id=torch.full((1, 10), 8, dtype=torch.long),
-        is_target=torch.ones((1, 10), dtype=torch.bool),
+        volume_id=torch.full((1, 10), 10, dtype=torch.long),
+        layer_id=torch.full((1, 10), 2, dtype=torch.long),
+        is_target=torch.zeros((1, 10), dtype=torch.bool),
         event_track_ids=torch.tensor([[1, 1]], dtype=torch.long),
+        fit_mask=torch.ones((1, 10), dtype=torch.bool),
     )
 
     seed = m.seed_helices(batches, n_iter=250, dtype=torch.float64)
@@ -598,11 +946,21 @@ def test_root_loader_exposes_raw_joint_measurements_and_stable_order(tmp_path):
         })
         root_file["trackstates"] = tree
 
-    inputs = m.load_variable_information(
-        summary_path,
-        states_path,
-        {(17, 8, 3): 2, (10, 2, 2): 1, (10, 1, 1): 0},
-    )
+    original_uproot_open = m.uproot.open
+
+    def reject_uproot(*_args, **_kwargs):
+        raise AssertionError("PyROOT-capable loader unexpectedly used uproot")
+
+    m.uproot.open = reject_uproot
+
+    try:
+        inputs = m.load_variable_information(
+            summary_path,
+            states_path,
+            {(17, 8, 3): 2, (10, 2, 2): 1, (10, 1, 1): 0},
+        )
+    finally:
+        m.uproot.open = original_uproot_open
 
     assert inputs.hit_sensor_ids.tolist() == [0, 1, 2]
     assert torch.allclose(inputs.measured_local[:, 1], torch.tensor([0.2, 0.0, 0.4]))

@@ -42,6 +42,14 @@ def test_inventory_reports_absolute_inputs_outputs_and_runtime_dependencies():
         / "Vol17_Lay8__Vol24_Lay4"
         / "trackstates_kf_v17l8_v24l4.root"
     )
+    assert inventory["default_outputs"]["helix_measurement_validation_csv"] == str(
+        repository_root
+        / "data"
+        / "experiments"
+        / "helix_validation"
+        / "Vol17_Lay8__Vol24_Lay4"
+        / "helix_measurement_comparison.csv"
+    )
 
     for section in (
         "roots",

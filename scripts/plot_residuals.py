@@ -87,6 +87,38 @@ def get_branch_data(file_path: Path, tree_name: str, branch_meas: str, branch_pr
         return None
 
     try:
+        if ROOT is not None:
+            branches = [branch_meas, branch_pred]
+            if vol_ids is not None:
+                branches.append("volume_id")
+            if lay_id is not None:
+                branches.append("layer_id")
+            frame = ROOT.RDataFrame(tree_name, str(file_path))
+            available = {str(name) for name in frame.GetColumnNames()}
+            missing = [name for name in branches if name not in available]
+            if missing:
+                print(
+                    f"error: Branches {missing} not found in tree "
+                    f"'{tree_name}'"
+                )
+                return None
+            arrays = frame.AsNumpy(branches)
+
+            def flatten(values):
+                entries = list(values)
+                return np.concatenate([np.asarray(entry) for entry in entries])
+
+            data = flatten(arrays[branch_meas]) - flatten(arrays[branch_pred])
+            mask = np.ones(len(data), dtype=bool)
+            if vol_ids is not None:
+                volume = flatten(arrays["volume_id"])
+                volume_ids = [vol_ids] if isinstance(vol_ids, int) else list(vol_ids)
+                mask &= np.isin(volume, volume_ids)
+            if lay_id is not None:
+                mask &= flatten(arrays["layer_id"]) == lay_id
+            selected = data[mask]
+            return selected[np.isfinite(selected)]
+
         with uproot.open(file_path) as file:
             if tree_name not in file:
                 print(f"error: Tree '{tree_name}' not found in {file_path}")

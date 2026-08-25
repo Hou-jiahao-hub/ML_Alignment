@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import awkward as ak
+import uproot
 
 
 def load_plot_chi2ndf_module():
@@ -43,6 +45,28 @@ def test_chi2_ndf_values_drop_non_positive_ndf(capsys):
 
     assert np.allclose(values, np.array([2.0, 2.0]))
     assert "Nominal: dropped 2/4 tracks with NDF <= 0" in capsys.readouterr().out
+
+
+@pytest.mark.root_io
+def test_chi2_loader_uses_pyroot_for_acts_style_jagged_tree(tmp_path, monkeypatch):
+    module = load_plot_chi2ndf_module()
+    if module.ROOT is None:
+        pytest.skip("PyROOT is unavailable")
+    path = tmp_path / "summary.root"
+    with uproot.recreate(path) as root_file:
+        root_file["tracksummary"] = {
+            "chi2Sum": ak.Array([[2.0, 8.0]]),
+            "NDF": ak.Array([[1.0, 4.0]]),
+        }
+    monkeypatch.setattr(
+        module.uproot,
+        "open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("PyROOT-capable environments must not use uproot")
+        ),
+    )
+
+    assert module.load_chi2_ndf(path).tolist() == pytest.approx([2.0, 2.0])
 
 
 def test_default_comparison_files_match_residuals_layout(tmp_path):

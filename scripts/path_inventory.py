@@ -103,6 +103,9 @@ def build_path_inventory(config: ProjectConfig | None = None) -> dict[str, Any]:
             "helix_validation_csv": str(
                 helix_validation / "helix_smt_comparison.csv"
             ),
+            "helix_measurement_validation_csv": str(
+                helix_validation / "helix_measurement_comparison.csv"
+            ),
         },
         "output_templates": {
             "iterative_geometry": str(

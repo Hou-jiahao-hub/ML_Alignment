@@ -676,7 +676,7 @@ def runAlignment(
     initialvarinflation = [100, 100, 100, 100, 100, 1]
 
     tx, ty, tz = 1, 1, 0  # Translation DOF
-    rx, ry, rz = 1, 1, 1  # Rotation DOF
+    rx, ry, rz = 0, 0, 1  # Rotation DOF
     shift_mag_mm = 0.5  # Shift magnitude (mm)
     rotation_mag_rad = 0.02  # Rotation magnitude (rad)
 

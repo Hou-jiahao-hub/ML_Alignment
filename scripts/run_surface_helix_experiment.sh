@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Independent surface -> frozen-helix -> ACTS validation experiment.
+# Two surface warm starts -> joint free helix -> ACTS acceptance -> guarded polish.
 set -eo pipefail
 
 JOB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$JOB_DIR"
+ORIGINAL_ARGS=("$@")
 CONFIG_PATH=""
 PRE_ARGS=("$@")
 for ((idx = 0; idx < ${#PRE_ARGS[@]}; idx++)); do
@@ -14,23 +15,26 @@ for ((idx = 0; idx < ${#PRE_ARGS[@]}; idx++)); do
         CONFIG_PATH="${PRE_ARGS[$idx]#--config=}"
     fi
 done
+
 if [[ -n "$CONFIG_PATH" ]]; then
     eval "$(python3 alignment_artifact_layout.py --config "$CONFIG_PATH" --shell)"
 else
     eval "$(python3 alignment_artifact_layout.py --shell)"
 fi
+CONFIG_ARGS=()
+[[ -z "$CONFIG_PATH" ]] || CONFIG_ARGS=(--config "$CONFIG_PATH")
 
 RUN_TAG=""
 EVENTS=100000
-TARGET_LAYERS="$TARGET_LAYERS_SPEC"
-HELIX_CANDIDATES="$TARGET_LAYERS_SPEC"
+EXPECTED_TARGET_LAYERS="17:8,24:4"
+TARGET_LAYERS="$EXPECTED_TARGET_LAYERS"
 ACTIVE_DOF="$ACTIVE_DOF_SPEC"
-SURFACE_EPOCHS=300
-SURFACE_REL_TOL=0.05
-SURFACE_PATIENCE=3
-SURFACE_CHI2_TARGET=1.0
-MAX_SURFACE_ITERS=15
-BASELINE_RATIO=1.2
+SURFACE_EPOCHS=200
+JOINT_ITERS=1000
+JOINT_SMT_SEED_ITERS=200
+JOINT_MEASUREMENT_REFIT_ITERS=200
+LM_MAX_ITERS=20
+MAX_TRACKS=0
 LAMBDA_L2=1e-5
 ALIGNMENT_DIR="$ALIGNMENT_ROOT"
 SIMULATION_DIR="$SIMULATION_ROOT"
@@ -40,10 +44,13 @@ INPUT_GEOM=""
 INPUT_STATES=""
 INPUT_SUMMARY=""
 NOMINAL_STATES=""
+HELIX_CANDIDATES=""
+BASELINE_RATIO=""
 ACTS_SETUP="$ML_ALIGNMENT_ACTS_SETUP"
 CONDA_SH="$ML_ALIGNMENT_CONDA_SETUP"
 CONDA_ENV="pytorch"
 DRY_RUN=0
+EVENT_SPLIT_SEED=6006
 
 usage() {
     cat <<EOF
@@ -54,24 +61,28 @@ Required:
 
 Options:
   --events N                 ACTS reconstruction events (default: 100000)
-  --helix-candidates SPEC    Explicit candidate layers (default: $TARGET_LAYERS_SPEC)
-  --surface-rel-tol VALUE    Relative chi2 plateau tolerance (default: 0.05)
-  --surface-patience N       Consecutive small changes required (default: 3)
-  --surface-chi2-target V    Absolute chi2/component target (default: 1.0)
-  --max-surface-iters N      Hard outer-loop limit (default: 15)
-  --baseline-ratio VALUE     Candidate/nominal RMS layer gate (default: 1.2)
+  --surface-epochs N         Epochs in each warm-start/polish surface solve
+  --joint-iters N            Joint free-helix iterations (default: 1000)
+  --joint-smt-seed-iters N   Non-target SMT seed iterations (default: 200)
+  --joint-measurement-refit-iters N
+                              Non-target measurement refit iterations (default: 200)
+  --lm-max-iters N            Block-LM geometry iterations (default: 20)
+  --max-tracks N             Limit free-helix tracks; 0 keeps all (default: 0)
   --input-geom PATH          Initial misaligned geometry
   --states PATH              Initial misaligned trackstates
   --summary PATH             Initial misaligned tracksummary
-  --nominal-states PATH      Nominal trackstates baseline
   --alignment-dir PATH       Alignment output base
   --simulation-dir PATH      Existing simulation input
   --reconstruction-dir PATH  Reconstruction output base
-  --log-dir PATH             Experiment log base
+  --log-dir PATH             Experiment output base
   --acts-setup PATH          ACTS environment setup script
   --conda-sh PATH            Conda shell hook
   --conda-env NAME           Conda environment name
-  --dry-run                  Print a representative complete workflow
+  --nominal-states PATH      Nominal states used only to freeze acceptance thresholds
+  --event-split-seed N       Stable 80/10/10 event split seed (default: 6006)
+  --baseline-ratio VALUE     Deprecated; ignored
+  --helix-candidates SPEC    Deprecated; ignored
+  --dry-run                  Print both conditional polish candidates
 EOF
 }
 
@@ -83,16 +94,18 @@ while [[ $# -gt 0 ]]; do
         --config=*) shift ;;
         --run-tag) RUN_TAG="$2"; shift 2 ;;
         --events) EVENTS="$2"; shift 2 ;;
-        --helix-candidates) HELIX_CANDIDATES="$2"; shift 2 ;;
-        --surface-rel-tol) SURFACE_REL_TOL="$2"; shift 2 ;;
-        --surface-patience) SURFACE_PATIENCE="$2"; shift 2 ;;
-        --surface-chi2-target) SURFACE_CHI2_TARGET="$2"; shift 2 ;;
-        --max-surface-iters) MAX_SURFACE_ITERS="$2"; shift 2 ;;
-        --baseline-ratio) BASELINE_RATIO="$2"; shift 2 ;;
+        --surface-epochs) SURFACE_EPOCHS="$2"; shift 2 ;;
+        --joint-iters) JOINT_ITERS="$2"; shift 2 ;;
+        --joint-smt-seed-iters) JOINT_SMT_SEED_ITERS="$2"; shift 2 ;;
+        --joint-measurement-refit-iters) JOINT_MEASUREMENT_REFIT_ITERS="$2"; shift 2 ;;
+        --lm-max-iters) LM_MAX_ITERS="$2"; shift 2 ;;
+        --max-tracks) MAX_TRACKS="$2"; shift 2 ;;
         --input-geom) INPUT_GEOM="$2"; shift 2 ;;
         --states) INPUT_STATES="$2"; shift 2 ;;
         --summary) INPUT_SUMMARY="$2"; shift 2 ;;
         --nominal-states) NOMINAL_STATES="$2"; shift 2 ;;
+        --baseline-ratio) BASELINE_RATIO="$2"; shift 2 ;;
+        --helix-candidates) HELIX_CANDIDATES="$2"; shift 2 ;;
         --alignment-dir) ALIGNMENT_DIR="$2"; shift 2 ;;
         --simulation-dir) SIMULATION_DIR="$2"; shift 2 ;;
         --reconstruction-dir) RECONSTRUCTION_DIR="$2"; shift 2 ;;
@@ -100,6 +113,7 @@ while [[ $# -gt 0 ]]; do
         --acts-setup) ACTS_SETUP="$2"; shift 2 ;;
         --conda-sh) CONDA_SH="$2"; shift 2 ;;
         --conda-env) CONDA_ENV="$2"; shift 2 ;;
+        --event-split-seed) EVENT_SPLIT_SEED="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1" ;;
@@ -108,13 +122,24 @@ done
 
 [[ -n "$RUN_TAG" ]] || die "--run-tag is required"
 [[ "$RUN_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "--run-tag contains unsafe characters"
-[[ "$EVENTS" =~ ^[0-9]+$ ]] || die "--events must be a non-negative integer"
-[[ "$SURFACE_PATIENCE" =~ ^[0-9]+$ ]] || die "--surface-patience must be an integer"
-[[ "$MAX_SURFACE_ITERS" =~ ^[1-9][0-9]*$ ]] || die "--max-surface-iters must be positive"
-[[ "$TARGET_LAYERS" == "$TARGET_LAYERS_SPEC" ]] || die "target layer configuration drift"
+[[ "$EVENTS" =~ ^[1-9][0-9]*$ ]] || die "--events must be positive"
+[[ "$SURFACE_EPOCHS" =~ ^[1-9][0-9]*$ ]] || die "--surface-epochs must be positive"
+[[ "$JOINT_ITERS" =~ ^[1-9][0-9]*$ ]] || die "--joint-iters must be positive"
+[[ "$JOINT_SMT_SEED_ITERS" =~ ^[1-9][0-9]*$ ]] || die "--joint-smt-seed-iters must be positive"
+[[ "$JOINT_MEASUREMENT_REFIT_ITERS" =~ ^[1-9][0-9]*$ ]] || die "--joint-measurement-refit-iters must be positive"
+[[ "$LM_MAX_ITERS" =~ ^[1-9][0-9]*$ ]] || die "--lm-max-iters must be positive"
+[[ "$MAX_TRACKS" =~ ^[0-9]+$ ]] || die "--max-tracks must be non-negative"
+[[ "$EVENT_SPLIT_SEED" =~ ^[0-9]+$ ]] || die "--event-split-seed must be non-negative"
+[[ "$TARGET_LAYERS_SPEC" == "$EXPECTED_TARGET_LAYERS" ]] || \
+    die "configured target layers must remain $EXPECTED_TARGET_LAYERS"
+[[ "$ACTIVE_DOF" == "0,1,5" ]] || die "this workflow requires active DOF 0,1,5"
+
+[[ -z "$NOMINAL_STATES" ]] || echo "note: --nominal-states supplies only the frozen acceptance baseline" >&2
+[[ -z "$BASELINE_RATIO" ]] || echo "deprecated: --baseline-ratio no longer controls the workflow" >&2
+[[ -z "$HELIX_CANDIDATES" ]] || echo "deprecated: --helix-candidates no longer selects layers" >&2
 
 with_target_dir() {
-    if [[ "$(basename "$1")" == "$TARGET_LAYER_DIR" ]]; then printf '%s\n' "$1";
+    if [[ "$(basename "$1")" == "$TARGET_LAYER_DIR" ]]; then printf '%s\n' "$1"
     else printf '%s/%s\n' "$1" "$TARGET_LAYER_DIR"; fi
 }
 
@@ -137,21 +162,23 @@ CONDA_SH="$(absolute_project_path "$CONDA_SH")"
 [[ -z "$NOMINAL_STATES" ]] || NOMINAL_STATES="$(absolute_project_path "$NOMINAL_STATES")"
 
 ALIGNMENT_TARGET_DIR="$(with_target_dir "$ALIGNMENT_DIR")"
-NOMINAL_RECON_DIR="$(with_target_dir "$RECONSTRUCTION_DIR/nominal")"
 MISALIGNED_RECON_DIR="$(with_target_dir "$RECONSTRUCTION_DIR/misaligned")"
 ALIGNED_RECON_DIR="$(with_target_dir "$RECONSTRUCTION_DIR/aligned")"
-RUN_LOG_DIR="$(with_target_dir "$LOG_DIR")/$RUN_TAG"
-
+RUN_DIR="$(with_target_dir "$LOG_DIR")/$RUN_TAG"
 [[ -n "$INPUT_GEOM" ]] || INPUT_GEOM="$ALIGNMENT_TARGET_DIR/$MISALIGNMENT_JSON"
 [[ -n "$INPUT_STATES" ]] || INPUT_STATES="$MISALIGNED_RECON_DIR/trackstates_kf_${TARGET_LAYER_SUFFIX}.root"
 [[ -n "$INPUT_SUMMARY" ]] || INPUT_SUMMARY="$MISALIGNED_RECON_DIR/tracksummary_kf_${TARGET_LAYER_SUFFIX}.root"
-[[ -n "$NOMINAL_STATES" ]] || NOMINAL_STATES="$NOMINAL_RECON_DIR/trackstates_kf_${TARGET_LAYER_SUFFIX}.root"
+[[ -n "$NOMINAL_STATES" ]] || NOMINAL_STATES="$(with_target_dir "$RECONSTRUCTION_DIR/nominal")/trackstates_kf_${TARGET_LAYER_SUFFIX}.root"
 
 print_command() { printf '  '; printf '%q ' "$@"; printf '\n'; }
 
 run_conda() {
     local log_file="$1"; shift
-    if [[ "$DRY_RUN" -eq 1 ]]; then print_command "$@"; return 0; fi
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[conda:$CONDA_ENV]"
+        print_command "$@"
+        return 0
+    fi
     (
         unset PYTHONHOME PYTHONPATH ROOTSYS
         source "$CONDA_SH"
@@ -162,7 +189,11 @@ run_conda() {
 
 run_acts() {
     local log_file="$1"; shift
-    if [[ "$DRY_RUN" -eq 1 ]]; then print_command "$@"; return 0; fi
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[acts]"
+        print_command "$@"
+        return 0
+    fi
     (
         unset PYTHONHOME PYTHONPATH ROOTSYS CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER
         source "$ACTS_SETUP"
@@ -172,144 +203,307 @@ run_acts() {
 
 require_file() { [[ -f "$1" ]] || die "missing required file: $1"; }
 
-echo "surface relative tolerance : $SURFACE_REL_TOL"
-echo "surface patience           : $SURFACE_PATIENCE"
-echo "surface chi2 target        : $SURFACE_CHI2_TARGET"
-echo "maximum surface iterations : $MAX_SURFACE_ITERS"
-echo "helix candidates           : $HELIX_CANDIDATES"
-echo "active DOF                 : $ACTIVE_DOF"
-echo "run tag                    : $RUN_TAG"
+geometry_path() { printf '%s/aligned_transforms_%s.json\n' "$ALIGNMENT_TARGET_DIR" "$1"; }
+states_path() { printf '%s/trackstates_kf_%s.root\n' "$ALIGNED_RECON_DIR" "$1"; }
+summary_path() { printf '%s/tracksummary_kf_%s.root\n' "$ALIGNED_RECON_DIR" "$1"; }
+acceptance_path() { printf '%s/acceptance_%s.json\n' "$RUN_DIR" "$1"; }
+BASELINE_PROFILE="$RUN_DIR/acceptance_baseline.json"
+
+echo "fixed surface warm starts : 2"
+echo "maximum surface polish    : 2"
+echo "joint target layers       : $TARGET_LAYERS"
+echo "active DOF                : $ACTIVE_DOF"
+echo "run tag                   : $RUN_TAG"
+
+MANIFEST_PATH="$RUN_DIR/manifest.json"
+MANIFEST_FINALIZED=0
+CURRENT_STAGE="preflight"
+finalize_failed_manifest() {
+    local exit_code="$?"
+    if [[ "$DRY_RUN" -eq 0 && "$MANIFEST_FINALIZED" -eq 0 && -f "$MANIFEST_PATH" ]]; then
+        local failure_metrics
+        local failure_outputs=()
+        failure_metrics="$(python3 -c 'import json,os,sys; joint_path,acceptance_path=sys.argv[1:3]; metrics={"exit_code":int(sys.argv[3]),"stop_reason":"unexpected_exit","stage":sys.argv[4]}; metrics["joint_free"]=json.load(open(joint_path)) if os.path.isfile(joint_path) else None; metrics["latest_acceptance"]=json.load(open(acceptance_path)) if acceptance_path and os.path.isfile(acceptance_path) else None; print(json.dumps(metrics,allow_nan=False))' \
+            "$RUN_DIR/joint_free_summary.json" "${current_acceptance:-}" "$exit_code" "$CURRENT_STAGE" 2>/dev/null || \
+            printf '{"exit_code":%s,"stop_reason":"unexpected_exit","stage":"%s"}' "$exit_code" "$CURRENT_STAGE")"
+        for failed_label in \
+            "${RUN_TAG}_surface_warm1" "${RUN_TAG}_surface_warm2" \
+            "${RUN_TAG}_joint_free" "${RUN_TAG}_surface_polish1" \
+            "${RUN_TAG}_surface_polish2"; do
+            [[ ! -f "$(geometry_path "$failed_label")" ]] || \
+                failure_outputs+=(--output "${failed_label}_geometry=$(geometry_path "$failed_label")")
+            [[ ! -f "$(states_path "$failed_label")" ]] || \
+                failure_outputs+=(--output "${failed_label}_states=$(states_path "$failed_label")")
+            [[ ! -f "$(summary_path "$failed_label")" ]] || \
+                failure_outputs+=(--output "${failed_label}_summary=$(summary_path "$failed_label")")
+            [[ ! -f "$(acceptance_path "$failed_label")" ]] || \
+                failure_outputs+=(--output "${failed_label}_acceptance=$(acceptance_path "$failed_label")")
+        done
+        python3 experiment_manifest.py finalize --manifest "$MANIFEST_PATH" \
+            --status failed "${failure_outputs[@]}" --metrics-json "$failure_metrics" \
+            >/dev/null 2>&1 || true
+    fi
+}
+trap finalize_failed_manifest EXIT
+trap 'exit 130' INT TERM HUP
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
-    [[ ! -e "$RUN_LOG_DIR" ]] || die "run tag already exists: $RUN_LOG_DIR"
-    for ((index=0; index<MAX_SURFACE_ITERS; index++)); do
-        [[ ! -e "$ALIGNMENT_TARGET_DIR/aligned_transforms_${RUN_TAG}_surface_iter${index}.json" ]] \
-            || die "surface geometry already exists for run tag $RUN_TAG"
-        [[ ! -e "$ALIGNED_RECON_DIR/trackstates_kf_${RUN_TAG}_surface_iter${index}.root" ]] \
-            || die "surface reconstruction already exists for run tag $RUN_TAG"
+    [[ ! -e "$RUN_DIR" ]] || die "run tag already exists: $RUN_DIR"
+    for label in \
+        "${RUN_TAG}_surface_warm1" "${RUN_TAG}_surface_warm2" \
+        "${RUN_TAG}_joint_free" "${RUN_TAG}_surface_polish1" \
+        "${RUN_TAG}_surface_polish2"; do
+        [[ ! -e "$(geometry_path "$label")" ]] || die "geometry already exists: $(geometry_path "$label")"
+        [[ ! -e "$(states_path "$label")" ]] || die "reconstruction already exists: $(states_path "$label")"
     done
-    [[ ! -e "$ALIGNMENT_TARGET_DIR/aligned_transforms_${RUN_TAG}_helix.json" ]] \
-        || die "helix geometry already exists for run tag $RUN_TAG"
-    [[ ! -e "$ALIGNED_RECON_DIR/trackstates_kf_${RUN_TAG}_helix.root" ]] \
-        || die "helix reconstruction already exists for run tag $RUN_TAG"
+    mkdir -p "$RUN_DIR" "$ALIGNMENT_TARGET_DIR" "$ALIGNED_RECON_DIR"
+    command_json="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$0" "${ORIGINAL_ARGS[@]}")"
+    python3 experiment_manifest.py start --run-dir "$RUN_DIR" --run-id "$RUN_TAG" \
+        --allow-missing-inputs \
+        --command-json "$command_json" --input "geometry=$INPUT_GEOM" \
+        --input "states=$INPUT_STATES" --input "summary=$INPUT_SUMMARY" \
+        --input "nominal_states=$NOMINAL_STATES" \
+        --input "simulation_dataset=$SIMULATION_DIR" \
+        --input "nominal_geometry=$GEOMETRY_ROOT/odd_transforms.json" \
+        --input "acts_setup=$ACTS_SETUP" --input "conda_setup=$CONDA_SH" \
+        --input "odd_digi_config=$ML_ALIGNMENT_ACTS_DIGI_CONFIG" \
+        --input "odd_material_map=$ML_ALIGNMENT_ODD_MATERIAL_MAP" \
+        "${CONFIG_ARGS[@]}" >/dev/null
     require_file "$INPUT_GEOM"
     require_file "$INPUT_STATES"
     require_file "$INPUT_SUMMARY"
     require_file "$NOMINAL_STATES"
+    require_file "$GEOMETRY_ROOT/odd_transforms.json"
+    [[ -d "$SIMULATION_DIR" ]] || die "missing simulation directory: $SIMULATION_DIR"
     require_file "$ACTS_SETUP"
     require_file "$CONDA_SH"
-    mkdir -p "$RUN_LOG_DIR" "$ALIGNMENT_TARGET_DIR" "$ALIGNED_RECON_DIR"
+    require_file "$ML_ALIGNMENT_ACTS_DIGI_CONFIG"
+    require_file "$ML_ALIGNMENT_ODD_MATERIAL_MAP"
 fi
+
+CURRENT_STAGE="acceptance_baseline"
+run_conda "$RUN_DIR/acceptance_baseline.log" \
+    python calibrate_acceptance.py "${CONFIG_ARGS[@]}" --states "$NOMINAL_STATES" \
+    --output "$BASELINE_PROFILE" --target-layers "$TARGET_LAYERS" \
+    --split-seed "$EVENT_SPLIT_SEED" --bootstrap-seed "$EVENT_SPLIT_SEED"
+if [[ "$DRY_RUN" -eq 0 ]]; then require_file "$BASELINE_PROFILE"; fi
+
+reconstruct() {
+    local label="$1" geometry="$2"
+    run_acts "$RUN_DIR/reconstruct_${label}.log" \
+        python alignment_odd.py reconstruction --mode aligned --num-events "$EVENTS" \
+        --input-dir "$SIMULATION_DIR" --output-dir "$RECONSTRUCTION_DIR" \
+        --aligned-file "$geometry" --output-suffix "$label"
+}
+
+run_acceptance() {
+    local label="$1" states="$2" output="$3" partition="$4"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        run_conda "$RUN_DIR/acceptance_${label}.log" \
+            python reconstruction_acceptance.py "${CONFIG_ARGS[@]}" --states "$states" --output "$output" \
+            --target-layers "$TARGET_LAYERS" --threshold-profile "$BASELINE_PROFILE" \
+            --event-partition "$partition" --split-seed "$EVENT_SPLIT_SEED"
+        return 0
+    fi
+    set +e
+    run_conda "$RUN_DIR/acceptance_${label}.log" \
+        python reconstruction_acceptance.py "${CONFIG_ARGS[@]}" --states "$states" --output "$output" \
+        --target-layers "$TARGET_LAYERS" --threshold-profile "$BASELINE_PROFILE" \
+        --event-partition "$partition" --split-seed "$EVENT_SPLIT_SEED"
+    local status="$?"
+    set -e
+    require_file "$output"
+    return "$status"
+}
 
 current_geom="$INPUT_GEOM"
 current_states="$INPUT_STATES"
 current_summary="$INPUT_SUMMARY"
-chi2_history=()
-stop_reason=""
 
-for ((iteration=0; iteration<MAX_SURFACE_ITERS; iteration++)); do
-    label="${RUN_TAG}_surface_iter${iteration}"
-    output_geom="$ALIGNMENT_TARGET_DIR/aligned_transforms_${label}.json"
-    next_states="$ALIGNED_RECON_DIR/trackstates_kf_${label}.root"
-    next_summary="$ALIGNED_RECON_DIR/tracksummary_kf_${label}.root"
-    surface_log="$RUN_LOG_DIR/${label}.log"
-    recon_log="$RUN_LOG_DIR/recon_${label}.log"
-
-    surface_cmd=(
-        python ml_alignment_autograd.py
-        --input-geom "$current_geom" --states "$current_states" --summary "$current_summary"
-        --output-geom "$output_geom" --target-layers "$TARGET_LAYERS"
-        --active-dof "$ACTIVE_DOF" --track-mode surface --epochs "$SURFACE_EPOCHS"
-        --lambda-l2 "$LAMBDA_L2" --iter "$iteration" --no-plot
-    )
-    run_conda "$surface_log" "${surface_cmd[@]}"
-
-    aligned_arg="$output_geom"
-    recon_cmd=(
-        python alignment_odd.py reconstruction --mode aligned --num-events "$EVENTS"
-        --input-dir "$SIMULATION_DIR" --output-dir "$RECONSTRUCTION_DIR"
-        --aligned-file "$aligned_arg" --output-suffix "$label"
-    )
-    run_acts "$recon_log" "${recon_cmd[@]}"
-
-    if [[ "$DRY_RUN" -eq 1 ]]; then
-        current_geom="$output_geom"; current_states="$next_states"; current_summary="$next_summary"
-        break
+for warm_round in 1 2; do
+    label="${RUN_TAG}_surface_warm${warm_round}"
+    CURRENT_STAGE="surface_warm${warm_round}"
+    output_geom="$(geometry_path "$label")"
+    run_conda "$RUN_DIR/${label}.log" \
+        python ml_alignment_autograd.py "${CONFIG_ARGS[@]}" --track-mode surface \
+        --input-geom "$current_geom" --states "$current_states" --summary "$current_summary" \
+        --output-geom "$output_geom" --target-layers "$TARGET_LAYERS" \
+        --active-dof "$ACTIVE_DOF" --epochs "$SURFACE_EPOCHS" \
+        --event-partition train --event-split-seed "$EVENT_SPLIT_SEED" \
+        --lambda-l2 "$LAMBDA_L2" --iter "warm${warm_round}" --no-plot
+    reconstruct "$label" "$output_geom"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        require_file "$output_geom"
+        require_file "$(states_path "$label")"
+        require_file "$(summary_path "$label")"
     fi
-    require_file "$output_geom"; require_file "$next_states"; require_file "$next_summary"
-    chi2="$(sed -n 's/.*| Chi2: \([^ ]*\).*/\1/p' "$surface_log" | tail -1)"
-    [[ "$chi2" =~ ^[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] || die "cannot parse final Chi2 from $surface_log"
-    chi2_history+=("$chi2")
-    history_csv="$(IFS=,; echo "${chi2_history[*]}")"
-    stop_reason="$(python3 -c 'import sys; from ml_alignment_helix import surface_stop_reason; h=[float(x) for x in sys.argv[1].split(",") if x]; print(surface_stop_reason(h, chi2_target=float(sys.argv[2]), relative_tolerance=float(sys.argv[3]), patience=int(sys.argv[4]), max_iterations=int(sys.argv[5])) or "")' "$history_csv" "$SURFACE_CHI2_TARGET" "$SURFACE_REL_TOL" "$SURFACE_PATIENCE" "$MAX_SURFACE_ITERS")"
-    current_geom="$output_geom"; current_states="$next_states"; current_summary="$next_summary"
-    [[ -z "$stop_reason" ]] || break
+    current_geom="$output_geom"
+    current_states="$(states_path "$label")"
+    current_summary="$(summary_path "$label")"
 done
 
-surface_assessment="$RUN_LOG_DIR/surface_assessment.json"
-assess_cmd=(
-    python ml_alignment_helix.py assess --nominal-states "$NOMINAL_STATES"
-    --candidate-states "$current_states" --target-layers "$HELIX_CANDIDATES"
-    --max-ratio "$BASELINE_RATIO" --output-summary "$surface_assessment"
-)
-run_conda "$RUN_LOG_DIR/surface_assessment.log" "${assess_cmd[@]}"
+warm2_label="${RUN_TAG}_surface_warm2"
+warm2_acceptance="$(acceptance_path "$warm2_label")"
+CURRENT_STAGE="warm2_calibration_acceptance"
+run_acceptance "$warm2_label" "$current_states" "$warm2_acceptance" calibration || true
+warm2_geom="$current_geom"
+warm2_states="$current_states"
+warm2_summary="$current_summary"
 
-if [[ "$DRY_RUN" -eq 1 ]]; then
-    failed_layers="$HELIX_CANDIDATES"
-else
-    require_file "$surface_assessment"
-    failed_layers="$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["failed_layers"]))' "$surface_assessment")"
-fi
+joint_label="${RUN_TAG}_joint_free"
+CURRENT_STAGE="joint_free"
+joint_geom="$(geometry_path "$joint_label")"
+joint_solver_summary="$RUN_DIR/joint_free_summary.json"
+run_conda "$RUN_DIR/${joint_label}.log" \
+    python ml_alignment_autograd.py "${CONFIG_ARGS[@]}" --track-mode free \
+    --input-geom "$current_geom" --states "$current_states" --summary "$current_summary" \
+    --output-geom "$joint_geom" --target-layers "$TARGET_LAYERS" --active-dof "$ACTIVE_DOF" \
+    --joint-seed-mode non-target-measurement --joint-seed-min-hits 8 \
+    --joint-seed-min-span 300 --joint-smt-seed-iters "$JOINT_SMT_SEED_ITERS" \
+    --joint-measurement-refit-iters "$JOINT_MEASUREMENT_REFIT_ITERS" \
+    --joint-solver block-lm --lm-max-iters "$LM_MAX_ITERS" \
+    --event-partition train --event-split-seed "$EVENT_SPLIT_SEED" \
+    --joint-iters "$JOINT_ITERS" --max-tracks "$MAX_TRACKS" \
+    --lambda-l2 "$LAMBDA_L2" --nominal-full-geom "$GEOMETRY_ROOT/odd_transforms.json" \
+    --output-summary "$joint_solver_summary" --no-plot
+reconstruct "$joint_label" "$joint_geom"
+joint_states="$(states_path "$joint_label")"
+joint_summary="$(summary_path "$joint_label")"
+joint_acceptance="$(acceptance_path "$joint_label")"
+CURRENT_STAGE="joint_acceptance"
+run_acceptance "$joint_label" "$joint_states" "$joint_acceptance" calibration || true
 
-if [[ -z "$failed_layers" ]]; then
-    echo "No candidate layer exceeds the nominal-relative RMS gate; helix stage skipped."
-    if [[ "$DRY_RUN" -eq 0 ]]; then
-        history_csv="$(IFS=,; echo "${chi2_history[*]}")"
-        python3 -c 'import json,sys; json.dump({"surface_chi2_history":[float(x) for x in sys.argv[1].split(",") if x],"surface_stop_reason":sys.argv[2],"helix_layers":[],"helix_skipped":True,"passed":True},open(sys.argv[3],"w"),indent=2)' "$history_csv" "$stop_reason" "$RUN_LOG_DIR/experiment_summary.json"
-    fi
-    exit 0
-fi
-
-helix_label="${RUN_TAG}_helix"
-helix_geometry="$ALIGNMENT_TARGET_DIR/aligned_transforms_${helix_label}.json"
-helix_summary="$RUN_LOG_DIR/helix_alignment_summary.json"
-helix_cmd=(
-    python ml_alignment_helix.py align --input-geometry "$current_geom" --states "$current_states"
-    --nominal-geometry "$GEOMETRY_ROOT/odd_transforms.json" --output-geometry "$helix_geometry"
-    --output-summary "$helix_summary" --target-layers "$failed_layers"
-    --active-dof "$ACTIVE_DOF"
-)
-run_conda "$RUN_LOG_DIR/helix_alignment.log" "${helix_cmd[@]}"
-
-helix_states="$ALIGNED_RECON_DIR/trackstates_kf_${helix_label}.root"
-helix_recon_cmd=(
-    python alignment_odd.py reconstruction --mode aligned --num-events "$EVENTS"
-    --input-dir "$SIMULATION_DIR" --output-dir "$RECONSTRUCTION_DIR"
-    --aligned-file "$helix_geometry" --output-suffix "$helix_label"
-)
-run_acts "$RUN_LOG_DIR/recon_${helix_label}.log" "${helix_recon_cmd[@]}"
-
-final_assessment="$RUN_LOG_DIR/helix_assessment.json"
-final_assess_cmd=(
-    python ml_alignment_helix.py assess --nominal-states "$NOMINAL_STATES"
-    --candidate-states "$helix_states" --target-layers "$failed_layers"
-    --max-ratio "$BASELINE_RATIO" --output-summary "$final_assessment"
-)
-run_conda "$RUN_LOG_DIR/helix_assessment.log" "${final_assess_cmd[@]}"
+current_geom="$joint_geom"
+current_states="$joint_states"
+current_summary="$joint_summary"
+current_acceptance="$joint_acceptance"
+stop_reason="joint_acceptance_passed"
+polish_attempts=0
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
-    require_file "$helix_geometry"; require_file "$helix_states"; require_file "$final_assessment"
-    history_csv="$(IFS=,; echo "${chi2_history[*]}")"
-    python3 -c 'import json,sys; surface=json.load(open(sys.argv[1])); final=json.load(open(sys.argv[2])); layers=sys.argv[3].split(","); ratios={}; improved=[]; degraded=[]
-for layer in layers:
-  ratios[layer]={}
-  for comp in ("loc0","loc1"):
-    s=surface["candidate"][layer].get(comp+"_rmse_mm"); f=final["candidate"][layer].get(comp+"_rmse_mm")
-    if s is None or f is None: continue
-    ratio=f/max(s,1e-12); ratios[layer][comp]=ratio
-    improved.append(1-ratio); degraded.append(ratio)
-passed=bool(improved) and max(improved)>=0.10 and all(x<=1.05 for x in degraded)
-out={"surface_chi2_history":[float(x) for x in sys.argv[4].split(",") if x],"surface_stop_reason":sys.argv[5],"helix_layers":layers,"helix_vs_surface_ratio":ratios,"passed":passed}; json.dump(out,open(sys.argv[6],"w"),indent=2)' "$surface_assessment" "$final_assessment" "$failed_layers" "$history_csv" "$stop_reason" "$RUN_LOG_DIR/experiment_summary.json"
+    joint_improved="$(python3 -c 'import json,sys; from reconstruction_acceptance import acceptance_score,polish_improves; joint=json.load(open(sys.argv[1])); warm=json.load(open(sys.argv[2])); print("1" if polish_improves(acceptance_score(joint),acceptance_score(warm)) else "0")' "$joint_acceptance" "$warm2_acceptance")"
+    joint_effective="$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); print("1" if value.get("best_iteration",-1)>=0 and value.get("correction_max_abs",0)>0 else "0")' "$joint_solver_summary")"
+    if [[ "$joint_improved" == "0" || "$joint_effective" == "0" ]]; then
+        current_geom="$warm2_geom"
+        current_states="$warm2_states"
+        current_summary="$warm2_summary"
+        current_acceptance="$warm2_acceptance"
+        stop_reason="joint_not_improved"
+    fi
 fi
 
-echo "Experiment artifacts: $RUN_LOG_DIR"
+for polish_round in 1 2; do
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        passed="$(python3 -c 'import json,sys; print("1" if json.load(open(sys.argv[1]))["passed"] else "0")' "$current_acceptance")"
+        [[ "$passed" == "0" ]] || break
+        failed_layers="$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["failed_layers"]))' "$current_acceptance")"
+        [[ -n "$failed_layers" ]] || die "acceptance failed without failed_layers"
+    else
+        failed_layers="$TARGET_LAYERS"
+    fi
+    label="${RUN_TAG}_surface_polish${polish_round}"
+    CURRENT_STAGE="surface_polish${polish_round}"
+    candidate_geom="$(geometry_path "$label")"
+    run_conda "$RUN_DIR/${label}.log" \
+        python ml_alignment_autograd.py "${CONFIG_ARGS[@]}" --track-mode surface \
+        --input-geom "$current_geom" --states "$current_states" --summary "$current_summary" \
+        --output-geom "$candidate_geom" --target-layers "$failed_layers" \
+        --active-dof "$ACTIVE_DOF" --alignment-gain 0.2 --epochs "$SURFACE_EPOCHS" \
+        --event-partition train --event-split-seed "$EVENT_SPLIT_SEED" \
+        --lambda-l2 "$LAMBDA_L2" --iter "polish${polish_round}" --no-plot
+    reconstruct "$label" "$candidate_geom"
+    candidate_states="$(states_path "$label")"
+    candidate_summary="$(summary_path "$label")"
+    candidate_acceptance="$(acceptance_path "$label")"
+    run_acceptance "$label" "$candidate_states" "$candidate_acceptance" calibration || true
+    polish_attempts="$polish_round"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        improved="$(python3 -c 'import json,sys; from reconstruction_acceptance import acceptance_score,polish_improves; c=json.load(open(sys.argv[1])); p=json.load(open(sys.argv[2])); print("1" if polish_improves(acceptance_score(c),acceptance_score(p)) else "0")' "$candidate_acceptance" "$current_acceptance")"
+        if [[ "$improved" == "0" ]]; then
+            stop_reason="polish_not_improved"
+            break
+        fi
+    fi
+    current_geom="$candidate_geom"
+    current_states="$candidate_states"
+    current_summary="$candidate_summary"
+    current_acceptance="$candidate_acceptance"
+    stop_reason="polish_limit_reached"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        passed="$(python3 -c 'import json,sys; print("1" if json.load(open(sys.argv[1]))["passed"] else "0")' "$current_acceptance")"
+        if [[ "$passed" == "1" ]]; then
+            stop_reason="polish_acceptance_passed"
+            break
+        fi
+    fi
+done
+
+calibration_acceptance="$current_acceptance"
+final_validation_acceptance="$(acceptance_path "${RUN_TAG}_validation")"
+CURRENT_STAGE="blind_validation"
+run_acceptance "${RUN_TAG}_validation" "$current_states" "$final_validation_acceptance" validation || true
+current_acceptance="$final_validation_acceptance"
+
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    require_file "$current_geom"
+    require_file "$current_states"
+    require_file "$current_summary"
+    require_file "$current_acceptance"
+fi
+
+CURRENT_STAGE="final_diagnostics"
+run_conda "$RUN_DIR/residual_comparison.log" \
+    python plot_residuals.py "${CONFIG_ARGS[@]}" --recon-dir "$RECONSTRUCTION_DIR" \
+    --aligned-trackstates "$current_states" --label "$RUN_TAG" --output-dir "$RUN_DIR"
+run_conda "$RUN_DIR/chi2_comparison.log" \
+    python plot_chi2ndf.py "${CONFIG_ARGS[@]}" --recon-dir "$RECONSTRUCTION_DIR" \
+    --aligned-tracksummary "$current_summary" --output "$RUN_DIR/track_chi2_ndf_comparison.png"
+run_conda "$RUN_DIR/geometry_comparison.log" \
+    python compare_geometries.py "${CONFIG_ARGS[@]}" --nominal "$GEOMETRY_ROOT/odd_transforms.json" \
+    --misaligned "$INPUT_GEOM" --aligned "$current_geom" --output-dir "$RUN_DIR/geometry_comparison"
+
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    CURRENT_STAGE="finalize"
+    python3 -c 'import json,sys; acceptance=json.load(open(sys.argv[1])); joint=json.load(open(sys.argv[8])); joint_effective=joint.get("best_iteration",-1)>=0 and joint.get("correction_max_abs",0)>0; passed=bool(acceptance["passed"] and joint_effective); out={"schema_version":2,"run_tag":sys.argv[2],"workflow":"surface-warm2_block-lm_surface-polish2_blind-validation","target_layers":["17:8","24:4"],"active_dof":[0,1,5],"event_split":{"seed":int(sys.argv[10]),"train":80,"calibration":10,"validation":10},"acceptance_baseline":sys.argv[11],"final_geometry":sys.argv[3],"final_trackstates":sys.argv[4],"final_tracksummary":sys.argv[5],"joint_free":joint,"joint_effective":joint_effective,"calibration_acceptance":json.load(open(sys.argv[12])),"final_acceptance":acceptance,"polish_attempts":int(sys.argv[6]),"stop_reason":"blind_validation_passed" if passed else "blind_validation_failed","diagnostics":{"truth_and_nominal":"diagnostic_only"},"passed":passed}; json.dump(out,open(sys.argv[9],"w"),indent=2)' \
+        "$current_acceptance" "$RUN_TAG" "$current_geom" "$current_states" "$current_summary" \
+        "$polish_attempts" "$stop_reason" "$joint_solver_summary" "$RUN_DIR/experiment_summary.json" \
+        "$EVENT_SPLIT_SEED" "$BASELINE_PROFILE" "$calibration_acceptance"
+    manifest_outputs=(
+        --output "surface_warm1_geometry=$(geometry_path "${RUN_TAG}_surface_warm1")"
+        --output "surface_warm1_states=$(states_path "${RUN_TAG}_surface_warm1")"
+        --output "surface_warm1_summary=$(summary_path "${RUN_TAG}_surface_warm1")"
+        --output "surface_warm2_geometry=$(geometry_path "${RUN_TAG}_surface_warm2")"
+        --output "surface_warm2_states=$(states_path "${RUN_TAG}_surface_warm2")"
+        --output "surface_warm2_summary=$(summary_path "${RUN_TAG}_surface_warm2")"
+        --output "surface_warm2_acceptance=$warm2_acceptance"
+        --output "joint_geometry=$joint_geom"
+        --output "joint_states=$joint_states"
+        --output "joint_summary=$joint_summary"
+        --output "joint_acceptance=$joint_acceptance"
+        --output "joint_solver_summary=$joint_solver_summary"
+        --output "acceptance_baseline=$BASELINE_PROFILE"
+        --output "calibration_acceptance=$calibration_acceptance"
+        --output "final_geometry=$current_geom"
+        --output "final_states=$current_states"
+        --output "final_summary=$current_summary"
+        --output "acceptance=$current_acceptance"
+        --output "validation_acceptance=$final_validation_acceptance"
+        --output "experiment_summary=$RUN_DIR/experiment_summary.json"
+        --output "track_chi2_comparison=$RUN_DIR/track_chi2_ndf_comparison.png"
+        --output "geometry_comparison=$RUN_DIR/geometry_comparison"
+    )
+    for ((polish_index=1; polish_index<=polish_attempts; polish_index++)); do
+        polish_label="${RUN_TAG}_surface_polish${polish_index}"
+        manifest_outputs+=(
+            --output "polish${polish_index}_geometry=$(geometry_path "$polish_label")"
+            --output "polish${polish_index}_states=$(states_path "$polish_label")"
+            --output "polish${polish_index}_summary=$(summary_path "$polish_label")"
+            --output "polish${polish_index}_acceptance=$(acceptance_path "$polish_label")"
+        )
+    done
+    python3 experiment_manifest.py finalize --manifest "$MANIFEST_PATH" --status completed \
+        "${manifest_outputs[@]}" --metrics-file "$RUN_DIR/experiment_summary.json" >/dev/null
+    MANIFEST_FINALIZED=1
+fi
+
+echo "Experiment artifacts: $RUN_DIR"

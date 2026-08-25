@@ -5,6 +5,10 @@ from pathlib import Path
 
 import numpy as np
 import uproot
+try:
+    import ROOT
+except ImportError:
+    ROOT = None
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 import matplotlib
 matplotlib.use("Agg")
@@ -58,6 +62,24 @@ def chi2_ndf_values(chi2, ndf, label=""):
 
 
 def load_chi2_ndf(input_path: Path, label=""):
+    if ROOT is not None:
+        frame = ROOT.RDataFrame("tracksummary", str(input_path))
+        available = {str(name) for name in frame.GetColumnNames()}
+        missing = {"chi2Sum", "NDF"} - available
+        if missing:
+            sys.exit(
+                f"error: branches {sorted(missing)} not found in {input_path}"
+            )
+        arrays = frame.AsNumpy(["chi2Sum", "NDF"])
+
+        def flatten(values):
+            entries = list(values)
+            return np.concatenate([np.asarray(entry) for entry in entries])
+
+        return chi2_ndf_values(
+            flatten(arrays["chi2Sum"]), flatten(arrays["NDF"]), label=label
+        )
+
     with uproot.open(input_path) as f:
         if "tracksummary" not in f:
             sys.exit(f"error: tree 'tracksummary' not found in {input_path}")

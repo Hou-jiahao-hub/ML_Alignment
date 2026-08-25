@@ -4,7 +4,7 @@ test:
 	python -m pytest tests
 
 test-root-io:
-	python -m pytest tests -m root_io --timeout=120 --timeout-method=thread
+	timeout 120s python -m pytest tests -m root_io
 
 test-shell:
 	bash tests/test_run_ml_iterative.sh

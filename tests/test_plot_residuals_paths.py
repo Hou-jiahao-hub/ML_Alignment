@@ -6,6 +6,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import awkward as ak
+import uproot
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -45,6 +47,33 @@ def test_vol_lay_directory_name_accepts_compact_and_underscored_suffixes():
         plot_residuals.vol_lay_directory_name("trackstates_kf_v24_l4_ml.root")
         == "Vol24_Lay4"
     )
+
+
+@pytest.mark.root_io
+def test_residual_loader_uses_pyroot_and_applies_layer_filter(tmp_path, monkeypatch):
+    module = load_plot_residuals_module()
+    if module.ROOT is None:
+        pytest.skip("PyROOT is unavailable")
+    path = tmp_path / "states.root"
+    with uproot.recreate(path) as root_file:
+        root_file["trackstates"] = {
+            "l_x_hit": ak.Array([[1.0, 5.0, 3.0]]),
+            "eLOC0_smt": ak.Array([[0.5, 1.0, 1.0]]),
+            "volume_id": ak.Array([[17, 17, 24]]),
+            "layer_id": ak.Array([[8, 6, 4]]),
+        }
+    monkeypatch.setattr(
+        module.uproot,
+        "open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("PyROOT-capable environments must not use uproot")
+        ),
+    )
+
+    values = module.get_branch_data(
+        path, "trackstates", "l_x_hit", "eLOC0_smt", vol_ids=17, lay_id=8
+    )
+    assert values.tolist() == pytest.approx([0.5])
 
 
 def test_comparison_files_use_target_layer_subdirectories(tmp_path):

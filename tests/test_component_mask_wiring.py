@@ -85,6 +85,9 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
         layer_id=torch.full((n_tracks, n_hits), 6, dtype=torch.long),
         is_target=torch.ones((n_tracks, n_hits), dtype=torch.bool),
         event_track_ids=torch.zeros((n_tracks, 2), dtype=torch.long),
+        fit_mask=torch.ones((n_tracks, n_hits), dtype=torch.bool),
+        fit_span=torch.tensor([300.0]),
+        selection_stats={"input_tracks": 1, "retained_tracks": 1, "excluded_tracks": 0},
     )
     geometry = m.JointGeometry(
         transforms=[], input_transforms=[],
@@ -117,6 +120,32 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
     monkeypatch.setattr(m, "load_variable_information", lambda *_a, **_k: inputs_stub)
     monkeypatch.setattr(m, "print_target_residual_stats", lambda *_a, **_k: None)
     monkeypatch.setattr(m, "build_track_batches", lambda *_a, **_k: batches)
+    seeded = torch.zeros((n_tracks, 6), dtype=torch.float64)
+    monkeypatch.setattr(m, "seed_helices", lambda *_a, **_k: seeded)
+    monkeypatch.setattr(
+        m,
+        "smt_seed_statistics",
+        lambda *_a, **_k: {"loss": 0.0, "n_points": 2, "invalid_fraction": 0.0},
+    )
+    monkeypatch.setattr(
+        m,
+        "fit_helices_to_measurements",
+        lambda *_a, **_k: (
+            seeded,
+            {"chi2_per_component": 0.0, "n_components": 4, "invalid_fraction": 0.0},
+        ),
+    )
+    monkeypatch.setattr(
+        m,
+        "_joint_forward",
+        lambda *_a, **_k: (
+            torch.zeros((n_tracks, n_hits, 2)),
+            torch.ones((n_tracks, n_hits, 2)),
+            component_mask,
+            torch.ones((n_tracks, n_hits), dtype=torch.bool),
+        ),
+    )
+    monkeypatch.setattr(m, "summarize_joint_layer_chi2", lambda *_a, **_k: {})
     monkeypatch.setattr(m, "run_joint_alignment", lambda *_a, **_k: joint_result)
     monkeypatch.setattr(m, "validate_against_truth", lambda *_a, **_k: {})
     monkeypatch.setattr(m, "export_joint_geometry", lambda *_a, **_k: None)

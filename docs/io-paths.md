@@ -52,7 +52,7 @@ versioned default configuration.
 | Chi2/hit diagnostics | Tracksummary ROOT files | `data/reconstruction/{chi2_ndf,hit_number}/<target>/*.png` |
 | Iterative experiment | Misaligned or prior-iteration geometry and ROOT files | Geometry, aligned reconstruction ROOT files, plots, and logs under `data/experiments/iterative_ml/<target>` |
 | Surface/helix experiment | Nominal and candidate ROOT files plus geometry JSON | Run-tagged geometry, summaries, ROOT files, and logs under `data/experiments/surface_helix/<target>/<run_tag>` |
-| Helix validation | Nominal trackstates and geometry JSON | `helix_validation_summary.json`, `helix_smt_comparison.csv`, and `plots/*.png` under `data/experiments/helix_validation/<target>` |
+| Helix validation | Nominal trackstates and geometry JSON | `helix_validation_summary.json`, `helix_measurement_comparison.csv`, compatibility `helix_smt_comparison.csv`, `manifest.json`, and `plots/*.png` under `data/experiments/helix_validation/<target>` |
 
 The inventory command publishes concrete default paths and absolute templates
 containing `{run_tag}`, `{iteration}`, `{axis}`, or `{layer}` for dynamic files.

@@ -428,3 +428,82 @@ merged_df["var_eLOC1"] = (merged_df["err_eLOC1_ubs"]**2).clip(lower=1e-8)
 ### ACTS 重建状态
 当前环境 `/cvmfs` 未挂载，`setup_acts.sh` 自动挂载需要交互式 sudo 密码，LCG_109/`acts.ActsPythonBindings` 无法加载，因此本轮未生成 `joint_free` 重建 ROOT，也未宣称新的 MAD。待 CVMFS 可用后执行 100k event aligned reconstruction 和 residual plotting，目标仍为 vol17/24 res_eLOC0 MAD 约 0.03–0.05mm。
 - Review follow-up: `JOINT_LR_TRACK=3e-2` and `S_MAX=1200mm` are intentional empirical defaults; the original plan baseline remains reproducible through CLI overrides. Free-mode diagnostics now reuse `print_per_layer_residual_diagnostics`, and the toy closure covers tx/ty/rx/ry plus a masked strip component and frozen-track control.
+
+---
+
+## Iteration 10 — nominal measurement holdout：helix 内推/双向外推验证
+**日期**: 2026-08-21 | **样本**: 每种模式最多 1000 个目标 hit | **拟合**: SMT seed + 非目标层 measurement refit，200+200 iter，CPU float64
+
+### 与旧验证假设的区别
+- 旧 `validate_helix_model.py` 以 `prediction-eLOC_smt` 为局部精度指标；本轮改为要求的 **`prediction-l_{x,y}_hit`**。目标层 measurement 和 SMT 均不进入 seed/refit，避免标签泄漏。
+- 对同一目标 hit 主动构造 `interpolation`、`forward_extrapolation`（仅较小 pathLength）和 `backward_extrapolation`（仅较大 pathLength）。实际数据证明 8 hit/300mm 无法形成 forward 样本，因此外推采用独立最低门槛 **4 hit/100mm**；内推仍为 8 hit/300mm。
+- 输入 SHA256：nominal trackstates `faed97457fd5af41880e25cad176e443914235779be8b9adddd0ef3a22443cd8`；nominal geometry `b409bccfbec3008a37e9aae57a66dad7c2cb4c79ab2b31071aff6a8f760c8680`。
+
+### 结果：prediction − nominal local measurement
+| 层 | 模式 | N | LOC0 bias / RMSE / P95 [mm] | LOC1 bias / RMSE / P95 [mm] | 方向 RMS [rad] |
+|---|---|---:|---|---|---:|
+| 17:8 | interpolation | 368 | -0.004 / 0.083 / 0.163 | -0.001 / 0.034 / 0.061 | 0.00048 |
+| 17:8 | forward | 262 | +0.020 / 0.227 / 0.363 | -0.004 / 0.058 / 0.100 | 0.00310 |
+| 17:8 | backward | 500 | -0.001 / 0.579 / 1.108 | +0.038 / 1.704 / 3.001 | 0.00501 |
+| 24:4 | interpolation | 632 | +0.004 / 0.170 / 0.311 | +0.005 / 1.158 / 2.260 | 0.00032 |
+| 24:4 | forward | 738 | -0.015 / 0.352 / 0.623 | -0.006 / 1.172 / 2.303 | 0.00273 |
+| 24:4 | backward | 500 | +0.025 / 0.903 / 1.494 | -0.027 / 4.433 / 8.810 | 0.00863 |
+
+所有分组求交失败率均为 **0%**，但绝对 RMSE 门槛未通过。内推精度最好，forward 外推约恶化 2–3 倍，backward 外推最差；各组 bias 接近零而 STD/RMSE 很大，说明主要是逐轨迹扩散而不是整体偏置。尤其 24:4 LOC1 的 measurement-normalized RMS 在内推/forward 约为 0.96/0.98，符合粗粒度 strip 分辨率；pixel LOC0 和 backward 模式远大于 1，单螺旋对 measurement 的预测误差明显超过测量误差。
+
+### 验收结论
+- **FAIL（有效负结果）**：当前 helix 模型不能满足 pixel 0.05mm、strip LOC0 0.10mm 的既定门槛；只有 17:8 interpolation LOC1 和 24:4 interpolation/forward LOC1 达到对应绝对门槛。
+- 失败不是 surface intersection 数值问题，而与单螺旋忽略材料效应/多次散射、单侧窗口 lever arm 和传播方向不对称一致。本轮只验证模型，不调参或修改 helix 数学形式。
+- 完整 manifest、summary、CSV 和 plots 位于 `data/experiments/helix_validation/Vol17_Lay8__Vol24_Lay4/measurement_holdout_20260821/`；manifest 状态为 `completed`，validation `passed=false`。
+
+---
+
+## Iteration 11 — surface warm-start + non-target initialization + joint free-helix（实现阶段）
+**日期**: 2026-08-24 | **状态**: implementation complete，ACTS 物理验收待运行
+
+### 相对 Iteration 10 改变的假设
+- Iteration 10 是逐目标 hit 的 nominal holdout 预测，且证明单螺旋单侧外推精度不足；本轮不重复该实验。新假设是先固定执行两轮 surface warm-start，再用整条轨迹的全部非目标层（至少 8 hit、300 mm）进行全局 SMT seed 和 measurement refit，最后在全部 measurement 上联合释放轨迹与双目标层几何。
+- nominal/truth 不再提供门控、候选层或验收基准；物理验收改为候选几何重新 ACTS reconstruction 后的 measurement/smoothed-state `chi2/N <= 1.0`。
+- 活动自由度按本轮固定配方设为 `(tx,ty,rz)`；这与历史 Iteration 7--9 的 `(tx,ty,rx,ry)` 实验假设不同，结果不得直接横向冒充复现。
+
+### 已实现
+- 抽取 ACTS-independent `helix_model.py`，统一六参数 helix、Newton 最近点/平面求交、曲率缩放和数值容差。
+- free 模式新增非目标层 `fit_mask`、跨度筛选、SMT seed、measurement χ² refit、初始化统计和三阶段逐层 χ²；联合阶段仍使用全部有效 measurement，保留 checkpoint、patience 和 5% 无效求交上限。
+- 新增 `reconstruction_acceptance.py`，对缺层、零分量、非有限值和 ROOT 字段不完整 fail closed；polish 使用固定字典序评分。
+- 编排固定两轮 warm-start、一次 joint free-helix 和最多两轮 gain=0.2 surface polish；旧 nominal/candidate CLI 仅警告并忽略。每个候选使用独立文件名重建和验收，未改善时保留上一版。
+- manifest 从运行开始创建，退出 trap 记录异常终止；最终 summary 包含初始化、逐层 χ²、验收、停止原因和最终选择。
+
+### 尚未宣称的结果
+- 本条不包含新的算法指标或 ACTS 验收结论。只有在独立 ACTS shell 完成 smoke/formal reconstruction、双层所有有效 LOC0/LOC1 均 `chi2/N <= 1.0` 且 manifest 完成后，才能追加物理成功结论。
+
+---
+
+## Iteration 12 — trial-006 失效分析与 block-LM 改版
+**日期**: 2026-08-25 | **状态**: implementation complete，trial-007 待运行
+
+### trial-006 的决定性证据
+- 两轮 surface 将四个目标分量 χ²大幅降低，但 joint 输出与 warm2 JSON 的 SHA256
+  完全相同。joint 最佳点停在 iteration `-1`：初始 loss `16.049`，iteration 100
+  升至 `86.816`，所有更新 checkpoint 都比初始状态差，最终恢复零修正。
+- 旧 `JOINT_LR_TRACK=0.03` 来自初始 χ²约 7480、GPU float32、不同 active DOF 的
+  Iteration 9；trial-006 已经是 warm2 + measurement-refit 后的 CPU float64 近解。
+  同一 Adam 步长同时作用于 mm 位置、rad 方向和无量纲 `tan_lambda`，首步方向变化在
+  数百 mm 杠杆臂上可放大为多 mm，不能作为细校准默认。
+- nominal 重建自身的 `17:8 LOC1 chi2/N=1.333`，证明统一绝对阈值 1.0 不是该统计量
+  在当前重建模型下的自洽几何基准。trial-006 final 虽继续改善，仍以四分量失败结束。
+
+### 与 Iteration 11 不同的新假设
+- 轨迹是由非目标层确定的 nuisance parameter；目标层 measurement 只估计目标层几何，
+  不再同时拉动轨迹。几何每 sensor 仅有三个自由度，采用聚合加权法方程比逐 hit Adam
+  更符合其可观测结构。
+- 事件固定切分为 80/10/10。calibration 用 nominal states 一次性冻结逐分量预测阈值并
+  选择候选；validation 只对最终候选评估一次。truth geometry recovery 仍不进入控制流。
+
+### 实现
+- measurement refit 将位置、方向和缩放曲率学习率拆为 `1e-3/1e-5/1e-3`，保存初始
+  checkpoint，并记录初始/最佳 χ²及三组参数更新 RMS。
+- free 默认 geometry solver 改为固定轨迹的逐 sensor block-LM；Fisher 使用物理尺度
+  归一化和 `1e-4` 特征值下限，只有实际目标 χ²下降且无效求交不超过 5% 才接受步骤。
+- 新增稳定事件切分、nominal bootstrap acceptance profile、归一化 polish score 和
+  blind-validation 编排。trial-007 只有四个 validation 分量全部通过且 joint 有非零
+  有效更新时才可标记通过。

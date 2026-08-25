@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import json
+import math
 import os
 import numpy as np
 import uproot
@@ -22,6 +23,31 @@ from alignment_artifact_layout import (
     target_layers_spec,
 )
 from project_config import absolute_project_path, add_config_argument
+from event_split import DEFAULT_SPLIT_SEED, PARTITIONS, event_partition_mask
+try:
+    from .helix_model import (
+        CURVATURE_SCALE,
+        S_MAX,
+        accept_newton_candidate,
+        assemble_track_parameters as assemble_joint_track_parameters,
+        closest_helix_points,
+        helix_point,
+        helix_tangent,
+        intersect_plane,
+        split_track_parameters as split_joint_track_parameters,
+    )
+except ImportError:  # Direct script execution.
+    from helix_model import (
+        CURVATURE_SCALE,
+        S_MAX,
+        accept_newton_candidate,
+        assemble_track_parameters as assemble_joint_track_parameters,
+        closest_helix_points,
+        helix_point,
+        helix_tangent,
+        intersect_plane,
+        split_track_parameters as split_joint_track_parameters,
+    )
 
 EPS_COVARIANCE = 1e-8
 EPS_WEIGHT = 1e-12
@@ -34,15 +60,12 @@ DEFAULT_TARGET_LAYERS = TARGET_LAYERS
 # constrained by a planar residual); rz must stay in -- it is the only
 # rotation the current misalignment actually produces.
 DEFAULT_ACTIVE_DOF = CONFIG_ACTIVE_DOF
-DEFAULT_EPOCHS = 300
+DEFAULT_EPOCHS = 200
 DEFAULT_LAMBDA_L2 = 1e-5
 DEFAULT_ADAM_LR = 1e-2
 DEFAULT_ADAM_ETA_MIN = 1e-5
 ADAM_CLAMP_T = 1.5
 ADAM_CLAMP_R = 0.05
-PLANE_PARALLEL_EPS = 1e-6
-PLANE_RESIDUAL_TOLERANCE = 1e-3
-S_MAX = 1200.0
 JOINT_ITERS = 1000
 JOINT_LR_TRANS = 1e-2
 JOINT_LR_TRACK = 3e-2
@@ -50,6 +73,20 @@ JOINT_CLAMP_T = 1.5
 JOINT_CLAMP_R = 0.05
 JOINT_CHECKPOINT_INTERVAL = 10
 JOINT_PATIENCE = 200
+JOINT_SEED_MODE = "non-target-measurement"
+JOINT_SEED_MIN_HITS = 8
+JOINT_SEED_MIN_SPAN = 300.0
+JOINT_SMT_SEED_ITERS = 200
+JOINT_MEASUREMENT_REFIT_ITERS = 200
+JOINT_SOLVER = "block-lm"
+LM_MAX_ITERS = 20
+LM_INITIAL_DAMPING = 1e-3
+FISHER_EIGEN_FLOOR = 1e-4
+LM_MAX_STEP_T = 0.1
+LM_MAX_STEP_R = 1e-3
+MEASUREMENT_REFIT_LR_POSITION = 1e-3
+MEASUREMENT_REFIT_LR_DIRECTION = 1e-5
+MEASUREMENT_REFIT_LR_RHO_SCALED = 1e-3
 # EXPERIMENTAL: hit-quality weighting is temporarily disabled; no caller sets
 # use_hit_weights=True.  Kept so the experiment can be restarted.
 HIT_WEIGHT_FLOOR = 0.3
@@ -82,6 +119,46 @@ class AlignmentInputs:
     merged_df: pd.DataFrame | None = field(default=None, repr=False)
 
 
+def filter_alignment_inputs_by_event_partition(
+    inputs: AlignmentInputs,
+    partition: str,
+    split_seed: int = DEFAULT_SPLIT_SEED,
+) -> AlignmentInputs:
+    """Return a hit-level view restricted to one deterministic event partition."""
+    mask_numpy = event_partition_mask(
+        inputs.hit_event_ids.detach().cpu().numpy(), partition, split_seed
+    )
+    mask = torch.as_tensor(mask_numpy, device=inputs.hit_event_ids.device, dtype=torch.bool)
+    if not mask.any():
+        raise ValueError(f"Event partition '{partition}' contains no alignment hits")
+
+    def selected(value):
+        return value[mask.to(value.device)] if value is not None else None
+
+    merged = None
+    if inputs.merged_df is not None:
+        merged = inputs.merged_df.loc[mask_numpy].reset_index(drop=True)
+    return AlignmentInputs(
+        hit_sensor_ids=selected(inputs.hit_sensor_ids),
+        initial_residuals=selected(inputs.initial_residuals),
+        covariances=selected(inputs.covariances),
+        track_params=selected(inputs.track_params),
+        track_chi2_ndf=selected(inputs.track_chi2_ndf),
+        hit_global_positions=selected(inputs.hit_global_positions),
+        hit_directions=selected(inputs.hit_directions),
+        hit_qoverp=selected(inputs.hit_qoverp),
+        hit_volume_ids=selected(inputs.hit_volume_ids),
+        hit_layer_ids=selected(inputs.hit_layer_ids),
+        hit_module_ids=selected(inputs.hit_module_ids),
+        hit_event_ids=selected(inputs.hit_event_ids),
+        hit_track_ids=selected(inputs.hit_track_ids),
+        measured_local=selected(inputs.measured_local),
+        loc1_valid=selected(inputs.loc1_valid),
+        raw_covariances=selected(inputs.raw_covariances),
+        merged_df=merged,
+    )
+
+
 @dataclass
 class TrackBatches:
     measured_local: torch.Tensor
@@ -95,6 +172,9 @@ class TrackBatches:
     layer_id: torch.Tensor
     is_target: torch.Tensor
     event_track_ids: torch.Tensor
+    fit_mask: torch.Tensor | None = None
+    fit_span: torch.Tensor | None = None
+    selection_stats: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -158,6 +238,23 @@ class AlignmentRunConfig:
     joint_patience: int = JOINT_PATIENCE
     joint_min_delta: float = 0.0
     joint_max_invalid_fraction: float = 0.05
+    joint_seed_mode: str = JOINT_SEED_MODE
+    joint_seed_min_hits: int = JOINT_SEED_MIN_HITS
+    joint_seed_min_span: float = JOINT_SEED_MIN_SPAN
+    joint_smt_seed_iters: int = JOINT_SMT_SEED_ITERS
+    joint_measurement_refit_iters: int = JOINT_MEASUREMENT_REFIT_ITERS
+    alignment_gain: float = 1.0
+    joint_solver: str = JOINT_SOLVER
+    lm_max_iters: int = LM_MAX_ITERS
+    lm_initial_damping: float = LM_INITIAL_DAMPING
+    fisher_eigen_floor: float = FISHER_EIGEN_FLOOR
+    lm_max_step_t: float = LM_MAX_STEP_T
+    lm_max_step_r: float = LM_MAX_STEP_R
+    measurement_refit_lr_position: float = MEASUREMENT_REFIT_LR_POSITION
+    measurement_refit_lr_direction: float = MEASUREMENT_REFIT_LR_DIRECTION
+    measurement_refit_lr_rho_scaled: float = MEASUREMENT_REFIT_LR_RHO_SCALED
+    event_partition: str | None = None
+    event_split_seed: int = DEFAULT_SPLIT_SEED
 
 
 class JointBestCheckpoint:
@@ -211,86 +308,45 @@ def joint_checkpoint_score(total_loss, invalid_fraction, max_invalid_fraction):
     return float(total_loss)
 
 
-def _sinc(value):
-    """Return sin(value) / value with a differentiable zero limit."""
-    return torch.sinc(value / torch.pi)
+def summarize_joint_layer_chi2(
+    residuals,
+    covariance,
+    component_mask,
+    volume_id,
+    layer_id,
+    target_layers,
+):
+    """Return per-layer, per-component chi2 for padded joint tensors."""
+    residuals = residuals.detach().cpu()
+    covariance = covariance.detach().cpu()
+    component_mask = component_mask.detach().cpu()
+    volume_id = volume_id.detach().cpu()
+    layer_id = layer_id.detach().cpu()
+    weighted = residuals.square() / covariance.clamp_min(EPS_COVARIANCE)
+    output = {}
+    for volume, layer in parse_target_layers(target_layers):
+        layer_mask = (volume_id == volume) & (layer_id == layer)
+        components = {}
+        for index, name in enumerate(("LOC0", "LOC1")):
+            mask = layer_mask & component_mask[..., index]
+            count = int(mask.sum())
+            components[name] = {
+                "chi2_per_component": (
+                    float(weighted[..., index][mask].mean()) if count else None
+                ),
+                "n_components": count,
+            }
+        output[f"{volume}:{layer}"] = components
+    return output
 
 
-def helix_point(track, s):
-    """Evaluate signed-curvature helices at transverse arc length ``s``."""
-    x0, y0, z0, psi0, tanl, rho = track.unbind(-1)
-    angle = rho * s
-    half_sinc = _sinc(angle / 2.0)
-    x = x0 + s * torch.cos(psi0 + angle / 2.0) * half_sinc
-    y = y0 + s * torch.sin(psi0 + angle / 2.0) * half_sinc
-    z = z0 + tanl * s
-    return torch.stack((x, y, z), dim=-1)
-
-
-def helix_tangent(track, s):
-    """Derivative of :func:`helix_point` with respect to transverse arc length."""
-    _x0, _y0, _z0, psi0, tanl, rho = track.unbind(-1)
-    psi = psi0 + rho * s
-    return torch.stack((torch.cos(psi), torch.sin(psi), tanl * torch.ones_like(s)), dim=-1)
-
-
-def accept_newton_candidate(previous, candidate, valid, candidate_ok):
-    """Accept feasible Newton steps without restarting failed paths at zero."""
-    updated_valid = valid & candidate_ok
-    return torch.where(updated_valid, candidate, previous), updated_valid
-
-
-def intersect_plane(track, center, normal, n_newton=12):
-    """Intersect helices with planes and return ``(s, point, valid_mask)``."""
-    tangent0 = helix_tangent(track, torch.zeros_like(track[..., 0]))
-    denominator0 = torch.sum(tangent0 * normal, dim=-1)
-    straight_valid = denominator0.abs() >= PLANE_PARALLEL_EPS
-    safe_denominator = torch.where(
-        straight_valid,
-        denominator0,
-        torch.where(denominator0 >= 0, torch.ones_like(denominator0), -torch.ones_like(denominator0)),
-    )
-    s = torch.sum((center - track[..., :3]) * normal, dim=-1) / safe_denominator
-    tangent_at_initial = helix_tangent(track, s)
-    initially_valid = (
-        straight_valid
-        & torch.isfinite(s)
-        & (torch.sum(tangent_at_initial * normal, dim=-1).abs() >= PLANE_PARALLEL_EPS)
-    )
-    s = torch.where(initially_valid, s, torch.zeros_like(s))
-    iteration_valid = initially_valid
-
-    for _ in range(n_newton):
-        point = helix_point(track, s)
-        tangent = helix_tangent(track, s)
-        residual = torch.sum((point - center) * normal, dim=-1)
-        derivative = torch.sum(tangent * normal, dim=-1)
-        derivative_safe = torch.where(
-            derivative.abs() >= PLANE_PARALLEL_EPS,
-            derivative,
-            torch.where(derivative >= 0, torch.full_like(derivative, PLANE_PARALLEL_EPS),
-                        torch.full_like(derivative, -PLANE_PARALLEL_EPS)),
-        )
-        candidate = s - residual / derivative_safe
-        candidate_ok = (
-            torch.isfinite(candidate)
-            & (candidate.abs() <= S_MAX)
-            & (derivative.abs() >= PLANE_PARALLEL_EPS)
-        )
-        s, iteration_valid = accept_newton_candidate(
-            s, candidate, iteration_valid, candidate_ok
-        )
-
-    point = helix_point(track, s)
-    final_residual = torch.sum((point - center) * normal, dim=-1).abs()
-    finite = torch.isfinite(s) & torch.isfinite(point).all(dim=-1)
-    valid = iteration_valid & finite & (s.abs() <= S_MAX) & (final_residual <= PLANE_RESIDUAL_TOLERANCE)
-    point = torch.where(valid.unsqueeze(-1), point, helix_point(track, torch.zeros_like(s)))
-    s = torch.where(valid, s, torch.zeros_like(s))
-    return s, point, valid
-
-
-def build_track_batches(inputs, target_layers, min_hits=8, max_tracks=0):
+def build_track_batches(
+    inputs,
+    target_layers,
+    min_hits=JOINT_SEED_MIN_HITS,
+    min_span=JOINT_SEED_MIN_SPAN,
+    max_tracks=0,
+):
     """Group flat hit tensors into deterministic padded per-track tensors."""
     if inputs.measured_local is None or inputs.loc1_valid is None:
         raise ValueError("Joint mode requires measured_local and loc1_valid.")
@@ -321,19 +377,27 @@ def build_track_batches(inputs, target_layers, min_hits=8, max_tracks=0):
 
     selected = []
     for key, indices in groups:
-        has_target = any(
-            (int(inputs.hit_volume_ids[i]), int(inputs.hit_layer_ids[i])) in target_layers
+        target_flags = [
+            (int(inputs.hit_volume_ids[i]), int(inputs.hit_layer_ids[i]))
+            in target_layers
             for i in indices
+        ]
+        fit_indices = [i for i, is_target in zip(indices, target_flags) if not is_target]
+        fit_positions = positions[fit_indices]
+        fit_span = (
+            float(np.linalg.norm(np.diff(fit_positions, axis=0), axis=1).sum())
+            if len(fit_positions) > 1
+            else 0.0
         )
-        if has_target and len(indices) >= min_hits:
-            selected.append((key, indices))
+        if any(target_flags) and len(fit_indices) >= min_hits and fit_span >= min_span:
+            selected.append((key, indices, fit_span))
     if max_tracks and max_tracks > 0:
         selected = selected[:max_tracks]
     if not selected:
         raise ValueError("No tracks satisfy the joint-alignment selection.")
 
     n_tracks = len(selected)
-    max_hits = max(len(indices) for _, indices in selected)
+    max_hits = max(len(indices) for _, indices, _fit_span in selected)
     measured = torch.zeros((n_tracks, max_hits, 2), dtype=inputs.measured_local.dtype)
     covariance = torch.ones((n_tracks, max_hits, 2), dtype=inputs.covariances.dtype)
     sensor_idx = torch.zeros((n_tracks, max_hits), dtype=torch.long)
@@ -344,8 +408,10 @@ def build_track_batches(inputs, target_layers, min_hits=8, max_tracks=0):
     volume_id = torch.zeros((n_tracks, max_hits), dtype=torch.long)
     layer_id = torch.zeros((n_tracks, max_hits), dtype=torch.long)
     is_target = torch.zeros((n_tracks, max_hits), dtype=torch.bool)
+    fit_mask = torch.zeros((n_tracks, max_hits), dtype=torch.bool)
+    fit_span = torch.zeros(n_tracks, dtype=inputs.hit_global_positions.dtype)
     event_track_ids = torch.zeros((n_tracks, 2), dtype=torch.long)
-    for track_index, (key, indices) in enumerate(selected):
+    for track_index, (key, indices, track_fit_span) in enumerate(selected):
         count = len(indices)
         index = torch.tensor(indices, dtype=torch.long)
         measured[track_index, :count] = inputs.measured_local[index]
@@ -358,10 +424,12 @@ def build_track_batches(inputs, target_layers, min_hits=8, max_tracks=0):
         volume_id[track_index, :count] = inputs.hit_volume_ids[index]
         layer_id[track_index, :count] = inputs.hit_layer_ids[index]
         event_track_ids[track_index] = torch.tensor(key)
+        fit_span[track_index] = track_fit_span
         for hit_index, flat_index in enumerate(indices):
             is_target[track_index, hit_index] = (
                 int(inputs.hit_volume_ids[flat_index]), int(inputs.hit_layer_ids[flat_index])
             ) in target_layers
+        fit_mask[track_index, :count] = ~is_target[track_index, :count]
     return TrackBatches(
         measured_local=measured,
         covariances=covariance,
@@ -374,6 +442,13 @@ def build_track_batches(inputs, target_layers, min_hits=8, max_tracks=0):
         layer_id=layer_id,
         is_target=is_target,
         event_track_ids=event_track_ids,
+        fit_mask=fit_mask,
+        fit_span=fit_span,
+        selection_stats={
+            "input_tracks": len(groups),
+            "retained_tracks": len(selected),
+            "excluded_tracks": len(groups) - len(selected),
+        },
     )
 
 
@@ -428,42 +503,21 @@ def export_joint_geometry(geometry, predicted_deltas, output_path):
     update_geometry_to_json(transforms, input_deltas, output_path)
 
 
-def closest_helix_points(track, points, n_newton=8):
-    """Return closest points on each helix to reference global points."""
-    delta = points - track[..., :3]
-    s = delta[..., 0] * torch.cos(track[..., 3]) + delta[..., 1] * torch.sin(track[..., 3])
-    valid = torch.isfinite(s)
-    s = torch.where(valid, s, torch.zeros_like(s))
-    for _ in range(n_newton):
-        position = helix_point(track, s)
-        tangent = helix_tangent(track, s)
-        displacement = position - points
-        rho = track[..., 5]
-        psi = track[..., 3] + rho * s
-        second = torch.stack(
-            (-rho * torch.sin(psi), rho * torch.cos(psi), torch.zeros_like(rho)), dim=-1
+def _non_target_fit_mask(batches):
+    if batches.fit_mask is None:
+        raise ValueError(
+            "Joint initialization requires a non-target fit_mask; "
+            "falling back to all hits is forbidden."
         )
-        first_derivative = torch.sum(displacement * tangent, dim=-1)
-        second_derivative = torch.sum(tangent * tangent + displacement * second, dim=-1)
-        safe = torch.where(
-            second_derivative.abs() > 1e-9,
-            second_derivative,
-            torch.where(second_derivative >= 0, torch.full_like(second_derivative, 1e-9),
-                        torch.full_like(second_derivative, -1e-9)),
-        )
-        candidate = s - first_derivative / safe
-        step_valid = torch.isfinite(candidate) & (candidate.abs() <= S_MAX)
-        s, valid = accept_newton_candidate(s, candidate, valid, step_valid)
-    fitted = helix_point(track, s)
-    valid = valid & torch.isfinite(fitted).all(dim=-1)
-    fitted = torch.where(valid.unsqueeze(-1), fitted, track[..., :3])
-    return fitted, s, valid
+    if (batches.fit_mask & batches.is_target).any():
+        raise ValueError("Joint initialization fit_mask contains target-layer hits.")
+    return batches.fit_mask
 
 
 def seed_helices(batches, n_iter=200, device="cpu", dtype=torch.float64):
     """Fit per-track helix warm starts to ACTS smoothed global points."""
     points = batches.g_smt.to(device=device, dtype=dtype)
-    mask = batches.hit_mask.to(device=device)
+    mask = _non_target_fit_mask(batches).to(device=device)
     n_tracks, n_hits, _ = points.shape
     first_index = mask.to(torch.int64).argmax(dim=1)
     rows = torch.arange(n_tracks, device=device)
@@ -480,7 +534,7 @@ def seed_helices(batches, n_iter=200, device="cpu", dtype=torch.float64):
     ])
     for _ in range(n_iter):
         optimizer.zero_grad()
-        track_parameters = torch.cat((linear, rho_scaled * 1e-4), dim=1)
+        track_parameters = assemble_joint_track_parameters(linear, rho_scaled)
         expanded = track_parameters[:, None, :].expand(-1, n_hits, -1)
         with torch.no_grad():
             _fit, path_length, valid = closest_helix_points(expanded.detach(), points)
@@ -491,17 +545,187 @@ def seed_helices(batches, n_iter=200, device="cpu", dtype=torch.float64):
         loss = loss / effective.sum().clamp(min=1)
         loss.backward()
         optimizer.step()
-    return torch.cat((linear, rho_scaled * 1e-4), dim=1).detach()
+    return assemble_joint_track_parameters(linear, rho_scaled).detach()
 
 
-def split_joint_track_parameters(track_parameters):
-    """Split physical helices into linear parameters and scaled curvature."""
-    return track_parameters[:, :5], track_parameters[:, 5:6] / 1e-4
+def smt_seed_statistics(batches, track_parameters):
+    """Summarize the non-target SMT point fit used only for initialization."""
+    points = batches.g_smt.to(track_parameters.device, track_parameters.dtype)
+    fit_mask = _non_target_fit_mask(batches).to(track_parameters.device)
+    expanded = track_parameters[:, None, :].expand(-1, points.shape[1], -1)
+    fitted, _path, valid = closest_helix_points(expanded, points)
+    effective = fit_mask & valid
+    if not effective.any():
+        raise ValueError("No valid non-target SMT points remain after helix seeding.")
+    squared_distance = torch.sum((fitted - points).square(), dim=-1)
+    loss = torch.sum(torch.where(effective, squared_distance, torch.zeros_like(squared_distance)))
+    loss = loss / effective.sum()
+    invalid_fraction = 1.0 - float(valid[fit_mask].float().mean().cpu())
+    return {
+        "loss": float(loss.cpu()),
+        "n_points": int(effective.sum().cpu()),
+        "invalid_fraction": invalid_fraction,
+    }
 
 
-def assemble_joint_track_parameters(linear, rho_scaled):
-    """Assemble physical helix parameters from the optimizer representation."""
-    return torch.cat((linear, rho_scaled * 1e-4), dim=1)
+def _measurement_refit_objective(
+    track_parameters,
+    batches,
+    geometry,
+):
+    """Evaluate non-target measurement chi2 on fixed working geometry."""
+    measured = batches.measured_local.to(track_parameters.device, track_parameters.dtype)
+    covariance = batches.covariances.to(track_parameters.device, track_parameters.dtype)
+    sensor_idx = batches.sensor_idx.to(track_parameters.device)
+    fit_mask = _non_target_fit_mask(batches).to(track_parameters.device)
+    loc1_mask = batches.loc1_mask.to(track_parameters.device)
+    n_hits = measured.shape[1]
+    tracks = track_parameters[:, None, :].expand(-1, n_hits, -1)
+    centers = geometry.centers.to(track_parameters.device, track_parameters.dtype)[sensor_idx]
+    rotations = geometry.rotations.to(track_parameters.device, track_parameters.dtype)[sensor_idx]
+    _path, intersections, intersection_valid = intersect_plane(
+        tracks, centers, rotations[..., :, 2]
+    )
+    local = torch.matmul(
+        rotations.transpose(-1, -2), (intersections - centers).unsqueeze(-1)
+    ).squeeze(-1)[..., :2]
+    residuals = measured - local
+    valid_hits = fit_mask & intersection_valid
+    component_mask = torch.stack((valid_hits, valid_hits & loc1_mask), dim=-1)
+    weighted = residuals.square() / covariance.clamp_min(EPS_COVARIANCE)
+    loss = torch.sum(torch.where(component_mask, weighted, torch.zeros_like(weighted)))
+    loss = loss / component_mask.sum().clamp(min=1)
+    invalid_fraction = 1.0 - float(
+        intersection_valid[fit_mask].float().mean().detach().cpu()
+    )
+    return loss, invalid_fraction, component_mask
+
+
+def fit_helices_to_measurements(
+    batches,
+    geometry,
+    initial_parameters,
+    n_iter=JOINT_MEASUREMENT_REFIT_ITERS,
+    device="cpu",
+    dtype=torch.float64,
+    max_invalid_fraction=0.05,
+    lr_position=MEASUREMENT_REFIT_LR_POSITION,
+    lr_direction=MEASUREMENT_REFIT_LR_DIRECTION,
+    lr_rho_scaled=MEASUREMENT_REFIT_LR_RHO_SCALED,
+):
+    """Refit helices using only non-target local measurements and fixed surfaces."""
+    if n_iter < 1:
+        raise ValueError("joint measurement refit iterations must be at least 1.")
+    initial = initial_parameters.to(device=device, dtype=dtype)
+    linear_initial, rho_initial = split_joint_track_parameters(initial)
+    position = nn.Parameter(linear_initial[:, :3].clone())
+    direction = nn.Parameter(linear_initial[:, 3:].clone())
+    rho_scaled = nn.Parameter(rho_initial.clone())
+    optimizer = optim.Adam(
+        (
+            {"params": [position], "lr": lr_position},
+            {"params": [direction], "lr": lr_direction},
+            {"params": [rho_scaled], "lr": lr_rho_scaled},
+        )
+    )
+    checkpoint = JointBestCheckpoint((position, direction, rho_scaled))
+    with torch.no_grad():
+        initial_loss_tensor, initial_invalid, initial_component_mask = _measurement_refit_objective(
+            initial, batches, geometry
+        )
+    initial_loss = float(initial_loss_tensor.cpu())
+    if initial_invalid > max_invalid_fraction:
+        raise ValueError(
+            "Initial non-target measurement refit exceeds invalid-intersection limit: "
+            f"{initial_invalid:.2%} > {max_invalid_fraction:.2%}."
+        )
+    checkpoint.observe(initial_loss, iteration=-1)
+    final_invalid = initial_invalid
+    first_step = None
+    for iteration in range(n_iter):
+        optimizer.zero_grad()
+        linear = torch.cat((position, direction), dim=1)
+        parameters = assemble_joint_track_parameters(linear, rho_scaled)
+        loss, invalid_fraction, component_mask = _measurement_refit_objective(
+            parameters, batches, geometry
+        )
+        if not component_mask.any():
+            raise ValueError("No valid non-target measurement components remain for helix refit.")
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Non-finite non-target measurement helix loss.")
+        loss.backward()
+        before = (
+            position.detach().clone(),
+            direction.detach().clone(),
+            rho_scaled.detach().clone(),
+        )
+        gradient_norms = {
+            "position": float(position.grad.norm().detach().cpu()),
+            "direction": float(direction.grad.norm().detach().cpu()),
+            "rho_scaled": float(rho_scaled.grad.norm().detach().cpu()),
+        }
+        optimizer.step()
+        with torch.no_grad():
+            evaluated = assemble_joint_track_parameters(
+                torch.cat((position, direction), dim=1), rho_scaled
+            )
+            evaluated_loss, evaluated_invalid, _evaluated_mask = _measurement_refit_objective(
+                evaluated, batches, geometry
+            )
+        evaluated_value = joint_checkpoint_score(
+            float(evaluated_loss.cpu()), evaluated_invalid, max_invalid_fraction
+        )
+        if iteration == 0:
+            updates = (
+                position.detach() - before[0],
+                direction.detach() - before[1],
+                rho_scaled.detach() - before[2],
+            )
+            names = ("position", "direction", "rho_scaled")
+            first_step = {
+                "loss_before": float(loss.detach().cpu()),
+                "loss_after": float(evaluated_loss.cpu()),
+                "invalid_fraction_after": evaluated_invalid,
+                "gradient_norms": gradient_norms,
+                "update_rms": {
+                    name: float(torch.sqrt(torch.mean(update.square())).cpu())
+                    for name, update in zip(names, updates, strict=True)
+                },
+                "update_max": {
+                    name: float(update.abs().max().cpu())
+                    for name, update in zip(names, updates, strict=True)
+                },
+            }
+        checkpoint.observe(evaluated_value, iteration=iteration)
+        final_invalid = evaluated_invalid
+    checkpoint.restore()
+    fitted = assemble_joint_track_parameters(
+        torch.cat((position, direction), dim=1), rho_scaled
+    ).detach()
+    with torch.no_grad():
+        evaluated_loss, final_invalid, component_mask = _measurement_refit_objective(
+            fitted, batches, geometry
+        )
+        final_loss = float(evaluated_loss.cpu())
+    if final_invalid > max_invalid_fraction:
+        raise ValueError(
+            "Non-target measurement refit intersection failure rate exceeds limit: "
+            f"{final_invalid:.2%} > {max_invalid_fraction:.2%}."
+        )
+    return fitted, {
+        "chi2_per_component": final_loss,
+        "initial_chi2_per_component": initial_loss,
+        "n_components": int(component_mask.sum().cpu()),
+        "invalid_fraction": final_invalid,
+        "best_iteration": checkpoint.best_iteration,
+        "improved": bool(checkpoint.best_iteration >= 0 and final_loss < initial_loss),
+        "parameter_updates": {
+            "position_rms": float(torch.sqrt(torch.mean((fitted[:, :3] - initial[:, :3]).square())).cpu()),
+            "direction_rms": float(torch.sqrt(torch.mean((fitted[:, 3:5] - initial[:, 3:5]).square())).cpu()),
+            "rho_rms": float(torch.sqrt(torch.mean((fitted[:, 5] - initial[:, 5]).square())).cpu()),
+        },
+        "first_step": first_step,
+    }
 
 
 def _joint_forward(track_parameters, alignment, batches, geometry, track_indices=None):
@@ -531,6 +755,252 @@ def _joint_forward(track_parameters, alignment, batches, geometry, track_indices
     component_mask = torch.stack((valid, valid & loc1_mask), dim=-1)
     residuals = torch.where(component_mask, residuals, torch.zeros_like(residuals))
     return residuals, covariance, component_mask, intersection_valid
+
+
+def regularize_fisher_matrix(fisher, damping, eigen_floor_ratio):
+    """Regularize a normalized Fisher matrix and report weak-mode diagnostics."""
+    if fisher.ndim != 2 or fisher.shape[0] != fisher.shape[1]:
+        raise ValueError("Fisher matrix must be square")
+    if damping < 0 or eigen_floor_ratio < 0:
+        raise ValueError("LM damping and Fisher eigen floor must be non-negative")
+    symmetric = 0.5 * (fisher + fisher.transpose(-1, -2))
+    eigenvalues = torch.linalg.eigvalsh(symmetric)
+    minimum = float(eigenvalues[0].detach().cpu())
+    maximum = float(eigenvalues[-1].detach().cpu())
+    floor = max(maximum, 0.0) * float(eigen_floor_ratio)
+    regularization = max(0.0, floor - minimum) + float(damping) * max(maximum, 1.0)
+    regularized = symmetric + torch.eye(
+        len(symmetric), device=symmetric.device, dtype=symmetric.dtype
+    ) * regularization
+    condition = float("inf") if minimum <= 0 else maximum / minimum
+    return regularized, {
+        "min_eigenvalue": minimum,
+        "max_eigenvalue": maximum,
+        "condition_number": condition,
+        "eigen_floor": floor,
+        "regularization": regularization,
+    }
+
+
+def _sensor_residual_data(
+    track_parameters,
+    alignment_row,
+    sensor_index,
+    batches,
+    geometry,
+):
+    device, dtype = track_parameters.device, track_parameters.dtype
+    hit_selection = (
+        batches.hit_mask.to(device)
+        & batches.is_target.to(device)
+        & (batches.sensor_idx.to(device) == int(sensor_index))
+    )
+    track_indices, hit_indices = torch.nonzero(hit_selection, as_tuple=True)
+    if len(track_indices) == 0:
+        return None
+    tracks = track_parameters[track_indices]
+    center0 = geometry.centers.to(device=device, dtype=dtype)[sensor_index]
+    rotation0 = geometry.rotations.to(device=device, dtype=dtype)[sensor_index]
+    center, rotation = apply_alignment_torch(center0, rotation0, alignment_row)
+    centers = center.expand(len(tracks), -1)
+    rotations = rotation.expand(len(tracks), -1, -1)
+    _path, intersections, intersection_valid = intersect_plane(
+        tracks, centers, rotations[..., :, 2], n_newton=12
+    )
+    local = torch.matmul(
+        rotations.transpose(-1, -2), (intersections - centers).unsqueeze(-1)
+    ).squeeze(-1)[..., :2]
+    measured = batches.measured_local.to(device=device, dtype=dtype)[track_indices, hit_indices]
+    covariance = batches.covariances.to(device=device, dtype=dtype)[track_indices, hit_indices]
+    loc1 = batches.loc1_mask.to(device)[track_indices, hit_indices]
+    residuals = measured - local
+    component_mask = torch.stack((intersection_valid, intersection_valid & loc1), dim=-1)
+    return residuals, covariance, component_mask, intersection_valid
+
+
+def _target_alignment_evaluation(track_parameters, alignment, batches, geometry):
+    residuals, covariance, component_mask, intersection_valid = _joint_forward(
+        track_parameters, alignment, batches, geometry
+    )
+    target_components = component_mask & batches.is_target.to(component_mask.device).unsqueeze(-1)
+    if not target_components.any():
+        raise ValueError("No valid target measurement components remain for block LM")
+    weighted = residuals.square() / covariance.clamp_min(EPS_COVARIANCE)
+    loss = torch.sum(torch.where(target_components, weighted, torch.zeros_like(weighted)))
+    loss = loss / target_components.sum()
+    valid_hits = batches.hit_mask.to(intersection_valid.device)
+    invalid_fraction = 1.0 - float(intersection_valid[valid_hits].float().mean().detach().cpu())
+    return loss, invalid_fraction, residuals, component_mask
+
+
+def run_block_lm_alignment(
+    batches,
+    geometry,
+    config,
+    active_dof=DEFAULT_ACTIVE_DOF,
+    initial_track_params=None,
+):
+    """Fit target geometry with fixed non-target-refitted helices using block LM."""
+    use_cuda = bool(config.gpu and torch.cuda.is_available())
+    device = torch.device("cuda" if use_cuda else "cpu")
+    dtype = torch.float32 if use_cuda else torch.float64
+    if initial_track_params is None:
+        initial_track_params = seed_helices(batches, device=device, dtype=dtype)
+    tracks = initial_track_params.to(device=device, dtype=dtype).detach()
+    active = tuple(int(index) for index in active_dof)
+    if not active:
+        raise ValueError("Block LM requires at least one active alignment DOF")
+    if any(index < 0 or index >= 6 for index in active):
+        raise ValueError("Block LM active DOF indices must be in [0, 5]")
+    if config.lm_max_iters < 1:
+        raise ValueError("lm_max_iters must be at least 1")
+    n_surfaces = len(geometry.centers)
+    alignment = torch.zeros((n_surfaces, 6), device=device, dtype=dtype)
+    active_index = torch.tensor(active, device=device, dtype=torch.long)
+    physical_scales = torch.tensor(
+        [1.0, 1.0, 1.0, 0.01, 0.01, 0.01], device=device, dtype=dtype
+    )[active_index]
+    initial_loss, initial_invalid, initial_residuals, initial_mask = (
+        _target_alignment_evaluation(tracks, alignment, batches, geometry)
+    )
+    if initial_invalid > config.joint_max_invalid_fraction:
+        raise ValueError(
+            "Initial block-LM helices exceed the invalid-intersection limit: "
+            f"{initial_invalid:.2%} > {config.joint_max_invalid_fraction:.2%}."
+        )
+    best_loss = float(initial_loss.detach().cpu())
+    best_iteration = -1
+    history = []
+    checkpoint_history = [(-1, best_loss)]
+    invalid_history = [initial_invalid]
+    fisher_diagnostics = []
+    damping = float(config.lm_initial_damping)
+    stopped_early = False
+    target_sensors = torch.nonzero(geometry.target_mask, as_tuple=False).flatten().tolist()
+    for iteration in range(config.lm_max_iters):
+        accepted_any = False
+        largest_step = 0.0
+        for sensor_index in target_sensors:
+            current = alignment[sensor_index].detach()
+            current_data = _sensor_residual_data(
+                tracks, current, sensor_index, batches, geometry
+            )
+            if current_data is None:
+                continue
+            residuals, covariance, component_mask, _valid = current_data
+            fixed_mask = component_mask.detach()
+            if not fixed_mask.any():
+                continue
+
+            def standardized(active_values):
+                row = current.scatter(0, active_index, active_values)
+                values, variances, _mask, _intersection_valid = _sensor_residual_data(
+                    tracks, row, sensor_index, batches, geometry
+                )
+                return (values / variances.clamp_min(EPS_COVARIANCE).sqrt())[fixed_mask]
+
+            active_values = current[active_index].detach().requires_grad_(True)
+            standardized_residual = standardized(active_values)
+            jacobian = torch.autograd.functional.jacobian(
+                standardized, active_values, vectorize=True
+            ).detach()
+            residual_vector = standardized_residual.detach()
+            normalized_jacobian = jacobian * physical_scales
+            fisher = normalized_jacobian.transpose(0, 1) @ normalized_jacobian
+            gradient = normalized_jacobian.transpose(0, 1) @ residual_vector
+            regularized, diagnostics = regularize_fisher_matrix(
+                fisher,
+                damping=damping,
+                eigen_floor_ratio=config.fisher_eigen_floor,
+            )
+            try:
+                normalized_step = -torch.linalg.solve(regularized, gradient)
+            except RuntimeError:
+                normalized_step = -torch.linalg.lstsq(regularized, gradient[:, None]).solution[:, 0]
+            physical_step = normalized_step * physical_scales
+            per_dof_limit = torch.tensor(
+                [config.lm_max_step_t if index < 3 else config.lm_max_step_r for index in active],
+                device=device,
+                dtype=dtype,
+            )
+            physical_step = torch.maximum(
+                torch.minimum(physical_step, per_dof_limit), -per_dof_limit
+            )
+            candidate = current.clone()
+            candidate[active_index] += physical_step
+            candidate[:3].clamp_(-config.joint_clamp_t, config.joint_clamp_t)
+            candidate[3:].clamp_(-config.joint_clamp_r, config.joint_clamp_r)
+            candidate_data = _sensor_residual_data(
+                tracks, candidate, sensor_index, batches, geometry
+            )
+            candidate_residuals, candidate_covariance, candidate_mask, candidate_valid = candidate_data
+            current_weighted = residuals.square() / covariance.clamp_min(EPS_COVARIANCE)
+            candidate_weighted = candidate_residuals.square() / candidate_covariance.clamp_min(EPS_COVARIANCE)
+            current_sensor_loss = current_weighted[component_mask].mean()
+            candidate_sensor_loss = candidate_weighted[candidate_mask].mean()
+            sensor_invalid = 1.0 - float(candidate_valid.float().mean().detach().cpu())
+            accepted = bool(
+                torch.isfinite(candidate_sensor_loss)
+                and sensor_invalid <= config.joint_max_invalid_fraction
+                and candidate_sensor_loss < current_sensor_loss
+            )
+            if accepted:
+                alignment[sensor_index] = candidate
+                accepted_any = True
+                largest_step = max(largest_step, float(physical_step.abs().max().detach().cpu()))
+            diagnostics.update({
+                "iteration": iteration,
+                "sensor_index": int(sensor_index),
+                "accepted": accepted,
+                "step_rms": float(torch.sqrt(torch.mean(physical_step.square())).detach().cpu()),
+                "step_max": float(physical_step.abs().max().detach().cpu()),
+                "gradient_norm": float(gradient.norm().detach().cpu()),
+                "loss_before": float(current_sensor_loss.detach().cpu()),
+                "loss_after": float(candidate_sensor_loss.detach().cpu()),
+            })
+            fisher_diagnostics.append(diagnostics)
+        evaluated_loss, invalid_fraction, _residuals, _mask = _target_alignment_evaluation(
+            tracks, alignment, batches, geometry
+        )
+        evaluated_value = float(evaluated_loss.detach().cpu())
+        history.append(evaluated_value)
+        checkpoint_history.append((iteration, evaluated_value))
+        invalid_history.append(invalid_fraction)
+        if evaluated_value < best_loss:
+            best_loss = evaluated_value
+            best_iteration = iteration
+        damping = max(damping * 0.5, 1e-12) if accepted_any else damping * 10.0
+        if not accepted_any or largest_step < 1e-10:
+            stopped_early = True
+            break
+    final_loss, final_invalid, final_residuals, final_mask = _target_alignment_evaluation(
+        tracks, alignment, batches, geometry
+    )
+    if final_invalid > config.joint_max_invalid_fraction:
+        raise ValueError(
+            "Block-LM result exceeds the invalid-intersection limit: "
+            f"{final_invalid:.2%} > {config.joint_max_invalid_fraction:.2%}."
+        )
+    return {
+        "solver": "block-lm",
+        "predicted_deltas": alignment.detach().cpu().double().numpy(),
+        "track_params": tracks.detach().cpu().double().numpy(),
+        "final_residuals": final_residuals.detach().cpu(),
+        "final_component_mask": final_mask.detach().cpu(),
+        "initial_residuals": initial_residuals.detach().cpu(),
+        "initial_component_mask": initial_mask.detach().cpu(),
+        "history": history,
+        "checkpoint_history": checkpoint_history,
+        "best_total_loss": best_loss,
+        "last_total_loss": float(final_loss.detach().cpu()),
+        "best_iteration": best_iteration,
+        "stopped_early": stopped_early,
+        "initial_total_loss": float(initial_loss.detach().cpu()),
+        "initial_invalid_fraction": initial_invalid,
+        "invalid_fraction": final_invalid,
+        "invalid_history": invalid_history,
+        "fisher_diagnostics": fisher_diagnostics,
+    }
 
 
 def run_joint_alignment(
@@ -713,6 +1183,14 @@ def run_joint_alignment(
         final_residuals, _covariance, final_component_mask, _valid = _joint_forward(
             track_parameters, predicted, batches, geometry
         )
+        final_invalid_fraction = 1.0 - float(
+            _valid[batches.hit_mask.to(device)].float().mean().cpu()
+        )
+    if final_invalid_fraction > config.joint_max_invalid_fraction:
+        raise ValueError(
+            "Best joint checkpoint exceeds the invalid-intersection limit: "
+            f"{final_invalid_fraction:.2%} > {config.joint_max_invalid_fraction:.2%}."
+        )
     return {
         "predicted_deltas": predicted.detach().cpu().double().numpy(),
         "track_params": track_parameters.detach().cpu().double().numpy(),
@@ -728,7 +1206,7 @@ def run_joint_alignment(
         "stopped_early": stopped_early,
         "initial_total_loss": initial_total_loss,
         "initial_invalid_fraction": initial_invalid_fraction,
-        "invalid_fraction": invalid_history[-1] if invalid_history else 0.0,
+        "invalid_fraction": final_invalid_fraction,
     }
 
 class AlignmentEngine(nn.Module):
@@ -910,6 +1388,57 @@ def parse_target_layers(target_layers):
     return tuple(parsed)
 
 
+def _read_root_columns(path, tree_name, columns, entry_stop=None):
+    """Read ROOT columns with PyROOT first; uproot remains a fixture fallback."""
+    try:
+        import ROOT
+    except ImportError:
+        ROOT = None
+    if ROOT is not None:
+        frame = ROOT.RDataFrame(tree_name, str(path))
+        requested = list(columns)
+        available = {str(name) for name in frame.GetColumnNames()}
+        missing = sorted(set(requested) - available)
+        if missing:
+            raise ValueError(
+                f"ROOT tree {tree_name!r} is missing columns: {', '.join(missing)}; "
+                f"requested columns: {', '.join(requested)}"
+            )
+        if entry_stop is not None:
+            frame = frame.Range(int(entry_stop))
+        try:
+            return frame.AsNumpy(requested), "pyroot"
+        except Exception as error:
+            raise ValueError(
+                f"PyROOT could not read {tree_name} columns from {path}: {error}"
+            ) from error
+    with uproot.open(path) as root_file:
+        if tree_name not in root_file:
+            raise ValueError(f"ROOT tree {tree_name!r} is missing from {path}")
+        tree = root_file[tree_name]
+        missing = sorted(set(columns) - set(tree.keys()))
+        if missing:
+            raise ValueError(
+                f"ROOT tree {tree_name!r} is missing columns: {', '.join(missing)}"
+            )
+        return tree.arrays(
+            list(columns), entry_stop=entry_stop, library="ak", how=dict
+        ), "uproot"
+
+
+def _root_column_entries(values):
+    if isinstance(values, ak.Array):
+        return ak.to_list(values)
+    return list(values)
+
+
+def _flatten_root_entries(values):
+    entries = _root_column_entries(values)
+    if not entries:
+        return np.asarray([], dtype=float)
+    return np.concatenate([np.asarray(entry) for entry in entries])
+
+
 def load_variable_information(
     tracksummary_filepath,
     trackstates_filepath,
@@ -920,14 +1449,38 @@ def load_variable_information(
     # 1. Read tracksummary
     sum_df = None
     if load_summary:
-        summary_file = uproot.open(tracksummary_filepath)
-        summary_tree = summary_file["tracksummary"]
         sum_keys = ["event_nr", "track_nr", "chi2Sum", "NDF"]
-        sum_arrays = summary_tree.arrays(sum_keys, entry_stop=max_track_entries)
-        sum_df = ak.to_dataframe(sum_arrays).reset_index(drop=True)
+        sum_arrays, summary_backend = _read_root_columns(
+            tracksummary_filepath,
+            "tracksummary",
+            sum_keys,
+            entry_stop=max_track_entries,
+        )
+        track_entries = _root_column_entries(sum_arrays["track_nr"])
+        summary_is_jagged = bool(
+            track_entries and np.asarray(track_entries[0]).ndim > 0
+        )
+        if summary_is_jagged:
+            summary_counts = np.asarray(
+                [len(np.asarray(entry)) for entry in track_entries], dtype=np.int64
+            )
+            event_values = np.asarray(sum_arrays["event_nr"])
+            summary_data = {
+                "event_nr": np.repeat(event_values, summary_counts),
+                "track_nr": _flatten_root_entries(sum_arrays["track_nr"]),
+                "chi2Sum": _flatten_root_entries(sum_arrays["chi2Sum"]),
+                "NDF": _flatten_root_entries(sum_arrays["NDF"]),
+            }
+        else:
+            summary_data = {
+                name: np.asarray(sum_arrays[name]) for name in sum_keys
+            }
+        sum_df = pd.DataFrame(summary_data).reset_index(drop=True)
+        sum_df["event_nr"] = sum_df["event_nr"].astype(np.int64)
+        sum_df["track_nr"] = sum_df["track_nr"].astype(np.int64)
         sum_df = sum_df.rename(columns={"chi2Sum":"chi2", "NDF": "ndf"})
         sum_df["chi2_ndf"] = sum_df["chi2"] / sum_df["ndf"]
-        print(f"Tracks loaded: {len(sum_df)} trajectories")
+        print(f"Tracks loaded: {len(sum_df)} trajectories ({summary_backend})")
 
     # 2. Load per-state columns only.
     # Background: the ROOT trackstates tree has two array-length classes per event:
@@ -937,9 +1490,6 @@ def load_variable_information(
     # Loading all classes together with ak.to_dataframe() truncates to N_meas rows and
     # fails to broadcast event_nr. Load per-state columns here, then expand true
     # measurement errors onto the measured states.
-    states_file = uproot.open(trackstates_filepath)
-    states_tree = states_file["trackstates"]
-
     per_state_keys = [
         "volume_id", "layer_id", "module_id",
         "l_x_hit", "l_y_hit",             # NaN for hole/material states
@@ -948,8 +1498,18 @@ def load_variable_information(
         "px_smt", "py_smt", "pz_smt",
         "ePHI_smt", "eTHETA_smt", "eQOP_smt",
     ]
-    states_array = states_tree.arrays(per_state_keys, entry_stop=max_track_entries)
-    states_df = ak.to_dataframe(states_array).reset_index(drop=True)
+    state_keys = per_state_keys + [
+        "err_x_hit", "err_y_hit", "event_nr", "track_nr"
+    ]
+    state_columns, states_backend = _read_root_columns(
+        trackstates_filepath,
+        "trackstates",
+        state_keys,
+        entry_stop=max_track_entries,
+    )
+    states_df = pd.DataFrame(
+        {name: _flatten_root_entries(state_columns[name]) for name in per_state_keys}
+    )
 
     # Load true measurement errors separately: err_x_hit / err_y_hit are per-measurement
     # (N_meas ≤ N_states per track).  Expand them to per-state length by inserting NaN
@@ -959,20 +1519,20 @@ def load_variable_information(
     # A length mismatch used to leave the whole entry as NaN, after which the
     # affected hits were dropped silently by the dropna() further down.
     try:
-        lx_jagged = states_tree["l_x_hit"].array(library="ak", entry_stop=max_track_entries)
-        errx_jagged = states_tree["err_x_hit"].array(library="ak", entry_stop=max_track_entries)
-        erry_jagged = states_tree["err_y_hit"].array(library="ak", entry_stop=max_track_entries)
+        lx_jagged = _root_column_entries(state_columns["l_x_hit"])
+        errx_jagged = _root_column_entries(state_columns["err_x_hit"])
+        erry_jagged = _root_column_entries(state_columns["err_y_hit"])
         errx_flat = []
         erry_flat = []
         for i in range(len(lx_jagged)):
-            lx_tr  = ak.to_numpy(lx_jagged[i])
+            lx_tr = np.asarray(lx_jagged[i])
             is_meas = ~np.isnan(lx_tr)
             n_st = len(lx_tr)
             n_meas = int(is_meas.sum())
             ex = np.full(n_st, np.nan)
             ey = np.full(n_st, np.nan)
-            em_x = ak.to_numpy(errx_jagged[i])
-            em_y = ak.to_numpy(erry_jagged[i])
+            em_x = np.asarray(errx_jagged[i])
+            em_y = np.asarray(erry_jagged[i])
             for name, values in (("err_x_hit", em_x), ("err_y_hit", em_y)):
                 if len(values) != n_meas:
                     raise ValueError(
@@ -985,8 +1545,11 @@ def load_variable_information(
             erry_flat.extend(ey.tolist())
         states_df["err_x_hit"] = errx_flat
         states_df["err_y_hit"] = erry_flat
-        print("  Loaded true measurement errors (err_x_hit / err_y_hit) via per-state expansion.")
-    except (uproot.KeyInFileError, KeyError, ValueError) as exc:
+        print(
+            "  Loaded true measurement errors (err_x_hit / err_y_hit) "
+            f"via per-state expansion ({states_backend})."
+        )
+    except (KeyError, ValueError) as exc:
         # Interpolate the cause so the entry/length detail stays visible at the
         # top level; `raise ... from exc` alone would hide it behind __cause__.
         raise ValueError(
@@ -994,16 +1557,14 @@ def load_variable_information(
         ) from exc
 
     # 3. Broadcast per-event event_nr / track_nr to per-state level.
-    vol_jagged = states_tree["volume_id"].array(library="ak", entry_stop=max_track_entries)
-    counts = ak.to_numpy(ak.num(vol_jagged, axis=1))
-    ev_flat = ak.to_numpy(
-        states_tree["event_nr"].array(library="ak", entry_stop=max_track_entries)
-    )
-    tr_flat = ak.to_numpy(
-        states_tree["track_nr"].array(library="ak", entry_stop=max_track_entries)
-    )
+    volume_entries = _root_column_entries(state_columns["volume_id"])
+    counts = np.asarray([len(entry) for entry in volume_entries], dtype=np.int64)
+    ev_flat = np.asarray(state_columns["event_nr"])
+    tr_flat = np.asarray(state_columns["track_nr"])
     states_df["event_nr"] = np.repeat(ev_flat, counts)
     states_df["track_nr"] = np.repeat(tr_flat, counts)
+    states_df["event_nr"] = states_df["event_nr"].astype(np.int64)
+    states_df["track_nr"] = states_df["track_nr"].astype(np.int64)
 
     # 4. Inner merge: map track-level chi2/ndf onto each hit state.
     if sum_df is None:
@@ -1241,11 +1802,15 @@ def compute_autograd_residuals(
     return measured_local - predicted_local
 
 
-def update_geometry_to_json(transforms_list, predicted_deltas, output_filepath):
+def update_geometry_to_json(
+    transforms_list, predicted_deltas, output_filepath, alignment_gain=1.0
+):
+    if not np.isfinite(alignment_gain) or alignment_gain < 0:
+        raise ValueError("alignment_gain must be a finite non-negative value.")
     for i, item in enumerate(transforms_list):
         #The delta transform
-        delta_t_local = predicted_deltas[i, :3]
-        delta_euler = predicted_deltas[i, 3:]
+        delta_t_local = predicted_deltas[i, :3] * alignment_gain
+        delta_euler = predicted_deltas[i, 3:] * alignment_gain
 
         # The original transform
         old_t = np.array(item["Translation"])
@@ -1271,6 +1836,8 @@ def update_geometry_to_json(transforms_list, predicted_deltas, output_filepath):
                     item["FullMatrix"] = fm.flatten('F').tolist()
                 else:
                     item["FullMatrix"] = fm.flatten("C").tolist()
+            elif np.asarray(old_fm).shape == (4, 4):
+                item["FullMatrix"] = fm.tolist()
         else:
             item["FullMatrix"] = fm.tolist()
 
@@ -1536,6 +2103,10 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
         max_track_entries=(config.max_tracks * 4 if config.max_tracks > 0 else None),
         load_summary=False,
     )
+    if config.event_partition is not None:
+        inputs = filter_alignment_inputs_by_event_partition(
+            inputs, config.event_partition, config.event_split_seed
+        )
     print_target_residual_stats(
         inputs.initial_residuals, inputs.hit_volume_ids, inputs.hit_layer_ids, target_layers,
         loc1_valid=inputs.loc1_valid,
@@ -1543,15 +2114,75 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
     batches = build_track_batches(
         inputs,
         target_layers,
-        min_hits=config.min_hits,
+        min_hits=config.joint_seed_min_hits,
+        min_span=config.joint_seed_min_span,
         max_tracks=config.max_tracks,
     )
     print(
         f"Joint track selection: {len(batches.event_track_ids)} tracks, "
         f"{int(batches.hit_mask.sum())} hits, padded width {batches.hit_mask.shape[1]}."
     )
-    result = run_joint_alignment(
-        batches, geometry, config, active_dof=active_dof
+    seeded_parameters = seed_helices(
+        batches,
+        n_iter=config.joint_smt_seed_iters,
+        device="cuda" if config.gpu and torch.cuda.is_available() else "cpu",
+        dtype=torch.float32 if config.gpu and torch.cuda.is_available() else torch.float64,
+    )
+    smt_stats = smt_seed_statistics(batches, seeded_parameters)
+    if smt_stats["invalid_fraction"] > config.joint_max_invalid_fraction:
+        raise ValueError(
+            "SMT helix seed intersection failure rate exceeds limit: "
+            f"{smt_stats['invalid_fraction']:.2%} > "
+            f"{config.joint_max_invalid_fraction:.2%}."
+        )
+    refitted_parameters, measurement_stats = fit_helices_to_measurements(
+        batches,
+        geometry,
+        seeded_parameters,
+        n_iter=config.joint_measurement_refit_iters,
+        device=seeded_parameters.device,
+        dtype=seeded_parameters.dtype,
+        max_invalid_fraction=config.joint_max_invalid_fraction,
+        lr_position=config.measurement_refit_lr_position,
+        lr_direction=config.measurement_refit_lr_direction,
+        lr_rho_scaled=config.measurement_refit_lr_rho_scaled,
+    )
+    print(
+        "Joint initialization: "
+        f"tracks={batches.selection_stats.get('input_tracks', len(batches.event_track_ids))} "
+        f"retained={batches.selection_stats.get('retained_tracks', len(batches.event_track_ids))} "
+        f"excluded={batches.selection_stats.get('excluded_tracks', 0)} "
+        f"SMT loss={smt_stats['loss']:.6g} "
+        f"measurement chi2/component={measurement_stats['chi2_per_component']:.6g}."
+    )
+    with torch.no_grad():
+        seed_alignment = torch.zeros(
+            (len(geometry.centers), 6),
+            device=seeded_parameters.device,
+            dtype=seeded_parameters.dtype,
+        )
+        seed_residuals, seed_covariance, seed_component_mask, _seed_valid = (
+            _joint_forward(seeded_parameters, seed_alignment, batches, geometry)
+        )
+    seed_layer_chi2 = summarize_joint_layer_chi2(
+        seed_residuals,
+        seed_covariance,
+        seed_component_mask,
+        batches.volume_id,
+        batches.layer_id,
+        target_layers,
+    )
+    solver = (
+        run_block_lm_alignment
+        if config.joint_solver == "block-lm"
+        else run_joint_alignment
+    )
+    result = solver(
+        batches,
+        geometry,
+        config,
+        active_dof=active_dof,
+        initial_track_params=refitted_parameters,
     )
     predicted_deltas = result["predicted_deltas"]
     truth_metrics = validate_against_truth(
@@ -1594,6 +2225,25 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
         batches.volume_id.numpy()[valid], batches.layer_id.numpy()[valid],
         target_layers, return_metrics=True, component_mask=component_mask,
     )
+    stage_layer_chi2 = {
+        "smt_seed": seed_layer_chi2,
+        "measurement_refit": summarize_joint_layer_chi2(
+            result["initial_residuals"],
+            batches.covariances,
+            result["initial_component_mask"],
+            batches.volume_id,
+            batches.layer_id,
+            target_layers,
+        ),
+        "joint": summarize_joint_layer_chi2(
+            result["final_residuals"],
+            batches.covariances,
+            result["final_component_mask"],
+            batches.volume_id,
+            batches.layer_id,
+            target_layers,
+        ),
+    }
 
     result.update({
         "output_geom": config.output_geom,
@@ -1601,6 +2251,14 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
         "n_tracks": len(batches.event_track_ids),
         "n_hits": int(batches.hit_mask.sum()),
         "target_metrics": target_metrics,
+        "initialization_stats": {
+            **batches.selection_stats,
+            "fit_hits": int(batches.fit_mask.sum()),
+            "min_fit_span": float(batches.fit_span.min()),
+            "smt": smt_stats,
+            "measurement_refit": measurement_stats,
+        },
+        "stage_layer_chi2": stage_layer_chi2,
     })
     return result
 
@@ -1608,6 +2266,69 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
 def resolve_active_dof(config):
     """Both track modes share one default; parse_active_dof handles None and ''."""
     return parse_active_dof(config.active_dof)
+
+
+def _json_ready(value):
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return _json_ready(value.tolist())
+    if isinstance(value, torch.Tensor):
+        return _json_ready(value.detach().cpu().tolist())
+    if isinstance(value, np.generic):
+        return _json_ready(value.item())
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def write_alignment_summary(result, output_path):
+    """Write compact solver observability without duplicating hit-sized arrays."""
+    retained_keys = (
+        "output_geom",
+        "n_tracks",
+        "n_hits",
+        "initialization_stats",
+        "stage_layer_chi2",
+        "target_metrics",
+        "truth_metrics",
+        "best_total_loss",
+        "last_total_loss",
+        "best_iteration",
+        "stopped_early",
+        "initial_total_loss",
+        "initial_invalid_fraction",
+        "invalid_fraction",
+        "solver",
+    )
+    summary = {key: _json_ready(result[key]) for key in retained_keys if key in result}
+    if "predicted_deltas" in result:
+        corrections = np.asarray(result["predicted_deltas"], dtype=float)
+        summary["correction_max_abs"] = (
+            float(np.max(np.abs(corrections))) if corrections.size else 0.0
+        )
+    fisher = result.get("fisher_diagnostics")
+    if fisher is not None:
+        finite_conditions = [
+            float(item["condition_number"])
+            for item in fisher
+            if math.isfinite(float(item.get("condition_number", float("inf"))))
+        ]
+        regularizations = [float(item.get("regularization", 0.0)) for item in fisher]
+        summary["fisher_summary"] = {
+            "evaluations": len(fisher),
+            "accepted_steps": sum(bool(item.get("accepted")) for item in fisher),
+            "finite_condition_max": max(finite_conditions) if finite_conditions else None,
+            "regularization_max": max(regularizations) if regularizations else None,
+        }
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(summary, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+    )
+    return destination
 
 
 def run_alignment_pipeline(config=None):
@@ -1663,6 +2384,10 @@ def run_alignment_pipeline(config=None):
         STATES_ROOT_FILE,
         id_to_idx_map,
     )
+    if config.event_partition is not None:
+        inputs = filter_alignment_inputs_by_event_partition(
+            inputs, config.event_partition, config.event_split_seed
+        )
     if inputs.measured_local is None or inputs.loc1_valid is None:
         raise ValueError("Surface mode requires measured_local and loc1_valid.")
 
@@ -1857,7 +2582,12 @@ def run_alignment_pipeline(config=None):
     )
 
     Path(ALIGNED_JSON_FILE).parent.mkdir(parents=True, exist_ok=True)
-    update_geometry_to_json(transforms_list, predicted_deltas, ALIGNED_JSON_FILE)
+    update_geometry_to_json(
+        transforms_list,
+        predicted_deltas,
+        ALIGNED_JSON_FILE,
+        alignment_gain=config.alignment_gain,
+    )
 
     print(f"Export successful! The aligned, complete geometry file has been saved to: {ALIGNED_JSON_FILE}")
 
@@ -1918,16 +2648,58 @@ def build_argument_parser():
     p.add_argument("--track-mode", choices=("surface", "free"), default="surface",
                    help="Track treatment: fixed smoothed surface solve or free joint helices.")
     p.add_argument("--joint-iters", type=int, default=JOINT_ITERS)
+    p.add_argument(
+        "--joint-solver",
+        choices=("block-lm", "adam"),
+        default=JOINT_SOLVER,
+        help="Free-mode geometry solver; block-lm keeps non-target-refitted tracks fixed.",
+    )
+    p.add_argument("--lm-max-iters", type=int, default=LM_MAX_ITERS)
+    p.add_argument("--lm-initial-damping", type=float, default=LM_INITIAL_DAMPING)
+    p.add_argument("--fisher-eigen-floor", type=float, default=FISHER_EIGEN_FLOOR)
+    p.add_argument("--lm-max-step-t", type=float, default=LM_MAX_STEP_T)
+    p.add_argument("--lm-max-step-r", type=float, default=LM_MAX_STEP_R)
     p.add_argument("--joint-checkpoint-interval", type=int, default=JOINT_CHECKPOINT_INTERVAL,
                    help="Full-dataset objective evaluation interval for best checkpointing.")
     p.add_argument("--joint-patience", type=int, default=JOINT_PATIENCE,
                    help="Stop after this many iterations without full-objective improvement; 0 disables.")
     p.add_argument("--joint-min-delta", type=float, default=0.0,
                    help="Minimum full-objective improvement required to reset patience.")
+    p.add_argument(
+        "--joint-seed-mode",
+        choices=("non-target-measurement",),
+        default=JOINT_SEED_MODE,
+        help="Free-helix initialization architecture (fixed to non-target measurement).",
+    )
+    p.add_argument("--joint-seed-min-hits", type=int, default=JOINT_SEED_MIN_HITS)
+    p.add_argument("--joint-seed-min-span", type=float, default=JOINT_SEED_MIN_SPAN)
+    p.add_argument("--joint-smt-seed-iters", type=int, default=JOINT_SMT_SEED_ITERS)
+    p.add_argument(
+        "--joint-measurement-refit-iters",
+        type=int,
+        default=JOINT_MEASUREMENT_REFIT_ITERS,
+    )
+    p.add_argument(
+        "--measurement-refit-lr-position",
+        type=float,
+        default=MEASUREMENT_REFIT_LR_POSITION,
+    )
+    p.add_argument(
+        "--measurement-refit-lr-direction",
+        type=float,
+        default=MEASUREMENT_REFIT_LR_DIRECTION,
+    )
+    p.add_argument(
+        "--measurement-refit-lr-rho-scaled",
+        type=float,
+        default=MEASUREMENT_REFIT_LR_RHO_SCALED,
+    )
     p.add_argument("--min-hits", type=int, default=8)
     p.add_argument("--max-tracks", type=int, default=0, help="0 keeps all selected tracks.")
     p.add_argument("--track-batch-size", type=int, default=0, help="0 uses full-batch.")
     p.add_argument("--rng-seed", type=int, default=42)
+    p.add_argument("--event-partition", choices=PARTITIONS, default=None)
+    p.add_argument("--event-split-seed", type=int, default=DEFAULT_SPLIT_SEED)
     p.add_argument("--gpu", action="store_true", help="Use CUDA float32; CPU uses float64.")
     p.add_argument("--rot-lr-scale", type=float, default=15.0)
     p.add_argument("--joint-lr-trans", type=float, default=JOINT_LR_TRANS)
@@ -1938,6 +2710,18 @@ def build_argument_parser():
                    help="Full nominal geometry used to anchor non-target hits in free mode.")
     p.add_argument("--freeze-tracks", action="store_true",
                    help="Freeze seeded helices and optimize geometry only in free mode.")
+    p.add_argument(
+        "--alignment-gain",
+        type=float,
+        default=1.0,
+        help="Scale geometry corrections when writing output (surface polish uses 0.2).",
+    )
+    p.add_argument(
+        "--output-summary",
+        type=absolute_project_path,
+        default=None,
+        help="Optional compact JSON containing solver stages and metrics.",
+    )
     p.add_argument("--no-plot", action="store_true", help="Skip the loss-curve PNG.")
     return p
 
@@ -1957,6 +2741,12 @@ def alignment_config_from_args(a):
         lambda_l2=a.lambda_l2,
         track_mode=a.track_mode,
         joint_iters=a.joint_iters,
+        joint_solver=a.joint_solver,
+        lm_max_iters=a.lm_max_iters,
+        lm_initial_damping=a.lm_initial_damping,
+        fisher_eigen_floor=a.fisher_eigen_floor,
+        lm_max_step_t=a.lm_max_step_t,
+        lm_max_step_r=a.lm_max_step_r,
         joint_checkpoint_interval=a.joint_checkpoint_interval,
         joint_patience=a.joint_patience,
         joint_min_delta=a.joint_min_delta,
@@ -1964,6 +2754,8 @@ def alignment_config_from_args(a):
         max_tracks=a.max_tracks,
         track_batch_size=a.track_batch_size,
         rng_seed=a.rng_seed,
+        event_partition=a.event_partition,
+        event_split_seed=a.event_split_seed,
         gpu=a.gpu,
         rot_lr_scale=a.rot_lr_scale,
         joint_lr_trans=a.joint_lr_trans,
@@ -1972,9 +2764,20 @@ def alignment_config_from_args(a):
         joint_clamp_r=a.joint_clamp_r,
         nominal_full_geom=a.nominal_full_geom,
         freeze_tracks=a.freeze_tracks,
+        joint_seed_mode=a.joint_seed_mode,
+        joint_seed_min_hits=a.joint_seed_min_hits,
+        joint_seed_min_span=a.joint_seed_min_span,
+        joint_smt_seed_iters=a.joint_smt_seed_iters,
+        joint_measurement_refit_iters=a.joint_measurement_refit_iters,
+        measurement_refit_lr_position=a.measurement_refit_lr_position,
+        measurement_refit_lr_direction=a.measurement_refit_lr_direction,
+        measurement_refit_lr_rho_scaled=a.measurement_refit_lr_rho_scaled,
+        alignment_gain=a.alignment_gain,
     )
 
 
 if __name__ == "__main__":
     args = build_argument_parser().parse_args()
-    run_alignment_pipeline(alignment_config_from_args(args))
+    alignment_result = run_alignment_pipeline(alignment_config_from_args(args))
+    if args.output_summary is not None:
+        write_alignment_summary(alignment_result, args.output_summary)

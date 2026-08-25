@@ -23,11 +23,21 @@ simulation -> ROOT/geometry JSON -> loaders -> solver -> aligned geometry
 | `project_config.py` | Typed TOML configuration and validation | None |
 | `ml_alignment.py` | Analytic-Jacobian surface solver | AlignDerivLib only |
 | `ml_alignment_autograd.py` | Autograd surface and joint track/geometry solvers | None |
+| `helix_model.py` | Shared six-parameter helix, Newton intersections, and curvature scaling | None |
 | `ml_alignment_helix.py` | Frozen-helix holdout alignment | None |
 | `validate_helix_model.py` | Holdout validation and acceptance gates | None |
+| `reconstruction_acceptance.py` | Reconstructed measurement/smoothed-state chi2 acceptance | None |
 | `plot_*.py` | Residual, chi2/NDF, and hit diagnostics | ROOT/uproot |
 | `experiment_manifest.py` | Reproducibility metadata and input hashes | None |
 | `path_inventory.py` | Effective absolute input/output path contract | None |
+
+The production surface/helix experiment uses a deterministic event split
+(80% train, 10% calibration, 10% blind validation). It runs two surface warm
+starts, a non-target helix refit, a fixed-track block-LM target-geometry solve,
+and at most two gain-0.2 surface polish candidates. Candidate selection reads
+only the calibration partition; the selected geometry is evaluated once on the
+validation partition. Nominal states are used once to create a versioned frozen
+acceptance profile, while nominal geometry/truth comparisons remain diagnostic.
 
 ## Configuration flow
 

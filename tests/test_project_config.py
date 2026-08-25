@@ -131,6 +131,7 @@ def test_cli_config_activation_supports_split_and_equals_forms(monkeypatch, tmp_
         "ml_alignment_autograd.py",
         "ml_alignment_helix.py",
         "validate_helix_model.py",
+        "reconstruction_acceptance.py",
         "plot_residuals.py",
         "plot_chi2ndf.py",
         "plot_hit_number.py",

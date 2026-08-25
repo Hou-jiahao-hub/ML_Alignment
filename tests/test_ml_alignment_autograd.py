@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
+import pytest
 import torch
 
 
@@ -76,6 +79,120 @@ def test_jacobian_update_interval_config_field_is_not_exposed():
     ml_alignment = load_ml_alignment_autograd_module()
 
     assert not hasattr(ml_alignment.AlignmentRunConfig(), "jacobian_update_interval")
+
+
+def test_update_geometry_to_json_refreshes_nested_full_matrix(tmp_path):
+    ml_alignment = load_ml_alignment_autograd_module()
+    output_path = tmp_path / "aligned.json"
+    transforms = [
+        {
+            "ID": "vol=17|lay=8|sen=1",
+            "Translation": [1.0, 2.0, 3.0],
+            "RotationMatrix": np.eye(3).tolist(),
+            "FullMatrix": [
+                [1.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0, 2.0],
+                [0.0, 0.0, 1.0, 3.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        }
+    ]
+    deltas = np.array([[0.5, -0.25, 0.0, 0.0, 0.0, np.pi / 2]])
+
+    ml_alignment.update_geometry_to_json(transforms, deltas, output_path)
+
+    result = json.loads(output_path.read_text(encoding="utf-8"))[0]
+    expected_full_matrix = np.array(
+        [
+            [0.0, -1.0, 0.0, 1.5],
+            [1.0, 0.0, 0.0, 1.75],
+            [0.0, 0.0, 1.0, 3.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    assert np.allclose(result["FullMatrix"], expected_full_matrix, atol=1e-12)
+    assert np.allclose(result["RotationMatrix"], expected_full_matrix[:3, :3], atol=1e-12)
+    assert np.allclose(result["Translation"], expected_full_matrix[:3, 3], atol=1e-12)
+
+
+def test_update_geometry_alignment_gain_scales_translation_and_rotation(tmp_path):
+    ml_alignment = load_ml_alignment_autograd_module()
+    transforms = [
+        {
+            "ID": "vol=17|lay=8|sen=1",
+            "Translation": [0.0, 0.0, 0.0],
+            "RotationMatrix": np.eye(3).tolist(),
+        }
+    ]
+    deltas = np.array([[1.0, -2.0, 0.0, 0.0, 0.0, 0.5]])
+    output_path = tmp_path / "polish.json"
+
+    ml_alignment.update_geometry_to_json(
+        transforms, deltas, output_path, alignment_gain=0.2
+    )
+
+    assert transforms[0]["Translation"] == pytest.approx([0.2, -0.4, 0.0])
+    expected = ml_alignment.euler_to_rotation_matrix(0.0, 0.0, 0.1)
+    assert np.allclose(transforms[0]["RotationMatrix"], expected)
+
+
+def test_alignment_summary_keeps_stage_metrics_without_large_tensor_payloads(tmp_path):
+    ml_alignment = load_ml_alignment_autograd_module()
+    output = tmp_path / "joint_summary.json"
+    result = {
+        "output_geom": "/tmp/aligned.json",
+        "n_tracks": 10,
+        "n_hits": 100,
+        "initialization_stats": {"retained_tracks": 10, "smt": {"loss": 2.0}},
+        "stage_layer_chi2": {"joint": {"17:8": {"LOC0": {"chi2_per_component": 0.5}}}},
+        "best_total_loss": 0.5,
+        "best_iteration": 12,
+        "invalid_fraction": 0.01,
+        "predicted_deltas": np.asarray([[0.0, -0.25, 0.0, 0.0, 0.0, 0.0]]),
+        "solver": "block-lm",
+        "fisher_diagnostics": [
+            {"condition_number": 10.0, "regularization": 0.2, "accepted": True},
+            {"condition_number": float("inf"), "regularization": 0.5, "accepted": False},
+        ],
+        "final_residuals": torch.zeros((10, 10, 2)),
+    }
+
+    ml_alignment.write_alignment_summary(result, output)
+    summary = json.loads(output.read_text())
+
+    assert summary["initialization_stats"]["retained_tracks"] == 10
+    assert summary["stage_layer_chi2"]["joint"]["17:8"]["LOC0"]["chi2_per_component"] == 0.5
+    assert summary["solver"] == "block-lm"
+    assert summary["correction_max_abs"] == pytest.approx(0.25)
+    assert summary["fisher_summary"] == {
+        "evaluations": 2,
+        "accepted_steps": 1,
+        "finite_condition_max": 10.0,
+        "regularization_max": 0.5,
+    }
+    assert "predicted_deltas" not in summary
+    assert "final_residuals" not in summary
+
+
+def test_alignment_summary_serializes_nonfinite_diagnostics_as_null(tmp_path):
+    ml_alignment = load_ml_alignment_autograd_module()
+    output = tmp_path / "joint_summary.json"
+
+    ml_alignment.write_alignment_summary(
+        {
+            "truth_metrics": {
+                "17:8": {
+                    "tx": {"correlation": float("nan")},
+                    "ty": {"recovery": float("inf")},
+                }
+            }
+        },
+        output,
+    )
+
+    summary = json.loads(output.read_text())
+    assert summary["truth_metrics"]["17:8"]["tx"]["correlation"] is None
+    assert summary["truth_metrics"]["17:8"]["ty"]["recovery"] is None
 
 
 def test_autograd_cli_paths_are_anchored_to_repository(monkeypatch, tmp_path):
@@ -232,7 +349,9 @@ def test_autograd_pipeline_does_not_import_align_derivlib(monkeypatch):
         "validate_against_truth",
         lambda *_args: expected_truth_metrics,
     )
-    monkeypatch.setattr(ml_alignment, "update_geometry_to_json", lambda *_args: None)
+    monkeypatch.setattr(
+        ml_alignment, "update_geometry_to_json", lambda *_args, **_kwargs: None
+    )
 
     result = ml_alignment.run_alignment_pipeline(
         ml_alignment.AlignmentRunConfig(

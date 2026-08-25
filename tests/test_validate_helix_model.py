@@ -75,11 +75,19 @@ def _comparison_frame():
     return pd.DataFrame(
         {
             "split": ["fit", "fit", "holdout", "holdout"],
+            "prediction_mode": [
+                "interpolation",
+                "interpolation",
+                "interpolation",
+                "forward_extrapolation",
+            ],
             "volume_id": [10, 10, 17, 17],
             "layer_id": [2, 2, 8, 8],
             "fitted_intersection_valid": [True, False, True, True],
             "fitted_dLOC0": [1.0, 999.0, -2.0, np.nan],
             "fitted_dLOC1": [2.0, 999.0, 3.0, 4.0],
+            "fitted_measurement_residual_LOC0": [0.5, 999.0, -1.5, np.nan],
+            "fitted_measurement_residual_LOC1": [1.0, 999.0, 2.5, 3.5],
             "fitted_dg_x": [3.0, 999.0, 0.0, 5.0],
             "fitted_dg_y": [4.0, 999.0, 0.0, 12.0],
             "fitted_dg_z": [0.0, 999.0, 2.0, 0.0],
@@ -92,8 +100,8 @@ def test_fitted_residual_components_filter_invalid_values_and_compute_norm():
 
     components = plots.fitted_residual_components(_comparison_frame())
 
-    assert components["local0"].tolist() == [1.0, -2.0]
-    assert components["local1"].tolist() == [2.0, 3.0, 4.0]
+    assert components["local0"].tolist() == [0.5, -1.5]
+    assert components["local1"].tolist() == [1.0, 2.5, 3.5]
     assert components["global_norm"].tolist() == [5.0, 2.0, 13.0]
 
 
@@ -111,6 +119,18 @@ def test_write_residual_plots_creates_fit_holdout_and_layer_pngs(tmp_path):
         "holdout_overall_global_residuals.png",
         "holdout_vol17_lay8_local_residuals.png",
         "holdout_vol17_lay8_global_residuals.png",
+        "holdout_interpolation_local_residuals.png",
+        "holdout_interpolation_global_residuals.png",
+        "holdout_forward_extrapolation_local_residuals.png",
+        "holdout_forward_extrapolation_global_residuals.png",
+        "holdout_backward_extrapolation_local_residuals.png",
+        "holdout_backward_extrapolation_global_residuals.png",
+        "holdout_vol17_lay8_interpolation_local_residuals.png",
+        "holdout_vol17_lay8_interpolation_global_residuals.png",
+        "holdout_vol17_lay8_forward_extrapolation_local_residuals.png",
+        "holdout_vol17_lay8_forward_extrapolation_global_residuals.png",
+        "holdout_vol17_lay8_backward_extrapolation_local_residuals.png",
+        "holdout_vol17_lay8_backward_extrapolation_global_residuals.png",
     }
     assert all(path.is_file() and path.stat().st_size > 0 for path in paths)
 
@@ -124,7 +144,7 @@ def test_write_residual_plots_creates_placeholder_for_no_valid_intersections(tmp
         frame, tmp_path, holdout_layers=((17, 8),)
     )
 
-    assert len(paths) == 6
+    assert len(paths) == 18
     assert all(path.is_file() and path.stat().st_size > 0 for path in paths)
 
 
@@ -322,10 +342,177 @@ def test_track_selection_uses_nearest_hits_before_and_after_holdout():
         context_hits_after=2,
     )
 
-    selected_modules = batches.module_id[0, batches.hit_mask[0]].tolist()
+    interpolation_row = batches.prediction_mode.index("interpolation")
+    selected_modules = batches.module_id[
+        interpolation_row, batches.hit_mask[interpolation_row]
+    ].tolist()
     assert selected_modules == [4, 5, 6, 7, 8]
-    assert batches.fit_mask.sum().item() == 4
-    assert batches.holdout_mask.sum().item() == 1
+    assert batches.fit_mask[interpolation_row].sum().item() == 4
+    assert batches.holdout_mask[interpolation_row].sum().item() == 1
+
+
+def test_track_selection_builds_interpolation_and_both_extrapolation_directions():
+    m = load_module()
+    inputs = _straight_inputs(m)
+    extra = _straight_inputs(m)
+    for name in (
+        "hit_sensor_ids",
+        "measured_local",
+        "measurement_variance",
+        "loc1_valid",
+        "smt_local",
+        "hit_global_positions",
+        "hit_directions",
+        "hit_volume_ids",
+        "hit_layer_ids",
+        "hit_module_ids",
+        "hit_event_ids",
+        "hit_track_ids",
+    ):
+        setattr(inputs, name, torch.cat((getattr(inputs, name), getattr(extra, name)[1:4])))
+    inputs.hit_sensor_ids = torch.arange(13)
+    inputs.hit_module_ids = torch.arange(1, 14)
+    inputs.hit_global_positions[:, 0] = torch.arange(13, dtype=torch.float64)
+    inputs.hit_global_positions[:, 2] = 0.1 * torch.arange(13, dtype=torch.float64)
+    inputs.hit_volume_ids[:] = 10
+    inputs.hit_layer_ids[:] = torch.arange(13)
+    inputs.hit_volume_ids[6] = 17
+    inputs.hit_layer_ids[6] = 8
+    inputs.hit_path_length = torch.arange(13, dtype=torch.float64)
+
+    batches = m.build_track_batches(
+        inputs,
+        ((17, 8),),
+        min_fit_hits=4,
+        min_fit_span=3.0,
+        context_hits_before=2,
+        context_hits_after=2,
+    )
+
+    assert batches.prediction_mode == (
+        "interpolation",
+        "forward_extrapolation",
+        "backward_extrapolation",
+    )
+    assert batches.context_hits_before.tolist() == [2, 4, 0]
+    assert batches.context_hits_after.tolist() == [2, 0, 4]
+    assert batches.nearest_context_distance.tolist() == [1.0, 1.0, 1.0]
+    assert batches.farthest_context_distance.tolist() == [2.0, 4.0, 4.0]
+    for row in range(3):
+        target_column = batches.holdout_mask[row].nonzero().item()
+        assert batches.measured_local[row, target_column, 0].item() == 0.0
+        assert batches.fit_mask[row, target_column].item() is False
+
+
+def test_measurement_residual_uses_prediction_minus_measurement_and_masks_loc1():
+    m = load_module()
+    predicted = torch.tensor(
+        [[[1.5, 4.0], [-2.0, 8.0]]], dtype=torch.float64
+    )
+    measured = torch.tensor(
+        [[[1.0, 2.5], [-1.5, 999.0]]], dtype=torch.float64
+    )
+    variance = torch.tensor(
+        [[[0.25, 2.25], [0.04, 1.0]]], dtype=torch.float64
+    )
+    loc1_valid = torch.tensor([[True, False]])
+
+    residual, normalized = m.measurement_residuals(
+        predicted, measured, variance, loc1_valid
+    )
+
+    assert torch.allclose(
+        residual[0, 0], torch.tensor([0.5, 1.5], dtype=torch.float64)
+    )
+    assert residual[0, 1, 0].item() == pytest.approx(-0.5)
+    assert torch.isnan(residual[0, 1, 1])
+    assert torch.allclose(
+        normalized[0, 0], torch.tensor([1.0, 1.0], dtype=torch.float64)
+    )
+    assert normalized[0, 1, 0].item() == pytest.approx(-2.5)
+    assert torch.isnan(normalized[0, 1, 1])
+
+
+def test_measurement_metrics_report_signed_accuracy_and_loc1_count():
+    m = load_module()
+    inputs = _straight_inputs(m)
+    inputs.hit_path_length = torch.arange(10, dtype=torch.float64)
+    inputs.hit_volume_ids[:] = 10
+    inputs.hit_layer_ids[:] = torch.arange(10)
+    inputs.hit_volume_ids[5] = 17
+    inputs.hit_layer_ids[5] = 8
+    batches = m.build_track_batches(
+        inputs,
+        ((17, 8),),
+        min_fit_hits=4,
+        min_fit_span=3.0,
+        context_hits_before=2,
+        context_hits_after=2,
+    )
+    row = batches.prediction_mode.index("interpolation")
+    target = batches.holdout_mask[row].nonzero().item()
+    batches.measured_local[row, target] = torch.tensor([1.0, 8.0])
+    batches.measurement_variance[row, target] = torch.tensor([0.25, 4.0])
+    batches.loc1_valid[row, target] = False
+    shape = batches.hit_mask.shape
+    predicted = batches.measured_local.clone()
+    predicted[row, target] = torch.tensor([1.5, 999.0])
+    evaluation = m.HelixEvaluation(
+        path_length=torch.zeros(shape),
+        global_position=torch.zeros((*shape, 3)),
+        local_position=predicted,
+        global_difference=torch.zeros((*shape, 3)),
+        local_difference=torch.zeros((*shape, 2)),
+        tangent_angle=torch.full(shape, 0.002),
+        intersection_valid=batches.hit_mask.clone(),
+    )
+
+    metrics = m.summarize_measurement_evaluation(
+        evaluation, batches, batches.holdout_mask & (batches.volume_id == 17)
+    )
+
+    assert metrics["local0_count"] == 3
+    assert metrics["local0_bias_mm"] == pytest.approx(1.0 / 6.0)
+    assert metrics["local0_rmse_mm"] == pytest.approx(np.sqrt(0.25 / 3.0))
+    assert metrics["local0_normalized_rms"] == pytest.approx(np.sqrt(1.0 / 3.0))
+    assert metrics["local1_count"] == 2
+    assert metrics["direction_angle_rms_rad"] == pytest.approx(0.002)
+
+
+def test_measurement_gate_checks_every_layer_and_prediction_mode():
+    m = load_module()
+
+    def comparison(loc0=0.01, loc1=0.02, angle=0.001, count=10):
+        return {
+            "requested_count": count,
+            "common_valid_count": count,
+            "fitted_intersection_failure_rate": 0.0,
+            "fitted": {
+                "local0_count": count,
+                "local1_count": count,
+                "local0_rmse_mm": loc0,
+                "local1_rmse_mm": loc1,
+                "direction_angle_rms_rad": angle,
+            },
+        }
+
+    scopes = {
+        "17:8": {mode: comparison() for mode in m.PREDICTION_MODES},
+        "24:4": {mode: comparison(loc1=1.0) for mode in m.PREDICTION_MODES},
+    }
+    scopes["17:8"]["backward_extrapolation"] = comparison(loc0=0.08)
+
+    passed, reasons = m._measurement_validation_pass(
+        scopes,
+        max_failure_rate=0.05,
+        layer_local_limits={"17:8": (0.05, 0.05), "24:4": (0.10, 1.50)},
+        max_direction_angle_rms=0.005,
+    )
+
+    assert passed is False
+    assert reasons == [
+        "holdout layer 17:8 backward_extrapolation LOC0 RMSE 0.08 mm exceeds 0.05 mm"
+    ]
 
 
 def test_geometry_contract_and_surface_intersection_use_the_same_nominal_plane():
@@ -684,17 +871,17 @@ def test_cli_runs_holdout_validation_and_writes_outputs(tmp_path, monkeypatch):
             "--holdout-layers",
             "17:8",
             "--min-fit-hits",
-            "8",
+            "4",
             "--min-fit-span",
-            "300",
+            "100",
             "--max-tracks",
             "1",
             "--fit-iters",
             "250",
             "--max-pixel-local-rmse",
-            "2.0",
+            "10.0",
             "--max-direction-angle-rms",
-            "0.02",
+            "0.2",
             "--output-dir",
             str(output_dir),
         ]
@@ -703,25 +890,38 @@ def test_cli_runs_holdout_validation_and_writes_outputs(tmp_path, monkeypatch):
     assert exit_code == 0
     summary = json.loads((output_dir / "helix_validation_summary.json").read_text())
     comparison = pd.read_csv(output_dir / "helix_smt_comparison.csv")
+    measurement_comparison = pd.read_csv(
+        output_dir / "helix_measurement_comparison.csv"
+    )
     assert summary["passed"] is True
     assert summary["fit_source"] == "measurement"
+    assert summary["validation_reference"] == "measurement"
     assert summary["comparison_baseline"] == "unrefined_smt_initialization"
     assert set(comparison["split"]) == {"fit", "holdout"}
+    assert set(measurement_comparison["prediction_mode"]) == set(m.PREDICTION_MODES)
+    assert "fitted_measurement_residual_LOC0" in measurement_comparison
     assert set(summary["holdout_by_layer"]) == {"17:8"}
+    assert set(summary["holdout_by_mode"]) == set(m.PREDICTION_MODES)
+    assert set(summary["holdout_by_layer_and_mode"]["17:8"]) == set(
+        m.PREDICTION_MODES
+    )
     plot_dir = output_dir / "plots"
-    assert {path.name for path in plot_dir.glob("*.png")} == {
-        "fit_local_residuals.png",
-        "fit_global_residuals.png",
-        "holdout_overall_local_residuals.png",
-        "holdout_overall_global_residuals.png",
-        "holdout_vol17_lay8_local_residuals.png",
-        "holdout_vol17_lay8_global_residuals.png",
-    }
+    assert (
+        plot_dir / "holdout_forward_extrapolation_local_residuals.png"
+    ).is_file()
+    assert (
+        plot_dir
+        / "holdout_vol17_lay8_backward_extrapolation_local_residuals.png"
+    ).is_file()
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert manifest["status"] == "completed"
+    assert manifest["metrics"]["validation_summary"]["passed"] is True
+    assert manifest["inputs"]["nominal_trackstates"]["sha256"]
 
 
 def test_cli_writes_failure_artifacts_and_returns_one(tmp_path, monkeypatch):
     m = load_module()
-    inputs = _straight_inputs(m)
+    inputs = _straight_inputs(m, holdout_measurement_shift=1.0)
     rotation = torch.tensor(
         [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
         dtype=torch.float64,
@@ -772,10 +972,60 @@ def test_cli_writes_failure_artifacts_and_returns_one(tmp_path, monkeypatch):
 
     assert exit_code == 1
     assert (output_dir / "helix_smt_comparison.csv").exists()
-    assert len(list((output_dir / "plots").glob("*.png"))) == 6
+    assert (output_dir / "helix_measurement_comparison.csv").exists()
+    assert len(list((output_dir / "plots").glob("*.png"))) == 18
     summary = json.loads((output_dir / "helix_validation_summary.json").read_text())
     assert summary["passed"] is False
     assert summary["failure_reasons"]
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert manifest["status"] == "completed"
+    assert manifest["metrics"]["validation_summary"]["passed"] is False
+
+
+def test_cli_records_failed_manifest_for_runtime_error(tmp_path, monkeypatch):
+    m = load_module()
+    geometry_path = tmp_path / "nominal.json"
+    states_path = tmp_path / "trackstates.root"
+    geometry_path.write_text(
+        json.dumps(
+            [
+                {
+                    "ID": "vol=17|lay=8|sen=1",
+                    "Translation": [0.0, 0.0, 0.0],
+                    "RotationMatrix": np.eye(3).tolist(),
+                }
+            ]
+        )
+    )
+    states_path.touch()
+    monkeypatch.setattr(
+        m,
+        "load_nominal_states",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("synthetic loader failure")
+        ),
+    )
+    output_dir = tmp_path / "runtime-failure"
+
+    exit_code = m.main(
+        [
+            "--states",
+            str(states_path),
+            "--geometry",
+            str(geometry_path),
+            "--nominal-full-geometry",
+            str(geometry_path),
+            "--holdout-layers",
+            "17:8",
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    assert exit_code == 2
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert manifest["status"] == "failed"
+    assert "synthetic loader failure" in manifest["metrics"]["error"]
 
 
 def test_cli_defaults_follow_nominal_artifact_layout():
@@ -785,4 +1035,8 @@ def test_cli_defaults_follow_nominal_artifact_layout():
     assert "/nominal/" in config.states
     assert config.states.endswith("trackstates_kf_v17l8_v24l4.root")
     assert config.holdout_layers == "17:8,24:4"
+    assert config.min_fit_hits == 8
+    assert config.min_fit_span == 300.0
+    assert config.min_extrapolation_fit_hits == 4
+    assert config.min_extrapolation_fit_span == 100.0
     assert config.output_dir.endswith("data/experiments/helix_validation/Vol17_Lay8__Vol24_Lay4")

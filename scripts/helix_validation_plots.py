@@ -16,6 +16,11 @@ import pandas as pd
 
 
 HISTOGRAM_BINS = 60
+PREDICTION_MODES = (
+    "interpolation",
+    "forward_extrapolation",
+    "backward_extrapolation",
+)
 
 
 def _finite(values: pd.Series | np.ndarray) -> np.ndarray:
@@ -27,8 +32,8 @@ def fitted_residual_components(frame: pd.DataFrame) -> dict[str, np.ndarray]:
     """Return finite fitted residual components from valid intersections."""
     required = {
         "fitted_intersection_valid",
-        "fitted_dLOC0",
-        "fitted_dLOC1",
+        "fitted_measurement_residual_LOC0",
+        "fitted_measurement_residual_LOC1",
         "fitted_dg_x",
         "fitted_dg_y",
         "fitted_dg_z",
@@ -43,8 +48,8 @@ def fitted_residual_components(frame: pd.DataFrame) -> dict[str, np.ndarray]:
     )
     finite_global_rows = np.isfinite(global_xyz).all(axis=1)
     return {
-        "local0": _finite(valid["fitted_dLOC0"]),
-        "local1": _finite(valid["fitted_dLOC1"]),
+        "local0": _finite(valid["fitted_measurement_residual_LOC0"]),
+        "local1": _finite(valid["fitted_measurement_residual_LOC1"]),
         "global_x": _finite(valid["fitted_dg_x"]),
         "global_y": _finite(valid["fitted_dg_y"]),
         "global_z": _finite(valid["fitted_dg_z"]),
@@ -141,6 +146,18 @@ def _plot_scopes(
             frame.loc[frame["split"] == "holdout"],
         ),
     ]
+    for mode in PREDICTION_MODES:
+        selected = frame.loc[
+            (frame["split"] == "holdout")
+            & (frame["prediction_mode"] == mode)
+        ]
+        scopes.append(
+            (
+                f"holdout_{mode}",
+                f"Holdout surfaces ({mode})",
+                selected,
+            )
+        )
     for volume, layer in holdout_layers:
         selected = frame.loc[
             (frame["split"] == "holdout")
@@ -154,6 +171,15 @@ def _plot_scopes(
                 selected,
             )
         )
+        for mode in PREDICTION_MODES:
+            mode_selected = selected.loc[selected["prediction_mode"] == mode]
+            scopes.append(
+                (
+                    f"holdout_vol{volume}_lay{layer}_{mode}",
+                    f"Holdout layer {volume}:{layer} ({mode})",
+                    mode_selected,
+                )
+            )
     return scopes
 
 
