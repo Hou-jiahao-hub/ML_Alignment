@@ -392,3 +392,213 @@ def test_alignment_run_config_defaults_use_target_subdirectories():
         config.output_geom
         == str(layout.DATA_ROOT / "alignment" / target_dir / f"aligned_transforms_{suffix}_ml.json")
     )
+
+
+def load_validate_helix_model_module():
+    module_path = Path(__file__).resolve().parents[1] / "scripts" / "validate_helix_model.py"
+    sys.path.insert(0, str(module_path.parent))
+    spec = importlib.util.spec_from_file_location("validate_helix_model", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def build_synthetic_joint_case(m, n_tracks=4, n_hits=6, noise=0.02):
+    """A barrel-like case whose intersections are all valid.
+
+    Planes carry the normal along x with local axes (y, z), so a nearly radial
+    helix crosses every one of them.  The last layer is the alignment target and
+    is therefore excluded from the refit, which is what makes ``fit_mask`` and
+    ``is_target`` complementary here.
+    """
+    dtype = torch.float64
+    generator = torch.Generator().manual_seed(20260826)
+
+    centers = torch.zeros((n_hits, 3), dtype=dtype)
+    centers[:, 0] = torch.linspace(50.0, 300.0, n_hits, dtype=dtype)
+    basis = torch.stack(
+        (
+            torch.tensor([0.0, 1.0, 0.0], dtype=dtype),
+            torch.tensor([0.0, 0.0, 1.0], dtype=dtype),
+            torch.tensor([1.0, 0.0, 0.0], dtype=dtype),
+        ),
+        dim=1,
+    )
+    rotations = basis.unsqueeze(0).expand(n_hits, 3, 3).contiguous()
+
+    truth = torch.zeros((n_tracks, 6), dtype=dtype)
+    truth[:, 3] = torch.linspace(-0.05, 0.05, n_tracks, dtype=dtype)
+    truth[:, 4] = torch.linspace(-0.2, 0.2, n_tracks, dtype=dtype)
+    truth[:, 5] = torch.linspace(-2.0e-4, 2.0e-4, n_tracks, dtype=dtype)
+
+    tracks = truth[:, None, :].expand(-1, n_hits, -1)
+    hit_centers = centers.unsqueeze(0).expand(n_tracks, -1, -1)
+    hit_rotations = rotations.unsqueeze(0).expand(n_tracks, -1, -1, -1)
+    _s, points, valid = m.intersect_plane(
+        tracks, hit_centers, hit_rotations[..., :, 2]
+    )
+    assert bool(valid.all()), "synthetic geometry must intersect every plane"
+    local = torch.matmul(
+        hit_rotations.transpose(-1, -2), (points - hit_centers).unsqueeze(-1)
+    ).squeeze(-1)[..., :2]
+    measured = local + noise * torch.randn(
+        local.shape, generator=generator, dtype=dtype
+    )
+
+    is_target = torch.zeros((n_tracks, n_hits), dtype=torch.bool)
+    is_target[:, -1] = True
+    batches = m.TrackBatches(
+        measured_local=measured,
+        covariances=torch.full_like(measured, noise**2),
+        sensor_idx=torch.arange(n_hits).unsqueeze(0).expand(n_tracks, -1).contiguous(),
+        hit_mask=torch.ones((n_tracks, n_hits), dtype=torch.bool),
+        loc1_mask=torch.ones((n_tracks, n_hits), dtype=torch.bool),
+        g_smt=points.clone(),
+        p_smt=torch.zeros((n_tracks, n_hits, 3), dtype=dtype),
+        volume_id=torch.full((n_tracks, n_hits), 16, dtype=torch.long),
+        layer_id=torch.arange(n_hits).unsqueeze(0).expand(n_tracks, -1).contiguous(),
+        is_target=is_target,
+        event_track_ids=torch.zeros((n_tracks, 2), dtype=torch.long),
+        fit_mask=~is_target,
+        fit_span=torch.full((n_tracks,), 250.0, dtype=dtype),
+    )
+    geometry = m.JointGeometry(
+        transforms=[],
+        input_transforms=[],
+        centers=centers,
+        rotations=rotations,
+        target_mask=is_target[0].clone(),
+        id_to_idx={(16, layer, 0): layer for layer in range(n_hits)},
+        input_indices=list(range(n_hits)),
+    )
+    seed = truth.clone()
+    seed[:, :3] += 0.5
+    seed[:, 3] += 0.01
+    return batches, geometry, truth, seed
+
+
+def test_refit_stationarity_is_measured_in_the_half_chi2_gauge():
+    """The two modules must agree on the objective before the decrement means anything.
+
+    ``_measurement_refit_objective`` divides by the component count while the
+    pre-registered ``NEWTON_DECREMENT_STATIONARY`` lives in ``F = 0.5 * chi2``.
+    Undoing that normalisation has to land exactly on the validation module's
+    standardized residual, or the reported decrement is off by the component
+    count and the threshold is meaningless.
+    """
+    m = load_ml_alignment_autograd_module()
+    v = load_validate_helix_model_module()
+    batches, geometry, _truth, seed = build_synthetic_joint_case(m)
+
+    loss, _invalid, component_mask = m._measurement_refit_objective(
+        seed, batches, geometry
+    )
+    autograd_half_chi2 = float(loss) * float(component_mask.sum()) / 2.0
+
+    validation_batches = m._validation_batches_from_joint(batches, v)
+    inputs = v._measurement_fit_inputs(validation_batches, geometry, seed)
+    no_kinks = inputs.node_s.new_zeros((seed.shape[0], 0, 2))
+    residual = v._standardized_residual(
+        v._pack_parameters(seed, no_kinks),
+        0,
+        v.reference_gauge_frame(seed),
+        inputs.node_s,
+        inputs.node_valid,
+        inputs.kink_sigma,
+        inputs.measured,
+        inputs.variance,
+        inputs.mask,
+        inputs.hit_s,
+        inputs.centers,
+        inputs.rotations,
+    )
+    validation_half_chi2 = float(0.5 * residual.square().sum())
+
+    assert validation_half_chi2 > 0.0
+    assert abs(autograd_half_chi2 - validation_half_chi2) <= 1e-9 * validation_half_chi2
+
+
+def test_validation_batches_from_joint_relabels_without_reinterpreting():
+    m = load_ml_alignment_autograd_module()
+    v = load_validate_helix_model_module()
+    batches, _geometry, _truth, _seed = build_synthetic_joint_case(m)
+
+    relabelled = m._validation_batches_from_joint(batches, v)
+
+    assert torch.equal(relabelled.measured_local, batches.measured_local)
+    assert torch.equal(relabelled.measurement_variance, batches.covariances)
+    assert torch.equal(relabelled.loc1_valid, batches.loc1_mask)
+    assert torch.equal(relabelled.fit_mask, batches.fit_mask)
+    assert torch.equal(relabelled.sensor_idx, batches.sensor_idx)
+    assert torch.equal(relabelled.g_smt, batches.g_smt)
+    # The stand-in holdout never overlaps the target layer, and the sentinel mode
+    # keeps these rows out of every Gate 4 selection.
+    assert not bool((relabelled.holdout_mask & batches.is_target).any())
+    assert bool((relabelled.holdout_mask & relabelled.fit_mask).any(dim=1).all())
+    assert set(relabelled.prediction_mode) == {m.DIAGNOSTIC_PREDICTION_MODE}
+    assert m.DIAGNOSTIC_PREDICTION_MODE not in v.PREDICTION_MODES
+
+
+def test_validation_batches_from_joint_fails_closed_on_target_leakage():
+    m = load_ml_alignment_autograd_module()
+    v = load_validate_helix_model_module()
+    batches, _geometry, _truth, _seed = build_synthetic_joint_case(m)
+    batches.fit_mask = torch.ones_like(batches.fit_mask)
+
+    with pytest.raises(ValueError, match="target-layer hits"):
+        m._validation_batches_from_joint(batches, v)
+
+
+def test_refit_stationarity_measurement_leaves_the_fit_untouched():
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, _truth, seed = build_synthetic_joint_case(m)
+
+    measured_fit, measured_stats = m.fit_helices_to_measurements(
+        batches, geometry, seed, n_iter=20, stationarity=True
+    )
+    plain_fit, plain_stats = m.fit_helices_to_measurements(
+        batches, geometry, seed, n_iter=20, stationarity=False
+    )
+
+    assert torch.equal(measured_fit, plain_fit)
+    assert "stationarity" not in plain_stats
+    assert set(measured_stats["stationarity"]) == {"seed", "refit"}
+    assert (
+        measured_stats["chi2_per_component"] == plain_stats["chi2_per_component"]
+    )
+
+
+def test_refit_stationarity_separates_a_truncated_fit_from_a_solved_one():
+    """Both directions, so a decrement that is always zero cannot pass.
+
+    A single Adam step must look worse than twenty, and the Gauss-Newton
+    solution of the same objective must come back stationary.  Without the
+    second half this test would still pass if the measurement collapsed to a
+    constant.
+    """
+    m = load_ml_alignment_autograd_module()
+    v = load_validate_helix_model_module()
+    batches, geometry, _truth, seed = build_synthetic_joint_case(m)
+
+    _one, one_step = m.fit_helices_to_measurements(
+        batches, geometry, seed, n_iter=1, stationarity=True
+    )
+    _many, many_steps = m.fit_helices_to_measurements(
+        batches, geometry, seed, n_iter=20, stationarity=True
+    )
+    assert (
+        many_steps["stationarity"]["refit"]["newton_decrement_p50"]
+        < one_step["stationarity"]["refit"]["newton_decrement_p50"]
+    )
+
+    solved, _stats = v.fit_helices_gauss_newton(
+        m._validation_batches_from_joint(batches, v), geometry, seed
+    )
+    solved_report = m.measure_joint_refit_stationarity(batches, geometry, solved)
+    assert solved_report["non_stationary_row_fraction"] == 0.0
+    assert (
+        solved_report["newton_decrement_max"]
+        < solved_report["stationary_threshold"]
+    )

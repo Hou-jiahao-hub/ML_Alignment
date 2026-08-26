@@ -253,6 +253,7 @@ class AlignmentRunConfig:
     measurement_refit_lr_position: float = MEASUREMENT_REFIT_LR_POSITION
     measurement_refit_lr_direction: float = MEASUREMENT_REFIT_LR_DIRECTION
     measurement_refit_lr_rho_scaled: float = MEASUREMENT_REFIT_LR_RHO_SCALED
+    joint_refit_stationarity: bool = True
     event_partition: str | None = None
     event_split_seed: int = DEFAULT_SPLIT_SEED
 
@@ -601,6 +602,108 @@ def _measurement_refit_objective(
     return loss, invalid_fraction, component_mask
 
 
+#: Prediction mode for batches built only to be measured, never fitted.  Gate 4
+#: selects rows by ``prediction_mode`` equality against ``PREDICTION_MODES``, so a
+#: value outside that tuple selects nothing rather than letting a placeholder row
+#: reach a physics result.
+DIAGNOSTIC_PREDICTION_MODE = "joint-refit-diagnostic"
+
+
+def _load_validation_module():
+    """Import ``validate_helix_model`` lazily.
+
+    It is a 4000-line entry point; importing it at module scope would make every
+    autograd run pay for the Gate 4 machinery.  Nothing runs at its import time
+    beyond constants and one ``vmap`` construction, and it does not import this
+    module, so there is no cycle.
+    """
+    try:
+        from . import validate_helix_model
+    except ImportError:  # Direct script execution.
+        import validate_helix_model
+    return validate_helix_model
+
+
+def _validation_batches_from_joint(batches, validation):
+    """Re-label joint batches as the validation module's ``TrackBatches``.
+
+    Both modules carry the same measurements under different field names
+    (``covariances``/``loc1_mask`` here, ``measurement_variance``/``loc1_valid``
+    there).  Building the real dataclass instead of duck-typing means a field
+    added on either side fails loudly here rather than silently reading a
+    placeholder.
+
+    ``holdout_mask`` has no meaning during joint initialization -- nothing is held
+    out.  ``newton_decrement`` reads none of the ``holdout_*`` inputs, so the first
+    fitted hit stands in, and ``prediction_mode`` carries the diagnostic sentinel
+    so this object cannot contribute rows to a Gate 4 verdict.
+    """
+    fit_mask = _non_target_fit_mask(batches)
+    n_rows = fit_mask.shape[0]
+    if not bool(fit_mask.any(dim=1).all()):
+        raise ValueError("Every joint track needs at least one non-target hit.")
+    holdout_mask = torch.zeros_like(fit_mask)
+    holdout_mask[
+        torch.arange(n_rows, device=fit_mask.device),
+        fit_mask.to(torch.int64).argmax(dim=1),
+    ] = True
+    real_dtype = batches.measured_local.dtype
+    zeros_long = torch.zeros(n_rows, dtype=torch.long)
+    zeros_real = torch.zeros(n_rows, dtype=real_dtype)
+    return validation.TrackBatches(
+        measured_local=batches.measured_local,
+        measurement_variance=batches.covariances,
+        loc1_valid=batches.loc1_mask,
+        smt_local=torch.zeros_like(batches.measured_local),
+        sensor_idx=batches.sensor_idx,
+        hit_mask=batches.hit_mask,
+        fit_mask=fit_mask,
+        holdout_mask=holdout_mask,
+        g_smt=batches.g_smt,
+        p_smt=batches.p_smt,
+        volume_id=batches.volume_id,
+        layer_id=batches.layer_id,
+        module_id=torch.zeros_like(batches.volume_id),
+        event_track_ids=batches.event_track_ids,
+        fit_span=batches.fit_span if batches.fit_span is not None else zeros_real,
+        prediction_mode=(DIAGNOSTIC_PREDICTION_MODE,) * n_rows,
+        context_hits_before=zeros_long,
+        context_hits_after=zeros_long,
+        nearest_context_distance=zeros_real,
+        farthest_context_distance=zeros_real,
+    )
+
+
+def measure_joint_refit_stationarity(
+    batches,
+    geometry,
+    parameters,
+    device="cpu",
+    dtype=torch.float64,
+):
+    """Per-row Newton decrement of the joint measurement refit.
+
+    Turns "the optimiser may have stopped on budget" into a number.  Measurement
+    only: it reads the parameters and never changes them.
+
+    Deliberately routed through the validation module's ``newton_decrement`` so
+    this and the Gate 4 single arm cannot drift apart, and so the value lands in
+    the pre-registered ``F = 0.5 * chi2`` gauge that ``NEWTON_DECREMENT_STATIONARY``
+    was set in.  ``_measurement_refit_objective`` divides by the component count,
+    which would scale every decrement by that factor -- order 1e-5 on a real run --
+    and make the threshold meaningless.
+
+    Runs in float64 on the CPU by default: a decrement compared against 1e-6 is
+    below float32 resolution.
+    """
+    validation = _load_validation_module()
+    measured = _validation_batches_from_joint(batches, validation)
+    decrement = validation.measurement_newton_decrement(
+        measured, geometry, parameters, device=device, dtype=dtype
+    )
+    return validation.stationarity_report(decrement)
+
+
 def fit_helices_to_measurements(
     batches,
     geometry,
@@ -612,8 +715,14 @@ def fit_helices_to_measurements(
     lr_position=MEASUREMENT_REFIT_LR_POSITION,
     lr_direction=MEASUREMENT_REFIT_LR_DIRECTION,
     lr_rho_scaled=MEASUREMENT_REFIT_LR_RHO_SCALED,
+    stationarity=True,
 ):
-    """Refit helices using only non-target local measurements and fixed surfaces."""
+    """Refit helices using only non-target local measurements and fixed surfaces.
+
+    ``stationarity`` adds a read-only Newton-decrement measurement of the seed and
+    of the refit output.  It does not touch the returned parameters: the seed
+    figure is what separates "Adam converged" from "the seed was already close".
+    """
     if n_iter < 1:
         raise ValueError("joint measurement refit iterations must be at least 1.")
     initial = initial_parameters.to(device=device, dtype=dtype)
@@ -712,7 +821,7 @@ def fit_helices_to_measurements(
             "Non-target measurement refit intersection failure rate exceeds limit: "
             f"{final_invalid:.2%} > {max_invalid_fraction:.2%}."
         )
-    return fitted, {
+    stats = {
         "chi2_per_component": final_loss,
         "initial_chi2_per_component": initial_loss,
         "n_components": int(component_mask.sum().cpu()),
@@ -726,6 +835,12 @@ def fit_helices_to_measurements(
         },
         "first_step": first_step,
     }
+    if stationarity:
+        stats["stationarity"] = {
+            "seed": measure_joint_refit_stationarity(batches, geometry, initial),
+            "refit": measure_joint_refit_stationarity(batches, geometry, fitted),
+        }
+    return fitted, stats
 
 
 def _joint_forward(track_parameters, alignment, batches, geometry, track_indices=None):
@@ -2146,6 +2261,7 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
         lr_position=config.measurement_refit_lr_position,
         lr_direction=config.measurement_refit_lr_direction,
         lr_rho_scaled=config.measurement_refit_lr_rho_scaled,
+        stationarity=config.joint_refit_stationarity,
     )
     print(
         "Joint initialization: "
@@ -2155,6 +2271,18 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
         f"SMT loss={smt_stats['loss']:.6g} "
         f"measurement chi2/component={measurement_stats['chi2_per_component']:.6g}."
     )
+    if "stationarity" in measurement_stats:
+        seed_report = measurement_stats["stationarity"]["seed"]
+        refit_report = measurement_stats["stationarity"]["refit"]
+        print(
+            "Joint refit stationarity (F = 0.5 chi2 gauge, threshold "
+            f"{refit_report['stationary_threshold']:.3g}): "
+            f"non-stationary rows {seed_report['non_stationary_row_fraction']:.2%} "
+            f"-> {refit_report['non_stationary_row_fraction']:.2%}, "
+            f"decrement p90 {seed_report['newton_decrement_p90']:.3g} "
+            f"-> {refit_report['newton_decrement_p90']:.3g}, "
+            f"non-finite {refit_report['n_non_finite']}."
+        )
     with torch.no_grad():
         seed_alignment = torch.zeros(
             (len(geometry.centers), 6),
@@ -2694,6 +2822,11 @@ def build_argument_parser():
         type=float,
         default=MEASUREMENT_REFIT_LR_RHO_SCALED,
     )
+    p.add_argument(
+        "--no-joint-refit-stationarity",
+        action="store_true",
+        help="Skip the Newton-decrement measurement of the measurement refit.",
+    )
     p.add_argument("--min-hits", type=int, default=8)
     p.add_argument("--max-tracks", type=int, default=0, help="0 keeps all selected tracks.")
     p.add_argument("--track-batch-size", type=int, default=0, help="0 uses full-batch.")
@@ -2772,6 +2905,7 @@ def alignment_config_from_args(a):
         measurement_refit_lr_position=a.measurement_refit_lr_position,
         measurement_refit_lr_direction=a.measurement_refit_lr_direction,
         measurement_refit_lr_rho_scaled=a.measurement_refit_lr_rho_scaled,
+        joint_refit_stationarity=not a.no_joint_refit_stationarity,
         alignment_gain=a.alignment_gain,
     )
 

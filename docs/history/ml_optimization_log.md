@@ -1180,3 +1180,115 @@ gauge-fixed 参数，μ_min 甚至为负），残差反映的是欠定拟合的�
   预注册变更，本轮未动。
 - `ml_alignment_autograd.py` 的 Adam refit 同类缺陷仍**只是标记，未测量、未修**。
 - 结论仍只在 20000 events 上，未在 100000 events 上复现。
+
+---
+
+## Iteration 18 — joint 路径的 Adam refit：驻点性首次被测量
+
+**改动**：`scripts/ml_alignment_autograd.py`、`tests/test_ml_alignment_autograd.py`
+**性质**：**纯测量，不改行为**。求解器、预注册常量、`refitted_parameters` 全部未动。
+
+### 1. 为什么现在做
+
+`fit_helices_to_measurements` 是 joint 校准初始化阶段的 Adam 测量 refit，
+在 `run_joint_alignment` 里调用一次，其输出是整个校准的 nuisance 轨迹起点。
+Iteration 15 已在 Gate 4 路径上证明同类 Adam refit 从未到过驻点，但 joint 路径的
+这一处从 Iteration 15 起就只被标记、从未测量。P1 完成后门槛解除。
+
+### 2. 两个必须先解决的问题
+
+**gauge 不一致。** `_measurement_refit_objective` 的 loss 是
+`sum(r²/cov) / component_mask.sum()`，而预注册的 `NEWTON_DECREMENT_STATIONARY = 1e-6`
+定义在 `F = 0.5·chi2` 上（`HALF_CHI2_OBJECTIVE`）。decrement 随目标线性缩放，
+直接在归一化 loss 上测会把每个值缩小约 1e-5 倍，阈值随之失去意义。
+→ 测量全部走 validation 模块，只把参数传过去。
+
+**两个目标是否同一个。** validation 侧用冻结弧长 `hit_s`，autograd 侧每次重解
+`intersect_plane`。实测在 nodeless 情况下**逐位相同**：
+
+| 量 | 值 |
+|---|---|
+| autograd loss 还原为 `0.5·chi2` | 120264.615429 |
+| validation `0.5·‖r‖²` | 120264.615429 |
+| 相对差 | **0.000e+00** |
+
+原因是三件事同时成立：`intersect_plane` 两边都用默认 `n_newton = 12`；
+`EPS_VARIANCE == EPS_COVARIANCE == 1e-8`；零节点时 `broken_helix_track_parameters`
+退化为 reference 的逐 hit 广播，`hit_s` 只用于选段，不影响预测。
+component mask 也是同一个 `batches.fit_mask`。
+
+### 3. 实现
+
+- `_validation_batches_from_joint`：两个模块各有自己的 `TrackBatches`
+  （`covariances`/`loc1_mask` 对 `measurement_variance`/`loc1_valid`）。构造真正的
+  dataclass 而非 duck-typing，字段变更才会当场报错。`holdout_mask` 在 joint 场景没有
+  意义（`newton_decrement` 不读任何 `holdout_*`），用第一个 fit hit 占位；
+  `prediction_mode` 填哨兵 `joint-refit-diagnostic`，它不在 `PREDICTION_MODES` 里，
+  因此这种 batches 永远选不进任何 Gate 4 结论。
+- `measure_joint_refit_stationarity`：调 `measurement_newton_decrement` +
+  `stationarity_report`，默认 CPU float64（与 1e-6 比较时 float32 精度不够）。
+- 挂载在 `fit_helices_to_measurements` 的 stats dict 上，对 **seed 与 refit 各测一次**。
+  只报 refit 说明不了 Adam 走了多远；seed→refit 的降幅才能区分「起点就近」和「优化器有效」。
+- `--no-joint-refit-stationarity` 可关（默认开）。
+
+### 4. 结果：joint 路径的 Adam refit 也从未接近驻点
+
+真实数据，`--track-mode free --max-tracks 300`（1200 轨迹选中 300）：
+
+| 量 | seed | 200 次 Adam 迭代后 |
+|---|---|---|
+| non-stationary 行占比 | 100.00% | **100.00%** |
+| Newton decrement p90 | 5.36e5 | **4.17e5** |
+| 非有限行 | 0 | 0 |
+
+阈值是 1e-6。200 次迭代把 decrement 降了约 22%，终点距驻点仍有 **11 个数量级**。
+这与 Iteration 15 在 Gate 4 路径上的发现同向，且这里的量级更极端。
+
+### 5. 行为不变的验证
+
+同一命令开/关 flag 各跑一次：
+
+- `measurement chi2/component = 7992.76` 逐位相同；
+- 最终导出的对齐几何 JSON **文件级完全一致**（`cmp` 无差异）。
+
+不只是 refit 参数没变，整条下游都没变。
+
+### 6. 测试
+
+新增 5 项（`tests/test_ml_alignment_autograd.py`）：gauge 等价（相对差 ≤ 1e-9）、
+适配器逐字段保真、target 泄漏仍 fail-closed、开关 flag 后 `torch.equal` 相同、
+以及双向的分辨力测试。
+
+最后一项是关键：只断言「1 次迭代比 20 次差」的话，一个恒返回常数的测量也能通过。
+因此同时断言**同一目标的 Gauss-Newton 解必须被判为收敛**——实测
+`non_stationary_row_fraction == 0.0` 且 `newton_decrement_max < 1e-6`。
+测量工具本身是对的，所以 Adam 的大 decrement 是真的。
+
+### 7. 环境更正（重要）
+
+`docs/handoff/2026-08-26-damping-equivalence-v2.md` §7 记的
+「`python` = `/usr/bin/python` 3.9.25，`make test` 293 passed / 35 failed」
+**是解释器用错了**。`pyproject.toml` 声明 `requires-python = ">=3.10"`，
+而 3.9 缺 `zip(..., strict=True)`，`fit_helices_to_measurements` 在它下面根本跑不完
+第一次迭代。项目自己的 skip 消息也写着「Run in the conda pytorch Python 3.10 environment」。
+
+正确解释器：`~/miniconda3/envs/pytorch/bin/python`（3.10.20，torch 2.11.0+cu126），
+需要 `LD_LIBRARY_PATH=$HOME/miniconda3/envs/pytorch/lib`
+（否则 `awkward_cpp` 找不到 `CXXABI_1.3.15`）。
+
+| 解释器 | 全量测试 |
+|---|---|
+| `/usr/bin/python` 3.9.25 | 293 passed / **35 failed** / 3 skipped |
+| conda `pytorch` 3.10.20（本轮前） | **328 passed / 0 failed** / 3 skipped |
+| conda `pytorch` 3.10.20（本轮后） | **333 passed / 0 failed** / 3 skipped |
+
+那 35 项「既有失败」不是代码欠债，是环境不匹配。本轮 +5 恰为新增测试数，零回归。
+
+### 尚未宣称
+
+- **没有**换求解器。把 refit 换成 `fit_helices_gauss_newton` 会改变
+  `refitted_parameters`，属于下一次预注册变更。
+- 上表的测量来自 300 条轨迹的小样本；全量 joint 运行上尚未复现。
+- `seed_helices` 的 Adam 预拟合仍未检验（P4）。
+- `24:4|backward_extrapolation|LOC0` 的 NLL 结论仍不可引用（P1'）。
+- `min_extrapolation_fit_hits = 4` 仍未动（P3）。
