@@ -45,7 +45,7 @@ broken 臂把 `node_s` 补到固定宽度，未用槽位不进入任何残差，
 | 5 | 新增 `PREREGISTRATION_VERSION = 2`、`MAX_RANK_DEFICIENT_ROW_FRACTION` |
 
 commit：`74dc0e7`（零方向 + damping=0）、`0e0f962`（秩亏行丢弃）、
-`f0f9b9c`（逐行判据修正，见 §4）。
+`25806c3`（逐行判据修正，见 §4）。
 
 ---
 
