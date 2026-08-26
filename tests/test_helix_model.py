@@ -68,3 +68,319 @@ def test_both_consumers_reexport_the_shared_math_implementation():
     ):
         assert getattr(alignment, name) is getattr(shared, name)
         assert getattr(validation, name) is getattr(shared, name)
+
+
+# ---------------------------------------------------------------------------
+# Highland multiple-scattering prior (work package 2, Gate 2)
+# ---------------------------------------------------------------------------
+
+
+def _acts_theta0(x_over_x0, q_over_p, mass, abs_charge=1.0):
+    """Reference implementation transcribed from ACTS Interactions.cpp:484-491."""
+    q2_over_beta2 = abs_charge**2 + (mass * q_over_p) ** 2
+    t = math.sqrt(x_over_x0 * q2_over_beta2)
+    momentum_inv = abs(q_over_p / abs_charge)
+    return 0.0136 * momentum_inv * t * (1.0 + 0.038 * 2 * math.log(t))
+
+
+def test_highland_kink_sigma_matches_acts_rpp2018_form():
+    model = importlib.import_module("scripts.helix_model")
+    x_over_x0 = torch.tensor([[0.01, 0.05]], dtype=torch.float64)
+    q_over_p = torch.tensor([0.2], dtype=torch.float64)
+
+    sigma = model.highland_kink_sigma(x_over_x0, q_over_p)
+
+    expected = [
+        _acts_theta0(0.01, 0.2, model.MUON_MASS_GEV),
+        _acts_theta0(0.05, 0.2, model.MUON_MASS_GEV),
+    ]
+    assert sigma[0].tolist() == pytest.approx(expected, rel=1e-12)
+
+
+def test_highland_kink_sigma_uses_exact_zero_limit_for_vacuum_nodes():
+    """x/X0 == 0 must return exactly 0 with finite gradients, not log(clamp(...))."""
+    model = importlib.import_module("scripts.helix_model")
+    x_over_x0 = torch.tensor(
+        [[0.0, 0.02, 0.0]], dtype=torch.float64, requires_grad=True
+    )
+    q_over_p = torch.tensor([0.5], dtype=torch.float64)
+
+    sigma = model.highland_kink_sigma(x_over_x0, q_over_p)
+    assert torch.isfinite(sigma).all()
+    assert sigma[0, 0].item() == 0.0
+    assert sigma[0, 2].item() == 0.0
+    assert sigma[0, 1].item() > 0.0
+
+    sigma.sum().backward()
+    assert torch.isfinite(x_over_x0.grad).all()
+
+
+def test_highland_kink_sigma_scales_with_thickness_and_momentum():
+    model = importlib.import_module("scripts.helix_model")
+    # Thickness x4 -> sigma approximately x2 (sqrt scaling, log term is a slow drift).
+    thin = model.highland_kink_sigma(
+        torch.tensor([[0.005]], dtype=torch.float64),
+        torch.tensor([0.1], dtype=torch.float64),
+    )
+    thick = model.highland_kink_sigma(
+        torch.tensor([[0.020]], dtype=torch.float64),
+        torch.tensor([0.1], dtype=torch.float64),
+    )
+    assert (thick / thin).item() == pytest.approx(2.0, rel=0.10)
+
+    # Momentum x2 (q/p halved) -> sigma halved for an ultra-relativistic muon.
+    slow = model.highland_kink_sigma(
+        torch.tensor([[0.01]], dtype=torch.float64),
+        torch.tensor([0.2], dtype=torch.float64),
+    )
+    fast = model.highland_kink_sigma(
+        torch.tensor([[0.01]], dtype=torch.float64),
+        torch.tensor([0.1], dtype=torch.float64),
+    )
+    assert (fast / slow).item() == pytest.approx(0.5, rel=1e-3)
+
+
+def test_highland_kink_sigma_split_matches_analytic_ratio_not_conservation():
+    """Splitting a slab changes the summed variance by a known analytic factor.
+
+    ACTS/PDG evaluate the log term with the per-slab x/X0 (Interactions.cpp:516),
+    so sum(theta0^2) is NOT invariant under splitting.  Asserting invariance would
+    encode wrong physics; assert the closed-form ratio instead.
+    """
+    model = importlib.import_module("scripts.helix_model")
+    x_over_x0, q_over_p, pieces = 0.02, 0.15, 5
+    mass = model.MUON_MASS_GEV
+
+    whole = model.highland_kink_sigma(
+        torch.tensor([[x_over_x0]], dtype=torch.float64),
+        torch.tensor([q_over_p], dtype=torch.float64),
+    )
+    split = model.highland_kink_sigma(
+        torch.full((1, pieces), x_over_x0 / pieces, dtype=torch.float64),
+        torch.tensor([q_over_p], dtype=torch.float64),
+    )
+
+    u = x_over_x0 * (1.0 + (mass * q_over_p) ** 2)
+    analytic_ratio = (
+        (1.0 + 0.038 * (math.log(u) - math.log(pieces))) / (1.0 + 0.038 * math.log(u))
+    ) ** 2
+    assert (split.square().sum() / whole.square().sum()).item() == pytest.approx(
+        analytic_ratio, rel=1e-12
+    )
+    assert analytic_ratio != pytest.approx(1.0, abs=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# Broken helix: segments, kinks and the frozen-reference coordinate contract
+# ---------------------------------------------------------------------------
+
+
+def _reference(dtype=torch.float64):
+    return torch.tensor([[10.0, -5.0, 2.0, 0.35, 0.60, 3.0e-4]], dtype=dtype)
+
+
+def test_broken_helix_reduces_to_the_single_helix_without_material():
+    """Zero-material limit: point, tangent AND gradient must be identical."""
+    model = importlib.import_module("scripts.helix_model")
+    reference = _reference().requires_grad_(True)
+    node_s = torch.tensor([[100.0, 300.0]], dtype=torch.float64)
+    node_valid = torch.zeros((1, 2), dtype=torch.bool)
+    kinks = torch.zeros((1, 2, 2), dtype=torch.float64)
+    hit_s = torch.tensor([[50.0, 200.0, 400.0]], dtype=torch.float64)
+
+    per_hit = model.broken_helix_track_parameters(
+        reference, kinks, node_s, node_valid, hit_s
+    )
+    expanded = reference[:, None, :].expand(-1, hit_s.shape[1], -1)
+    torch.testing.assert_close(per_hit, expanded)
+
+    local_s = model.broken_helix_local_path(node_s, node_valid, hit_s)
+    torch.testing.assert_close(local_s, hit_s)
+
+    broken_point = model.helix_point(per_hit, local_s)
+    single_point = model.helix_point(expanded, hit_s)
+    torch.testing.assert_close(broken_point, single_point)
+    torch.testing.assert_close(
+        model.helix_tangent(per_hit, local_s), model.helix_tangent(expanded, hit_s)
+    )
+
+    broken_grad = torch.autograd.grad(broken_point.sum(), reference, retain_graph=True)[0]
+    single_grad = torch.autograd.grad(single_point.sum(), reference)[0]
+    torch.testing.assert_close(broken_grad, single_grad)
+
+
+def test_zero_kinks_are_a_no_op_even_when_nodes_are_active():
+    model = importlib.import_module("scripts.helix_model")
+    reference = _reference()
+    node_s = torch.tensor([[100.0, 300.0]], dtype=torch.float64)
+    node_valid = torch.ones((1, 2), dtype=torch.bool)
+    kinks = torch.zeros((1, 2, 2), dtype=torch.float64)
+    hit_s = torch.tensor([[50.0, 200.0, 400.0]], dtype=torch.float64)
+
+    per_hit = model.broken_helix_track_parameters(
+        reference, kinks, node_s, node_valid, hit_s
+    )
+    local_s = model.broken_helix_local_path(node_s, node_valid, hit_s)
+    torch.testing.assert_close(
+        model.helix_point(per_hit, local_s),
+        model.helix_point(reference[:, None, :].expand(-1, 3, -1), hit_s),
+    )
+
+
+def test_both_kink_components_deflect_by_the_same_physical_angle():
+    """sigmaPhi = theta0 / sin(theta) makes the 2D prior isotropic in 3D."""
+    model = importlib.import_module("scripts.helix_model")
+    reference = _reference()
+    node_s = torch.tensor([[100.0]], dtype=torch.float64)
+    node_valid = torch.ones((1, 1), dtype=torch.bool)
+    delta = 1.0e-5
+
+    angles = []
+    for component in (0, 1):
+        kinks = torch.zeros((1, 1, 2), dtype=torch.float64)
+        kinks[0, 0, component] = delta
+        segments = model.broken_helix_segments(reference, kinks, node_s, node_valid)
+        zero = torch.zeros((1, 1), dtype=torch.float64)
+        incoming = model.helix_tangent(segments[:, 0:1, :], node_s)
+        outgoing = model.helix_tangent(segments[:, 1:2, :], zero)
+        incoming = incoming / incoming.norm(dim=-1, keepdim=True)
+        outgoing = outgoing / outgoing.norm(dim=-1, keepdim=True)
+        angles.append(
+            float(torch.acos((incoming * outgoing).sum(-1).clamp(-1.0, 1.0)))
+        )
+    assert angles[0] == pytest.approx(delta, rel=1e-5)
+    assert angles[1] == pytest.approx(delta, rel=1e-5)
+
+
+def test_segments_stay_continuous_in_position_across_every_kink():
+    model = importlib.import_module("scripts.helix_model")
+    reference = _reference()
+    node_s = torch.tensor([[80.0, 250.0, 500.0]], dtype=torch.float64)
+    node_valid = torch.ones((1, 3), dtype=torch.bool)
+    kinks = torch.tensor([[[2e-4, -1e-4], [-3e-4, 2e-4], [1e-4, 1e-4]]], dtype=torch.float64)
+
+    segments = model.broken_helix_segments(reference, kinks, node_s, node_valid)
+    origin_s = torch.cat(
+        (torch.zeros((1, 1), dtype=torch.float64), node_s), dim=1
+    )
+    for index in range(3):
+        arrival = model.helix_point(
+            segments[:, index, :], node_s[:, index] - origin_s[:, index]
+        )
+        departure = segments[:, index + 1, :3]
+        torch.testing.assert_close(arrival, departure)
+
+
+def test_padding_nodes_transfer_the_segment_unchanged():
+    model = importlib.import_module("scripts.helix_model")
+    reference = _reference()
+    node_s = torch.tensor([[80.0, 0.0, 250.0]], dtype=torch.float64)
+    node_valid = torch.tensor([[True, False, True]])
+    kinks = torch.tensor([[[2e-4, -1e-4], [9.9, 9.9], [-3e-4, 2e-4]]], dtype=torch.float64)
+
+    segments = model.broken_helix_segments(reference, kinks, node_s, node_valid)
+    # The masked node must neither move the origin nor apply its garbage kink.
+    torch.testing.assert_close(segments[:, 1, :], segments[:, 2, :])
+
+    compact = model.broken_helix_segments(
+        reference,
+        kinks[:, [0, 2], :],
+        node_s[:, [0, 2]],
+        torch.ones((1, 2), dtype=torch.bool),
+    )
+    torch.testing.assert_close(segments[:, 3, :], compact[:, 2, :])
+
+
+def test_hit_segment_assignment_is_deterministic_and_detached():
+    model = importlib.import_module("scripts.helix_model")
+    node_s = torch.tensor([[100.0, 300.0, 0.0]], dtype=torch.float64)
+    node_valid = torch.tensor([[True, True, False]])
+    hit_s = torch.tensor([[-50.0, 100.0, 150.0, 300.0, 900.0]], dtype=torch.float64)
+
+    first = model.assign_hit_segments(node_s, hit_s, node_valid)
+    second = model.assign_hit_segments(node_s, hit_s, node_valid)
+    assert first.dtype == torch.int64
+    assert not first.requires_grad
+    assert first.tolist() == second.tolist()
+    # A hit exactly on a node belongs to the segment after that node.
+    assert first.tolist() == [[0, 1, 1, 2, 2]]
+
+
+def test_reference_reparameterisation_leaves_prediction_invariant():
+    """Regression for the frozen-reference coordinate contract.
+
+    Two validation rows fit their own reference helix, so the same physical
+    track gets different ``s`` origins.  Node arc lengths are therefore not
+    transferable, but once each row recomputes them against its own frozen
+    reference the segment assignment and the predicted global points must agree.
+    """
+    model = importlib.import_module("scripts.helix_model")
+    reference = _reference()
+    shift = 137.0
+
+    # Same trajectory, origin moved forward along it: a pure re-parameterisation.
+    x0, y0, z0, psi0, tanl, rho = reference[0].tolist()
+    moved_origin = model.helix_point(
+        reference, torch.tensor([shift], dtype=torch.float64)
+    )
+    shifted = torch.tensor(
+        [[*moved_origin[0].tolist(), psi0 + rho * shift, tanl, rho]],
+        dtype=torch.float64,
+    )
+    del x0, y0, z0, psi0
+
+    node_positions = model.helix_point(
+        reference[:, None, :].expand(-1, 3, -1),
+        torch.tensor([[80.0, 250.0, 500.0]], dtype=torch.float64),
+    )
+    hit_positions = model.helix_point(
+        reference[:, None, :].expand(-1, 4, -1),
+        torch.tensor([[40.0, 150.0, 300.0, 700.0]], dtype=torch.float64),
+    )
+    node_valid = torch.ones((1, 3), dtype=torch.bool)
+    kinks = torch.tensor([[[2e-4, -1e-4], [-3e-4, 2e-4], [1e-4, 1e-4]]], dtype=torch.float64)
+
+    predictions = []
+    assignments = []
+    for frozen in (reference, shifted):
+        node_s, node_ok = model.node_arc_lengths(frozen, node_positions, node_valid)
+        hit_s, _hit_ok = model.node_arc_lengths(
+            frozen, hit_positions, torch.ones((1, 4), dtype=torch.bool)
+        )
+        assert bool(node_ok.all())
+        assignments.append(model.assign_hit_segments(node_s, hit_s, node_valid).tolist())
+        per_hit = model.broken_helix_track_parameters(
+            frozen, kinks, node_s, node_valid, hit_s
+        )
+        local_s = model.broken_helix_local_path(node_s, node_valid, hit_s)
+        predictions.append(model.helix_point(per_hit, local_s))
+
+    # The two rows disagree on s by the shift ...
+    assert assignments[0] == assignments[1]
+    # ... but must agree on every predicted global position.
+    torch.testing.assert_close(predictions[0], predictions[1], atol=1e-9, rtol=0)
+
+
+def test_broken_helix_accepts_a_nodeless_track():
+    """N == 0 is the single-helix arm of the paired holdout, not an edge case.
+
+    Both arms must go through this same code so the comparison cannot be
+    confounded by two different optimisers.
+    """
+    module = importlib.import_module("scripts.helix_model")
+    reference = torch.tensor([[1.0, 2.0, 0.0, 0.3, 0.5, 1.0e-4]], dtype=torch.float64)
+    node_s = torch.zeros((1, 0), dtype=torch.float64)
+    node_valid = torch.zeros((1, 0), dtype=torch.bool)
+    kinks = torch.zeros((1, 0, 2), dtype=torch.float64)
+    hit_s = torch.tensor([[50.0, 200.0, 400.0]], dtype=torch.float64)
+
+    origins = module.segment_origin_path(node_s, node_valid)
+    assert origins.shape == (1, 1)
+    assert bool((origins == 0).all())
+    assert module.assign_hit_segments(node_s, hit_s, node_valid).tolist() == [[0, 0, 0]]
+
+    per_hit = module.broken_helix_track_parameters(
+        reference, kinks, node_s, node_valid, hit_s
+    )
+    expected = reference[:, None, :].expand(-1, 3, -1)
+    torch.testing.assert_close(per_hit, expected)

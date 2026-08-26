@@ -11,7 +11,10 @@ the final prediction reference: ``predicted_local - measured_local``.
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
 import json
+import math
 import re
 import sys
 from dataclasses import dataclass
@@ -44,19 +47,31 @@ try:
     from .helix_model import (
         S_MAX,
         accept_newton_candidate,
+        assemble_track_parameters,
+        broken_helix_track_parameters,
+        assign_hit_segments,
         closest_helix_points,
         helix_point,
         helix_tangent,
+        highland_kink_sigma,
         intersect_plane,
+        node_arc_lengths,
+        split_track_parameters,
     )
 except ImportError:  # Direct script execution.
     from helix_model import (
         S_MAX,
         accept_newton_candidate,
+        assemble_track_parameters,
+        broken_helix_track_parameters,
+        assign_hit_segments,
         closest_helix_points,
         helix_point,
         helix_tangent,
+        highland_kink_sigma,
         intersect_plane,
+        node_arc_lengths,
+        split_track_parameters,
     )
 
 
@@ -66,6 +81,11 @@ DEFAULT_MIN_EXTRAPOLATION_FIT_HITS = 4
 DEFAULT_MIN_EXTRAPOLATION_FIT_SPAN = 100.0
 DEFAULT_MAX_TRACKS = 1000
 DEFAULT_FIT_ITERS = 200
+#: ``fit_iters`` only bounds the Adam arm.  Gauss-Newton is the default because
+#: Iteration 14 measured Adam stopping on budget rather than at the optimum;
+#: ``adam`` stays reachable so that finding can be reproduced, not because it is
+#: a supported way to run the validation.
+FIT_SOLVERS = ("gauss-newton", "adam")
 DEFAULT_GEOMETRY_TOLERANCE = 1e-3
 DEFAULT_MAX_INTERSECTION_FAILURE_RATE = 0.05
 DEFAULT_MAX_PIXEL_LOCAL_RMSE = 0.05
@@ -104,6 +124,12 @@ class HelixValidationConfig:
     max_direction_angle_rms: float = DEFAULT_MAX_DIRECTION_ANGLE_RMS
     context_hits_before: int = DEFAULT_CONTEXT_HITS_BEFORE
     context_hits_after: int = DEFAULT_CONTEXT_HITS_AFTER
+    model: str = "both"
+    material_artifact: str | None = None
+    material_artifact_energy_loss: str | None = None
+    on_missing_material: str = "fail"
+    broken_fit_iters: int = 60
+    fit_solver: str = "gauss-newton"
 
 
 @dataclass
@@ -1555,6 +1581,18 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
     ):
         if value < 0:
             raise ValueError(f"{name} must be non-negative.")
+    if config.model not in {"single", "broken", "both"}:
+        raise ValueError("model must be one of single, broken, both.")
+    if config.on_missing_material not in {"fail", "drop"}:
+        raise ValueError("on_missing_material must be fail or drop.")
+    if config.broken_fit_iters < 1:
+        raise ValueError("broken_fit_iters must be at least 1.")
+    if config.fit_solver not in FIT_SOLVERS:
+        raise ValueError(
+            f"fit_solver must be one of {', '.join(sorted(FIT_SOLVERS))}."
+        )
+    if config.model == "broken" and not config.material_artifact:
+        raise ValueError("--model broken requires --material-artifact.")
     for input_path, label in (
         (config.states, "nominal trackstates"),
         (config.geometry, "current geometry"),
@@ -1562,6 +1600,17 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
     ):
         if not Path(input_path).exists():
             raise FileNotFoundError(f"{label} does not exist: {input_path}")
+    # Gate 4 runs only when a material artifact is supplied; ``--model single``
+    # keeps the legacy single-helix-only run even if one is.
+    run_gate4 = bool(config.material_artifact) and config.model != "single"
+    material = (
+        load_material_artifact(config.material_artifact) if run_gate4 else None
+    )
+    energy_loss_material = (
+        load_material_artifact(config.material_artifact_energy_loss)
+        if run_gate4 and config.material_artifact_energy_loss
+        else None
+    )
 
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1574,6 +1623,19 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
             "nominal_trackstates": config.states,
             "current_geometry": config.geometry,
             "nominal_full_geometry": config.nominal_full_geometry,
+            **(
+                {"material_artifact": config.material_artifact}
+                if config.material_artifact
+                else {}
+            ),
+            **(
+                {
+                    "material_artifact_energy_loss":
+                        config.material_artifact_energy_loss
+                }
+                if config.material_artifact_energy_loss
+                else {}
+            ),
         },
         outputs={
             "summary": output_dir / "helix_validation_summary.json",
@@ -1644,14 +1706,34 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
     seeded_parameters = seed_helices(
         batches, n_iter=config.fit_iters, device=device, dtype=dtype
     )
-    fitted_parameters = fit_helices_to_measurements(
-        batches,
-        geometry,
-        seeded_parameters,
-        n_iter=config.fit_iters,
-        device=device,
-        dtype=dtype,
-    )
+    if config.fit_solver == "gauss-newton":
+        fitted_parameters, fit_diagnostics = fit_helices_gauss_newton(
+            batches,
+            geometry,
+            seeded_parameters,
+            max_iters=config.broken_fit_iters,
+            device=device,
+            dtype=dtype,
+        )
+    else:
+        fitted_parameters = fit_helices_to_measurements(
+            batches,
+            geometry,
+            seeded_parameters,
+            n_iter=config.fit_iters,
+            device=device,
+            dtype=dtype,
+        )
+        fit_diagnostics = {
+            "solver": "adam",
+            "iterations": config.fit_iters,
+            "stationarity": stationarity_report(
+                measurement_newton_decrement(
+                    batches, geometry, fitted_parameters,
+                    device=device, dtype=dtype,
+                )
+            ),
+        }
     initial = evaluate_helix_on_surfaces(
         initial_parameters, batches, geometry
     )
@@ -1717,6 +1799,18 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
         layer_local_limits=layer_local_limits,
         max_direction_angle_rms=config.max_direction_angle_rms,
     )
+    # A refit that never reached its optimum makes every downstream residual a
+    # statement about the optimiser, not about the model.  The same threshold
+    # already gates the Gate 4 arms.
+    stalled = fit_diagnostics["stationarity"]["non_stationary_row_fraction"]
+    if stalled > MAX_NON_STATIONARY_ROW_FRACTION:
+        passed = False
+        failure_reasons = list(failure_reasons) + [
+            f"measurement refit ({fit_diagnostics['solver']}): {stalled:.4f} of "
+            f"rows are non-stationary (Newton decrement > "
+            f"{NEWTON_DECREMENT_STATIONARY}), above the pre-registered "
+            f"{MAX_NON_STATIONARY_ROW_FRACTION}"
+        ]
     summary = {
         "passed": passed,
         "failure_reasons": failure_reasons,
@@ -1745,7 +1839,14 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
             "max_strip_loc0_rmse_mm": config.max_strip_loc0_rmse,
             "max_strip_loc1_rmse_mm": config.max_strip_loc1_rmse,
             "max_direction_angle_rms_rad": config.max_direction_angle_rms,
+            "model": config.model,
+            "material_artifact": config.material_artifact,
+            "material_artifact_energy_loss": config.material_artifact_energy_loss,
+            "on_missing_material": config.on_missing_material,
+            "broken_fit_iters": config.broken_fit_iters,
+            "fit_solver": config.fit_solver,
         },
+        "measurement_fit": json_safe(fit_diagnostics),
         "geometry_consistency": geometry_report,
         "n_tracks": len(batches.event_track_ids),
         "n_fit_hits": int(batches.fit_mask.sum()),
@@ -1762,6 +1863,37 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
         "holdout_by_layer_and_mode": holdout_by_layer_and_mode,
         "smt_diagnostics": smt_diagnostics,
     }
+    if run_gate4:
+        broken_gate = run_paired_holdout(
+            batches,
+            geometry,
+            fitted_parameters,
+            material,
+            holdout_layers,
+            output_dir,
+            device=device,
+            dtype=dtype,
+            model=config.model,
+            on_missing_material=config.on_missing_material,
+            max_iters=config.broken_fit_iters,
+            energy_loss_material=energy_loss_material,
+        )
+        summary["broken_helix_gate"] = json_safe(broken_gate)
+        if broken_gate["status"] != "passed":
+            summary["passed"] = False
+            summary["failure_reasons"] = list(summary["failure_reasons"]) + [
+                f"broken-helix gate {broken_gate['status']}: {reason}"
+                for reason in broken_gate["reasons"]
+            ]
+    else:
+        summary["broken_helix_gate"] = {
+            "status": "skipped",
+            "reason": (
+                "no --material-artifact supplied"
+                if not config.material_artifact
+                else "--model single"
+            ),
+        }
     comparison_frame = build_comparison_frame(
         batches,
         initial_parameters,
@@ -1795,6 +1927,11 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
             / "helix_measurement_comparison.csv",
             "smt_comparison": output_dir / "helix_smt_comparison.csv",
             "plots": output_dir / "plots",
+            **(
+                {"holdout_keys": output_dir / "holdout_keys.csv"}
+                if run_gate4
+                else {}
+            ),
         },
         metrics={"validation_summary": summary},
     )
@@ -1841,6 +1978,46 @@ def print_validation_summary(summary: dict, output_dir: Path) -> None:
             f"{angle_text:>14} "
             f"{comparison['fitted_intersection_failure_rate'] or 0.0:>11.2%}"
         )
+    gate = summary.get("broken_helix_gate", {})
+    if gate.get("status") not in (None, "skipped"):
+        print("\n=== Gate 4: paired single vs broken helix ===")
+        print(
+            f"rows={gate['n_rows_used']}/{gate['n_rows_total']} "
+            f"keys_sha256={gate['holdout_keys_sha256'][:16]}... "
+            f"nodes_in_window={gate['nodes_in_window']}"
+        )
+        header = (
+            f"{'Group':<40} {'N':>6} {'RMSE single':>13} {'RMSE broken':>13} "
+            f"{'dRMSE 95% CI':>24} {'dNLL 95% CI':>24}"
+        )
+        print(header)
+        for layer_key, by_mode in gate["groups"].items():
+            for mode, by_component in by_mode.items():
+                for name, entry in by_component.items():
+                    if entry["n"] == 0:
+                        continue
+                    rmse = entry["relative_rmse_change"]
+                    nll = entry["delta_mean_nll"]
+
+                    def cell(value, spec):
+                        return (
+                            "n/a".rjust(int(re.sub(r"[^0-9]", "", spec.split(".")[0]) or 0))
+                            if value is None or not math.isfinite(value)
+                            else format(value, spec)
+                        )
+
+                    print(
+                        f"{layer_key + ' ' + mode + ' ' + name:<40} {entry['n']:>6} "
+                        f"{cell(entry['single']['rmse_mm'], '>13.6f')} "
+                        f"{cell(entry['broken']['rmse_mm'], '>13.6f')} "
+                        f"[{cell(rmse['low'], '>+9.3%')},{cell(rmse['high'], '>+9.3%')}] "
+                        f"[{cell(nll['low'], '>+10.4g')},{cell(nll['high'], '>+10.4g')}]"
+                    )
+        print(f"Broken-helix gate: {gate['status'].upper()}")
+        print(
+            "Energy-loss re-verification: "
+            f"{gate['energy_loss_reverification']['status']}"
+        )
     state = "PASS" if summary["passed"] else "FAIL"
     print(f"Result: {state}")
     for reason in summary["failure_reasons"]:
@@ -1879,6 +2056,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tracks", type=int, default=defaults.max_tracks)
     parser.add_argument("--fit-iters", type=int, default=defaults.fit_iters)
     parser.add_argument(
+        "--fit-solver",
+        choices=FIT_SOLVERS,
+        default=defaults.fit_solver,
+        help=(
+            "Solver for the measurement refit. gauss-newton is the default; "
+            "adam reproduces the pre-Iteration-14 behaviour and is not expected "
+            "to reach the optimum."
+        ),
+    )
+    parser.add_argument(
         "--context-hits-before", type=int, default=defaults.context_hits_before
     )
     parser.add_argument(
@@ -1915,6 +2102,38 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=float,
         default=defaults.max_direction_angle_rms,
     )
+    parser.add_argument(
+        "--model",
+        choices=("single", "broken", "both"),
+        default=defaults.model,
+        help=(
+            "Which track model to evaluate against the material artifact. Both "
+            "arms always run in one process on one shared row set."
+        ),
+    )
+    parser.add_argument(
+        "--material-artifact",
+        type=absolute_project_path,
+        default=defaults.material_artifact,
+        help="Schema-1.1 material NPZ from scripts/material_artifact.py.",
+    )
+    parser.add_argument(
+        "--material-artifact-energy-loss",
+        type=absolute_project_path,
+        default=defaults.material_artifact_energy_loss,
+        help=(
+            "Optional second artifact exported with energyLoss=True; supplying it "
+            "runs the Gate 0 energy-loss re-verification that is still open."
+        ),
+    )
+    parser.add_argument(
+        "--on-missing-material",
+        choices=("fail", "drop"),
+        default=defaults.on_missing_material,
+    )
+    parser.add_argument(
+        "--broken-fit-iters", type=int, default=defaults.broken_fit_iters
+    )
     return parser
 
 
@@ -1930,6 +2149,7 @@ def config_from_args(args: argparse.Namespace) -> HelixValidationConfig:
         min_extrapolation_fit_span=args.min_extrapolation_fit_span,
         max_tracks=args.max_tracks,
         fit_iters=args.fit_iters,
+        fit_solver=args.fit_solver,
         context_hits_before=args.context_hits_before,
         context_hits_after=args.context_hits_after,
         gpu=args.gpu,
@@ -1941,6 +2161,11 @@ def config_from_args(args: argparse.Namespace) -> HelixValidationConfig:
         max_strip_loc0_rmse=args.max_strip_loc0_rmse,
         max_strip_loc1_rmse=args.max_strip_loc1_rmse,
         max_direction_angle_rms=args.max_direction_angle_rms,
+        model=args.model,
+        material_artifact=args.material_artifact,
+        material_artifact_energy_loss=args.material_artifact_energy_loss,
+        on_missing_material=args.on_missing_material,
+        broken_fit_iters=args.broken_fit_iters,
     )
 
 
@@ -1960,6 +2185,1741 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Helix validation error: {exc}", file=sys.stderr)
         return 2
     return 0 if summary["passed"] else 1
+
+
+
+
+# ---------------------------------------------------------------------------
+# Posterior and predictive covariance
+# ---------------------------------------------------------------------------
+
+#: Objective convention.  Everything below assumes ``F = 0.5 * chi2`` so that the
+#: Gauss-Newton Hessian IS the posterior precision with no extra factor.  Using
+#: the chi2 Hessian instead would report exactly half the true variance, which is
+#: why ``tests/test_validate_helix_model.py`` cross-checks the scale against a
+#: Monte-Carlo sampling covariance rather than against this same formula.
+HALF_CHI2_OBJECTIVE = True
+
+#: Pre-registered at Gate 1.  The scan is a sensitivity diagnostic only: the
+#: production value must never be chosen after looking at the scan.
+PRODUCTION_DAMPING = 1e-10
+DAMPING_SCAN = (0.0, 1e-12, 1e-10, 1e-8, 1e-6)
+
+
+def gauss_newton_hessian(
+    jacobian: torch.Tensor,
+    variance: torch.Tensor,
+    prior_precision: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return ``J^T V^-1 J + Q^-1``, the posterior precision of ``F = 0.5 chi2``.
+
+    ``jacobian`` is ``[n_residual, n_parameter]`` and ``variance`` holds the
+    per-component measurement variances, matching the repository's diagonal
+    measurement-covariance contract.  ``prior_precision`` carries the scattering
+    prior ``blkdiag(Q_j^-1)`` padded to the full parameter vector.
+    """
+    weighted = jacobian / variance.unsqueeze(-1)
+    hessian = jacobian.transpose(-1, -2) @ weighted
+    if prior_precision is not None:
+        hessian = hessian + prior_precision
+    return 0.5 * (hessian + hessian.transpose(-1, -2))
+
+
+def predictive_covariance(
+    hessian: torch.Tensor,
+    prediction_jacobian: torch.Tensor,
+    damping: float = PRODUCTION_DAMPING,
+) -> tuple[torch.Tensor, dict[str, float | bool]]:
+    """Propagate the posterior onto a prediction: ``J C J^T`` with ``C = H^-1``.
+
+    The inverse is never formed.  A Cholesky factorisation plus a triangular
+    solve is both cheaper and better conditioned, and it fails loudly on an
+    indefinite Hessian instead of silently returning garbage.
+
+    Damping is applied relative to the mean diagonal so it means the same thing
+    across the very different scales of the reference parameters and the kinks.
+    """
+    symmetric = 0.5 * (hessian + hessian.transpose(-1, -2))
+    eigenvalues = torch.linalg.eigvalsh(symmetric)
+    # Accepts one Hessian or a batch of them; diagnostics report the worst case
+    # across the batch so a single bad track cannot hide behind an average.
+    minimum = float(eigenvalues[..., 0].min())
+    maximum = float(eigenvalues[..., -1].max())
+    scale = symmetric.diagonal(dim1=-2, dim2=-1).mean(dim=-1)
+    identity = torch.eye(
+        symmetric.shape[-1], device=symmetric.device, dtype=symmetric.dtype
+    )
+    regularized = symmetric + damping * scale[..., None, None] * identity
+    factor = torch.linalg.cholesky(regularized)
+    solved = torch.cholesky_solve(prediction_jacobian.transpose(-1, -2), factor)
+    covariance = prediction_jacobian @ solved
+    covariance = 0.5 * (covariance + covariance.transpose(-1, -2))
+    diagnostics = {
+        "cholesky_ok": True,
+        "damping": float(damping),
+        "symmetry_residual": float(
+            (hessian - hessian.transpose(-1, -2)).norm()
+            / hessian.norm().clamp_min(torch.finfo(hessian.dtype).tiny)
+        ),
+        "batch_size": int(hessian.shape[0]) if hessian.ndim == 3 else 1,
+        "min_eigenvalue": minimum,
+        "max_eigenvalue": maximum,
+        "condition_number": float("inf") if minimum <= 0 else maximum / minimum,
+    }
+    return covariance, diagnostics
+
+
+# ---------------------------------------------------------------------------
+# Broken-helix MAP fit
+# ---------------------------------------------------------------------------
+
+GAUSS_NEWTON_MAX_ITERS = 60
+#: Relative, not absolute.  The reference helix carries a near-degenerate
+#: "slide the origin along the trajectory" direction: freezing ``node_s`` stops
+#: it being an exact gauge, but it still sits ~12 orders below the stiffest
+#: mode.  An absolute objective-decrease test therefore never fires -- the
+#: solver keeps crawling along that direction long after the fit is converged
+#: in every quantity anyone reads out.
+GAUSS_NEWTON_TOLERANCE = 1e-10
+GAUSS_NEWTON_INITIAL_DAMPING = 1e-8
+GAUSS_NEWTON_MIN_DAMPING = 1e-12
+
+
+def reference_gauge_frame(
+    reference: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fix the reference helix's gauge: an origin and two transverse axes.
+
+    Sliding ``(x0, y0, z0)`` along the trajectory while rotating ``psi0`` by
+    ``rho * ds`` traces the identical curve, so the six reference parameters
+    are one redundant.  Freezing ``node_s`` breaks that degeneracy only through
+    the kinks moving with the origin, which is an O(kink) effect -- in practice
+    ~12 orders below the stiffest mode, leaving the normal equations singular
+    for every practical purpose.
+
+    Constraining the origin to the plane through it perpendicular to the
+    initial direction removes the redundancy outright, exactly as a perigee or
+    reference-surface convention does.  The frame belongs to the linearisation
+    point and is held fixed for the whole fit.
+    """
+    direction = helix_tangent(reference, torch.zeros_like(reference[:, 0]))
+    direction = direction / direction.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    helper = torch.zeros_like(direction)
+    helper[:, 2] = 1.0
+    # Fall back to x when the track runs along z and the cross product vanishes.
+    degenerate = direction[:, 2].abs() > 1.0 - 1e-6
+    helper[degenerate] = torch.tensor(
+        [1.0, 0.0, 0.0], dtype=helper.dtype, device=helper.device
+    )
+    axis0 = torch.cross(helper, direction, dim=-1)
+    axis0 = axis0 / axis0.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    axis1 = torch.cross(direction, axis0, dim=-1)
+    return reference[:, :3].clone(), axis0, axis1
+
+
+def _pack_parameters(reference: torch.Tensor, kinks: torch.Tensor) -> torch.Tensor:
+    """Stack the gauge-fixed reference and every kink into one vector per track.
+
+    The two transverse origin offsets start at zero by construction, so the
+    frame returned by :func:`reference_gauge_frame` must accompany this vector
+    everywhere it is unpacked.  Curvature is carried in the optimiser's scaled
+    units so one step size means the same thing for millimetres, radians and
+    inverse millimetres.
+    """
+    _linear, rho_scaled = split_track_parameters(reference)
+    offsets = torch.zeros((reference.shape[0], 2), dtype=reference.dtype, device=reference.device)
+    return torch.cat(
+        (offsets, reference[:, 3:5], rho_scaled, kinks.flatten(start_dim=1)), dim=1
+    )
+
+
+def _unpack_parameters(
+    theta: torch.Tensor, n_nodes: int, frame: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    origin, axis0, axis1 = frame
+    position = origin + theta[:, 0:1] * axis0 + theta[:, 1:2] * axis1
+    reference = assemble_track_parameters(
+        torch.cat((position, theta[:, 2:4]), dim=1), theta[:, 4:5]
+    )
+    kinks = theta[:, 5:].reshape(theta.shape[0], n_nodes, 2)
+    return reference, kinks
+
+
+def broken_helix_local_prediction(
+    reference: torch.Tensor,
+    kinks: torch.Tensor,
+    node_s: torch.Tensor,
+    node_valid: torch.Tensor,
+    hit_s: torch.Tensor,
+    centers: torch.Tensor,
+    rotations: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Predict local (LOC0, LOC1) on every surface through the broken helix.
+
+    ``hit_s`` is only used to pick each hit's segment; the arc length that
+    actually reaches the surface comes from the plane intersection, so a kink
+    upstream moves the prediction exactly as it should.
+    """
+    per_hit = broken_helix_track_parameters(
+        reference, kinks, node_s, node_valid, hit_s
+    )
+    _path, intersections, valid = intersect_plane(
+        per_hit, centers, rotations[..., :, 2], n_newton=12
+    )
+    local3 = torch.matmul(
+        rotations.transpose(-1, -2), (intersections - centers).unsqueeze(-1)
+    ).squeeze(-1)
+    return local3[..., :2], valid
+
+
+def _standardized_residual(
+    theta: torch.Tensor,
+    n_nodes: int,
+    frame: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    node_s: torch.Tensor,
+    node_valid: torch.Tensor,
+    kink_sigma: torch.Tensor,
+    measured: torch.Tensor,
+    variance: torch.Tensor,
+    mask: torch.Tensor,
+    hit_s: torch.Tensor,
+    centers: torch.Tensor,
+    rotations: torch.Tensor,
+) -> torch.Tensor:
+    """Return ``[T, 2H + 2N]``: whitened measurements stacked on whitened kinks.
+
+    Writing the scattering prior as extra standardized residuals makes the
+    Gauss-Newton normal equations exactly ``J^T J = H`` of ``F = 0.5 chi2``,
+    with no separate prior term to get the factor wrong on.
+    """
+    reference, kinks = _unpack_parameters(theta, n_nodes, frame)
+    local, valid = broken_helix_local_prediction(
+        reference, kinks, node_s, node_valid, hit_s, centers, rotations
+    )
+    residual = (measured - local) / variance.clamp_min(EPS_VARIANCE).sqrt()
+    active = mask & valid.unsqueeze(-1)
+    residual = torch.where(active, residual, torch.zeros_like(residual))
+    prior = kinks / kink_sigma.clamp_min(EPS_VARIANCE).unsqueeze(-1)
+    prior = torch.where(
+        node_valid.unsqueeze(-1), prior, torch.zeros_like(prior)
+    )
+    return torch.cat((residual.flatten(1), prior.flatten(1)), dim=1)
+
+
+def _single_track_residual(
+    theta: torch.Tensor,
+    origin: torch.Tensor,
+    axis0: torch.Tensor,
+    axis1: torch.Tensor,
+    node_s: torch.Tensor,
+    node_valid: torch.Tensor,
+    kink_sigma: torch.Tensor,
+    measured: torch.Tensor,
+    variance: torch.Tensor,
+    mask: torch.Tensor,
+    hit_s: torch.Tensor,
+    centers: torch.Tensor,
+    rotations: torch.Tensor,
+) -> torch.Tensor:
+    """Single-track wrapper so ``vmap`` can differentiate one row at a time."""
+    return _standardized_residual(
+        theta.unsqueeze(0),
+        node_s.shape[0],
+        (origin.unsqueeze(0), axis0.unsqueeze(0), axis1.unsqueeze(0)),
+        node_s.unsqueeze(0),
+        node_valid.unsqueeze(0),
+        kink_sigma.unsqueeze(0),
+        measured.unsqueeze(0),
+        variance.unsqueeze(0),
+        mask.unsqueeze(0),
+        hit_s.unsqueeze(0),
+        centers.unsqueeze(0),
+        rotations.unsqueeze(0),
+    ).squeeze(0)
+
+
+_BATCHED_RESIDUAL_JACOBIAN = torch.func.vmap(
+    torch.func.jacrev(_single_track_residual, argnums=0)
+)
+
+
+def fit_broken_helix(
+    reference: torch.Tensor,
+    kinks: torch.Tensor,
+    node_s: torch.Tensor,
+    node_valid: torch.Tensor,
+    kink_sigma: torch.Tensor,
+    measured: torch.Tensor,
+    variance: torch.Tensor,
+    mask: torch.Tensor,
+    hit_s: torch.Tensor,
+    centers: torch.Tensor,
+    rotations: torch.Tensor,
+    max_iters: int = GAUSS_NEWTON_MAX_ITERS,
+    damping: float = GAUSS_NEWTON_INITIAL_DAMPING,
+    tolerance: float = GAUSS_NEWTON_TOLERANCE,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float | bool]]:
+    """MAP-fit the reference helix and its kinks by damped Gauss-Newton.
+
+    Gauss-Newton rather than Adam: the closure that validates the scattering
+    prior needs the actual MAP, and a first-order optimiser stopped after a
+    fixed budget leaves a shrinkage bias that is indistinguishable from a
+    mis-scaled prior.  Each track carries its own damping and a step is kept
+    only when its objective decreases, so a bad linearisation costs one
+    iteration instead of the fit.
+    """
+    n_nodes = node_s.shape[1]
+    frame = reference_gauge_frame(reference)
+    arguments = (
+        node_s,
+        node_valid,
+        kink_sigma,
+        measured,
+        variance,
+        mask,
+        hit_s,
+        centers,
+        rotations,
+    )
+    theta = _pack_parameters(reference, kinks).clone()
+
+    def residual_of(values: torch.Tensor) -> torch.Tensor:
+        return _standardized_residual(values, n_nodes, frame, *arguments)
+
+    def objective(values: torch.Tensor) -> torch.Tensor:
+        return 0.5 * residual_of(values).square().sum(dim=1)
+
+    current = objective(theta)
+    initial = float(current.mean())
+    identity = torch.eye(theta.shape[1], dtype=theta.dtype, device=theta.device)
+    level = torch.full((theta.shape[0], 1, 1), float(damping), dtype=theta.dtype)
+    converged = False
+    iterations = 0
+    gradient = torch.zeros_like(theta)
+    for iterations in range(1, max_iters + 1):
+        jacobian = _BATCHED_RESIDUAL_JACOBIAN(theta, *frame, *arguments)
+        residual = residual_of(theta)
+        hessian = jacobian.transpose(1, 2) @ jacobian
+        gradient = (jacobian.transpose(1, 2) @ residual.unsqueeze(-1)).squeeze(-1)
+        scale = hessian.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1e-30)
+        regularized = hessian + level * scale[:, None, None] * identity
+        step = torch.linalg.solve(regularized, -gradient.unsqueeze(-1)).squeeze(-1)
+        candidate = theta + step
+        candidate_objective = objective(candidate)
+        improved = candidate_objective < current
+        theta = torch.where(improved.unsqueeze(-1), candidate, theta)
+        level = torch.where(
+            improved[:, None, None],
+            (level * 0.1).clamp_min(GAUSS_NEWTON_MIN_DAMPING),
+            level * 10.0,
+        )
+        decrease = (current - candidate_objective).clamp_min(0.0) / current.abs().clamp_min(1.0)
+        current = torch.where(improved, candidate_objective, current)
+        change = float(decrease.max())
+        if change < tolerance:
+            converged = True
+            break
+    final_reference, final_kinks = _unpack_parameters(theta, n_nodes, frame)
+    return (
+        final_reference.detach(),
+        final_kinks.detach(),
+        {
+            "converged": bool(converged),
+            "iterations": int(iterations),
+            "initial_objective": initial,
+            "final_objective": float(current.mean()),
+            "max_relative_decrease": float(change),
+            "max_gradient_norm": float(gradient.norm(dim=1).max()),
+        },
+    )
+
+
+def _broken_predictive_pieces(
+    reference: torch.Tensor,
+    kinks: torch.Tensor,
+    node_s: torch.Tensor,
+    node_valid: torch.Tensor,
+    kink_sigma: torch.Tensor,
+    variance: torch.Tensor,
+    mask: torch.Tensor,
+    hit_s: torch.Tensor,
+    centers: torch.Tensor,
+    rotations: torch.Tensor,
+    holdout_s: torch.Tensor,
+    holdout_centers: torch.Tensor,
+    holdout_rotations: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Posterior precision and prediction Jacobian, before any damping.
+
+    Split out so a damping scan reuses one pair of expensive ``vmap`` Jacobian
+    passes instead of recomputing them per damping value.
+    """
+    n_nodes = node_s.shape[1]
+    frame = reference_gauge_frame(reference)
+    theta = _pack_parameters(reference, kinks)
+    arguments = (
+        node_s,
+        node_valid,
+        kink_sigma,
+        torch.zeros_like(variance),
+        variance,
+        mask,
+        hit_s,
+        centers,
+        rotations,
+    )
+    jacobian = _BATCHED_RESIDUAL_JACOBIAN(theta, *frame, *arguments)
+    hessian = jacobian.transpose(1, 2) @ jacobian
+
+    def predict(values: torch.Tensor) -> torch.Tensor:
+        predicted_reference, predicted_kinks = _unpack_parameters(values, n_nodes, frame)
+        local, _valid = broken_helix_local_prediction(
+            predicted_reference,
+            predicted_kinks,
+            node_s,
+            node_valid,
+            holdout_s,
+            holdout_centers,
+            holdout_rotations,
+        )
+        return local.flatten(1)
+
+    def predict_single(theta_row, origin_row, axis0_row, axis1_row, node_s_row,
+                       node_valid_row, holdout_row, center_row, rotation_row):
+        predicted_reference, predicted_kinks = _unpack_parameters(
+            theta_row.unsqueeze(0),
+            n_nodes,
+            (origin_row.unsqueeze(0), axis0_row.unsqueeze(0), axis1_row.unsqueeze(0)),
+        )
+        local, _valid = broken_helix_local_prediction(
+            predicted_reference,
+            predicted_kinks,
+            node_s_row.unsqueeze(0),
+            node_valid_row.unsqueeze(0),
+            holdout_row.unsqueeze(0),
+            center_row.unsqueeze(0),
+            rotation_row.unsqueeze(0),
+        )
+        return local.squeeze(0).flatten()
+
+    prediction_jacobian = torch.func.vmap(
+        torch.func.jacrev(predict_single, argnums=0)
+    )(theta, *frame, node_s, node_valid, holdout_s, holdout_centers, holdout_rotations)
+
+    predicted = predict(theta).reshape(holdout_s.shape[0], -1, 2)
+    return predicted.detach(), hessian, prediction_jacobian
+
+
+def broken_helix_predictive_distribution(
+    reference: torch.Tensor,
+    kinks: torch.Tensor,
+    node_s: torch.Tensor,
+    node_valid: torch.Tensor,
+    kink_sigma: torch.Tensor,
+    variance: torch.Tensor,
+    mask: torch.Tensor,
+    hit_s: torch.Tensor,
+    centers: torch.Tensor,
+    rotations: torch.Tensor,
+    holdout_s: torch.Tensor,
+    holdout_centers: torch.Tensor,
+    holdout_rotations: torch.Tensor,
+    damping: float = PRODUCTION_DAMPING,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Predict held-out surfaces and propagate the posterior onto them.
+
+    The returned variance covers only the fitted parameters.  Callers add the
+    held-out surface's own measurement variance before forming a pull; the
+    point of the exercise is that leaving the parameter term out is exactly the
+    error that made the single helix look mis-calibrated.
+    """
+    predicted, hessian, prediction_jacobian = _broken_predictive_pieces(
+        reference,
+        kinks,
+        node_s,
+        node_valid,
+        kink_sigma,
+        variance,
+        mask,
+        hit_s,
+        centers,
+        rotations,
+        holdout_s,
+        holdout_centers,
+        holdout_rotations,
+    )
+    covariance, _diagnostics = predictive_covariance(
+        hessian, prediction_jacobian, damping=damping
+    )
+    return predicted, covariance.diagonal(dim1=1, dim2=2).reshape(
+        holdout_s.shape[0], -1, 2
+    ).detach()
+
+
+# ---------------------------------------------------------------------------
+# Gate 4: paired single/broken held-out comparison
+# ---------------------------------------------------------------------------
+
+#: All of the following were pre-registered at Gate 1 and must not be tuned
+#: after looking at a result.  See ``docs/history/ml_optimization_log.md``.
+BOOTSTRAP_RESAMPLES = 1000
+BOOTSTRAP_SEED = 20260825
+MIN_GROUP_COMPONENTS = 200
+INTERPOLATION_RMSE_IMPROVEMENT = 0.20
+EXTRAPOLATION_RMSE_REGRESSION = 0.05
+PREDICTIVE_CHI2_BAND = (0.7, 1.5)
+MAX_ABS_PULL_MEAN = 0.2
+MAX_MISSING_MATERIAL_FRACTION = 0.02
+#: Gate 0 left the energy-loss item open; these close it or reopen the choice.
+ENERGY_LOSS_MAX_SEGMENT_FLIP_RATE = 0.0
+ENERGY_LOSS_MAX_PREDICTION_SIGMA_P99 = 0.10
+#: Registered before the diagnostic was ever evaluated: if more than this share of
+#: rows is still non-stationary, the run is a numerical failure and its verdict
+#: says nothing about the physics either way.
+MAX_NON_STATIONARY_ROW_FRACTION = 0.01
+
+COMPONENT_NAMES = ("LOC0", "LOC1")
+MODEL_ARMS = ("single", "broken")
+
+#: A group with no statistics cannot vacuum-pass the gate: every entry here must
+#: reach ``MIN_GROUP_COMPONENTS`` or the whole verdict is ``inconclusive``.
+REQUIRED_MODES = PREDICTION_MODES
+REQUIRED_COMPONENT = "LOC0"
+
+MATERIAL_ARTIFACT_FIELDS = (
+    "event_nr",
+    "track_nr",
+    "q_over_p_gev_inv",
+    "node_offsets",
+    "position_mm",
+    "x_over_x0",
+)
+
+
+def json_safe(value):
+    """Replace non-finite floats with ``None`` so the summary stays valid JSON.
+
+    ``inf`` shows up honestly -- an undamped condition number, a bootstrap CI
+    with no finite resamples -- and the summary is written with
+    ``allow_nan=False`` on purpose, so it has to be represented rather than
+    silently dropped.
+    """
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, bool) or isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return value
+
+
+@dataclass
+class MaterialNodes:
+    """Per-track material budget, addressed by ``(event_nr, track_nr)``."""
+
+    lookup: dict[tuple[int, int], tuple[int, int, int]]
+    position_mm: np.ndarray
+    x_over_x0: np.ndarray
+    q_over_p_gev_inv: np.ndarray
+    source: str
+
+
+def load_material_artifact(path: str | Path) -> MaterialNodes:
+    """Read a schema-1.1 material NPZ and index it by track key."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"material artifact does not exist: {path}")
+    with np.load(path) as data:
+        missing = [name for name in MATERIAL_ARTIFACT_FIELDS if name not in data.files]
+        if missing:
+            raise KeyError(
+                f"material artifact {path} is missing fields: {sorted(missing)}"
+            )
+        event_nr = np.asarray(data["event_nr"], dtype=np.int64)
+        track_nr = np.asarray(data["track_nr"], dtype=np.int64)
+        offsets = np.asarray(data["node_offsets"], dtype=np.int64)
+        position_mm = np.asarray(data["position_mm"], dtype=np.float64)
+        x_over_x0 = np.asarray(data["x_over_x0"], dtype=np.float64)
+        q_over_p = np.asarray(data["q_over_p_gev_inv"], dtype=np.float64)
+    if offsets.shape[0] != event_nr.shape[0] + 1:
+        raise ValueError("node_offsets length does not match the track count.")
+    lookup: dict[tuple[int, int], tuple[int, int, int]] = {}
+    for row, (event, track) in enumerate(zip(event_nr.tolist(), track_nr.tolist())):
+        key = (int(event), int(track))
+        if key in lookup:
+            raise ValueError(f"duplicate track key in material artifact: {key}")
+        lookup[key] = (int(offsets[row]), int(offsets[row + 1]), row)
+    return MaterialNodes(
+        lookup=lookup,
+        position_mm=position_mm,
+        x_over_x0=x_over_x0,
+        q_over_p_gev_inv=q_over_p,
+        source=str(path),
+    )
+
+
+def material_row_coverage(
+    batches: TrackBatches, material: MaterialNodes
+) -> tuple[list[int], list[tuple[int, int]]]:
+    """Split batch rows into those with material and those without."""
+    present: list[int] = []
+    missing: list[tuple[int, int]] = []
+    for row in range(batches.event_track_ids.shape[0]):
+        key = (
+            int(batches.event_track_ids[row, 0]),
+            int(batches.event_track_ids[row, 1]),
+        )
+        if key in material.lookup:
+            present.append(row)
+        else:
+            missing.append(key)
+    return present, missing
+
+
+def filter_track_batches(batches: TrackBatches, rows: list[int]) -> TrackBatches:
+    """Keep the given batch rows.  Both arms must be handed the same result."""
+    if not rows:
+        raise ValueError("No batch rows survive material matching.")
+    index = torch.tensor(rows, dtype=torch.long)
+    return TrackBatches(
+        measured_local=batches.measured_local[index],
+        measurement_variance=batches.measurement_variance[index],
+        loc1_valid=batches.loc1_valid[index],
+        smt_local=batches.smt_local[index],
+        sensor_idx=batches.sensor_idx[index],
+        hit_mask=batches.hit_mask[index],
+        fit_mask=batches.fit_mask[index],
+        holdout_mask=batches.holdout_mask[index],
+        g_smt=batches.g_smt[index],
+        p_smt=batches.p_smt[index],
+        volume_id=batches.volume_id[index],
+        layer_id=batches.layer_id[index],
+        module_id=batches.module_id[index],
+        event_track_ids=batches.event_track_ids[index],
+        fit_span=batches.fit_span[index],
+        prediction_mode=tuple(batches.prediction_mode[row] for row in rows),
+        context_hits_before=batches.context_hits_before[index],
+        context_hits_after=batches.context_hits_after[index],
+        nearest_context_distance=batches.nearest_context_distance[index],
+        farthest_context_distance=batches.farthest_context_distance[index],
+    )
+
+
+def gather_row_nodes(
+    batches: TrackBatches,
+    material: MaterialNodes,
+    device: str | torch.device = "cpu",
+    dtype=torch.float64,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad each row's material nodes to a common width.
+
+    The same physical track appears in several rows -- one per held-out hit and
+    prediction mode -- and its nodes are copied into every one of them.  That is
+    deliberate: each row is an independent local fit with its own window.
+    """
+    n_rows = batches.event_track_ids.shape[0]
+    spans = []
+    for row in range(n_rows):
+        key = (
+            int(batches.event_track_ids[row, 0]),
+            int(batches.event_track_ids[row, 1]),
+        )
+        spans.append(material.lookup[key])
+    max_nodes = max((hi - lo) for lo, hi, _ in spans)
+    position = torch.zeros((n_rows, max_nodes, 3), dtype=dtype, device=device)
+    x_over_x0 = torch.zeros((n_rows, max_nodes), dtype=dtype, device=device)
+    present = torch.zeros((n_rows, max_nodes), dtype=torch.bool, device=device)
+    q_over_p = torch.zeros(n_rows, dtype=dtype, device=device)
+    for row, (lo, hi, track_row) in enumerate(spans):
+        count = hi - lo
+        position[row, :count] = torch.as_tensor(
+            material.position_mm[lo:hi], dtype=dtype, device=device
+        )
+        x_over_x0[row, :count] = torch.as_tensor(
+            material.x_over_x0[lo:hi], dtype=dtype, device=device
+        )
+        present[row, :count] = True
+        q_over_p[row] = float(material.q_over_p_gev_inv[track_row])
+    return position, x_over_x0, present, q_over_p
+
+
+@dataclass
+class BrokenHelixInputs:
+    """Everything the broken-helix solver needs for one arm, already frozen."""
+
+    node_s: torch.Tensor
+    node_valid: torch.Tensor
+    kink_sigma: torch.Tensor
+    hit_s: torch.Tensor
+    centers: torch.Tensor
+    rotations: torch.Tensor
+    measured: torch.Tensor
+    variance: torch.Tensor
+    mask: torch.Tensor
+    holdout_s: torch.Tensor
+    holdout_centers: torch.Tensor
+    holdout_rotations: torch.Tensor
+    holdout_measured: torch.Tensor
+    holdout_variance: torch.Tensor
+    holdout_loc1_valid: torch.Tensor
+    n_nodes_in_window: torch.Tensor
+
+
+def prepare_broken_inputs(
+    batches: TrackBatches,
+    geometry: NominalGeometry,
+    reference: torch.Tensor,
+    node_position: torch.Tensor | None,
+    node_x_over_x0: torch.Tensor | None,
+    node_present: torch.Tensor | None,
+    q_over_p: torch.Tensor | None,
+    device: str | torch.device = "cpu",
+    dtype=torch.float64,
+) -> BrokenHelixInputs:
+    """Freeze the linearisation: recompute every arc length from ``reference``.
+
+    ``node_s`` and ``hit_s`` come from the same frozen helix, which is the only
+    way the window clip and the segment assignment can be mutually consistent --
+    the exporter's own path length is a different gauge and is never used here.
+    Passing ``node_position=None`` builds the nodeless (single-helix) arm, which
+    then runs through exactly the same solver.
+    """
+    reference = reference.to(device=device, dtype=dtype)
+    n_rows, n_hits = batches.hit_mask.shape
+    sensor_idx = batches.sensor_idx.to(device=device)
+    centers = geometry.centers.to(device=device, dtype=dtype)[sensor_idx]
+    rotations = geometry.rotations.to(device=device, dtype=dtype)[sensor_idx]
+    measured = batches.measured_local.to(device=device, dtype=dtype)
+    variance = batches.measurement_variance.to(device=device, dtype=dtype)
+    fit_mask = batches.fit_mask.to(device=device)
+    holdout_mask = batches.holdout_mask.to(device=device)
+    hit_mask = batches.hit_mask.to(device=device)
+    loc1_valid = batches.loc1_valid.to(device=device)
+
+    points = batches.g_smt.to(device=device, dtype=dtype)
+    _fitted, hit_s, _ok = closest_helix_points(
+        reference[:, None, :].expand(-1, n_hits, -1), points
+    )
+    hit_s = hit_s.detach()
+
+    # Fit window: only material the trajectory actually crosses between the
+    # first and last hit of THIS row may bend it.  Without the clip an
+    # extrapolating row would pick up kinks it never traverses.
+    large = torch.full_like(hit_s, float("inf"))
+    window_low = torch.where(hit_mask, hit_s, large).min(dim=1).values
+    window_high = torch.where(hit_mask, hit_s, -large).max(dim=1).values
+
+    if node_position is None:
+        node_s = hit_s.new_zeros((n_rows, 0))
+        node_valid = torch.zeros((n_rows, 0), dtype=torch.bool, device=device)
+        kink_sigma = hit_s.new_zeros((n_rows, 0))
+    else:
+        node_s, node_ok = node_arc_lengths(reference, node_position, node_present)
+        inside = (node_s >= window_low[:, None]) & (node_s <= window_high[:, None])
+        node_valid = node_ok & inside
+        kink_sigma = highland_kink_sigma(
+            torch.where(node_valid, node_x_over_x0, torch.zeros_like(node_x_over_x0)),
+            q_over_p,
+        )
+        # The segment recursion walks nodes in index order, so valid nodes must
+        # be sorted by arc length; masked ones are parked at the end.
+        order = torch.argsort(
+            torch.where(node_valid, node_s, torch.full_like(node_s, float("inf"))),
+            dim=1,
+        )
+        node_s = torch.gather(node_s, 1, order)
+        node_valid = torch.gather(node_valid, 1, order)
+        kink_sigma = torch.gather(kink_sigma, 1, order)
+        keep = int(node_valid.sum(dim=1).max())
+        node_s = node_s[:, :keep].contiguous()
+        node_valid = node_valid[:, :keep].contiguous()
+        kink_sigma = kink_sigma[:, :keep].contiguous()
+
+    component_mask = torch.stack((fit_mask, fit_mask & loc1_valid), dim=-1)
+    holdout_index = holdout_mask.to(torch.int64).argmax(dim=1)
+    rows = torch.arange(n_rows, device=device)
+    return BrokenHelixInputs(
+        node_s=node_s,
+        node_valid=node_valid,
+        kink_sigma=kink_sigma,
+        hit_s=hit_s,
+        centers=centers,
+        rotations=rotations,
+        measured=measured,
+        variance=variance,
+        mask=component_mask,
+        holdout_s=hit_s[rows, holdout_index][:, None],
+        holdout_centers=centers[rows, holdout_index][:, None],
+        holdout_rotations=rotations[rows, holdout_index][:, None],
+        holdout_measured=measured[rows, holdout_index][:, None],
+        holdout_variance=variance[rows, holdout_index][:, None],
+        holdout_loc1_valid=loc1_valid[rows, holdout_index],
+        n_nodes_in_window=node_valid.sum(dim=1),
+    )
+
+
+#: One ``vmap``-of-``jacrev`` pass materialises a [rows, residuals, parameters]
+#: Jacobian plus its autograd intermediates, so a full-detector run is chunked.
+#: Rows are independent, which makes the split exact rather than approximate.
+BROKEN_ARM_CHUNK_ROWS = 2048
+
+
+def _slice_inputs(inputs: BrokenHelixInputs, start: int, stop: int) -> BrokenHelixInputs:
+    return BrokenHelixInputs(
+        **{
+            name: getattr(inputs, name)[start:stop]
+            for name in inputs.__dataclass_fields__
+        }
+    )
+
+
+def run_broken_arm(
+    inputs: BrokenHelixInputs,
+    reference: torch.Tensor,
+    dampings: tuple[float, ...] = DAMPING_SCAN,
+    production_damping: float = PRODUCTION_DAMPING,
+    max_iters: int = GAUSS_NEWTON_MAX_ITERS,
+    chunk_rows: int = BROKEN_ARM_CHUNK_ROWS,
+) -> dict:
+    """MAP-fit one arm and evaluate it on the held-out surface, in row chunks."""
+    n_rows = reference.shape[0]
+    if chunk_rows <= 0 or n_rows <= chunk_rows:
+        return _run_broken_arm_chunk(
+            inputs, reference, dampings, production_damping, max_iters
+        )
+    chunks = [
+        _run_broken_arm_chunk(
+            _slice_inputs(inputs, start, start + chunk_rows),
+            reference[start : start + chunk_rows],
+            dampings,
+            production_damping,
+            max_iters,
+        )
+        for start in range(0, n_rows, chunk_rows)
+    ]
+    merged = {
+        name: torch.cat([chunk[name] for chunk in chunks], dim=0)
+        for name in (
+            "reference",
+            "kinks",
+            "predicted",
+            "predictive_variance",
+            "intersection_valid",
+            "segment_of_hit",
+            "newton_decrement",
+        )
+    }
+    merged["predictive_variance_by_damping"] = {
+        damping: (
+            None
+            if any(
+                chunk["predictive_variance_by_damping"][damping] is None
+                for chunk in chunks
+            )
+            else torch.cat(
+                [chunk["predictive_variance_by_damping"][damping] for chunk in chunks],
+                dim=0,
+            )
+        )
+        for damping in chunks[0]["predictive_variance_by_damping"]
+    }
+    merged["convergence"] = _merge_convergence(
+        [chunk["convergence"] for chunk in chunks],
+        [float(chunk["predicted"].shape[0]) for chunk in chunks],
+    )
+    merged["covariance_diagnostics"] = {
+        key: _merge_covariance_diagnostics(
+            [chunk["covariance_diagnostics"][key] for chunk in chunks]
+        )
+        for key in chunks[0]["covariance_diagnostics"]
+    }
+    return merged
+
+
+def _merge_covariance_diagnostics(entries: list[dict]) -> dict:
+    """Worst case across chunks, so one bad track cannot average itself away."""
+    failures = [entry for entry in entries if "error" in entry]
+    if failures:
+        return {"error": failures[0]["error"], "n_failed_chunks": len(failures)}
+    return {
+        "cholesky_ok": all(entry["cholesky_ok"] for entry in entries),
+        "damping": entries[0]["damping"],
+        "symmetry_residual": max(entry["symmetry_residual"] for entry in entries),
+        "batch_size": sum(entry["batch_size"] for entry in entries),
+        "min_eigenvalue": min(entry["min_eigenvalue"] for entry in entries),
+        "max_eigenvalue": max(entry["max_eigenvalue"] for entry in entries),
+        "condition_number": max(entry["condition_number"] for entry in entries),
+    }
+
+
+#: A row counts as stationary when the Newton decrement -- the objective drop the
+#: quadratic model still promises -- is below this.  ``max_gradient_norm`` alone
+#: cannot decide it: the gradient is in whitened units, so a row with a 0.01 mm
+#: sigma carries a numerically large gradient while sitting at its optimum.
+NEWTON_DECREMENT_STATIONARY = 1.0e-6
+
+
+def newton_decrement(
+    reference: torch.Tensor,
+    kinks: torch.Tensor,
+    node_s: torch.Tensor,
+    node_valid: torch.Tensor,
+    kink_sigma: torch.Tensor,
+    measured: torch.Tensor,
+    variance: torch.Tensor,
+    mask: torch.Tensor,
+    hit_s: torch.Tensor,
+    centers: torch.Tensor,
+    rotations: torch.Tensor,
+    damping: float = GAUSS_NEWTON_MIN_DAMPING,
+) -> torch.Tensor:
+    """Per-row ``g^T H^-1 g``: the objective decrease still on the table.
+
+    This is the scale-free convergence statement.  Reporting it per row is what
+    lets a negative physics result be separated from a handful of rows whose
+    linearisation stalled.
+    """
+    n_nodes = node_s.shape[1]
+    frame = reference_gauge_frame(reference)
+    arguments = (
+        node_s, node_valid, kink_sigma, measured, variance, mask,
+        hit_s, centers, rotations,
+    )
+    theta = _pack_parameters(reference, kinks)
+    jacobian = _BATCHED_RESIDUAL_JACOBIAN(theta, *frame, *arguments)
+    residual = _standardized_residual(theta, n_nodes, frame, *arguments)
+    hessian = jacobian.transpose(1, 2) @ jacobian
+    gradient = (jacobian.transpose(1, 2) @ residual.unsqueeze(-1)).squeeze(-1)
+    scale = hessian.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1e-30)
+    identity = torch.eye(theta.shape[1], dtype=theta.dtype, device=theta.device)
+    regularized = hessian + damping * scale[:, None, None] * identity
+    step = torch.linalg.solve(regularized, gradient.unsqueeze(-1)).squeeze(-1)
+    return (gradient * step).sum(dim=1).detach()
+
+
+def stationarity_report(decrement: torch.Tensor) -> dict[str, float | int]:
+    """Summarise per-row Newton decrements into the pre-registered gate inputs."""
+    finite = decrement[torch.isfinite(decrement)]
+    quantile = (
+        (lambda q: float(finite.quantile(q)))
+        if finite.numel()
+        else (lambda q: float("nan"))
+    )
+    return {
+        "stationary_threshold": NEWTON_DECREMENT_STATIONARY,
+        "non_stationary_row_fraction": (
+            float((decrement > NEWTON_DECREMENT_STATIONARY).to(torch.float64).mean())
+            if decrement.numel()
+            else 0.0
+        ),
+        "n_non_finite": int(decrement.numel() - finite.numel()),
+        "newton_decrement_p50": quantile(0.50),
+        "newton_decrement_p90": quantile(0.90),
+        "newton_decrement_p99": quantile(0.99),
+        "newton_decrement_max": float(finite.max()) if finite.numel() else float("nan"),
+    }
+
+
+def _merge_convergence(stats: list[dict], weights: list[float]) -> dict:
+    """Row-count weighted objectives, worst case for every failure statistic."""
+    total = float(sum(weights)) or 1.0
+    share = [weight / total for weight in weights]
+    return {
+        "converged": all(entry["converged"] for entry in stats),
+        "iterations": max(entry["iterations"] for entry in stats),
+        "initial_objective": float(
+            sum(w * entry["initial_objective"] for w, entry in zip(share, stats))
+        ),
+        "final_objective": float(
+            sum(w * entry["final_objective"] for w, entry in zip(share, stats))
+        ),
+        "max_relative_decrease": max(entry["max_relative_decrease"] for entry in stats),
+        "max_gradient_norm": max(entry["max_gradient_norm"] for entry in stats),
+        "n_chunks": len(stats),
+    }
+
+
+def _measurement_fit_inputs(
+    batches: TrackBatches,
+    geometry: NominalGeometry,
+    parameters: torch.Tensor,
+    device: str | torch.device = "cpu",
+    dtype=torch.float64,
+) -> BrokenHelixInputs:
+    """The nodeless (single-helix) inputs: one frozen linearisation per row."""
+    return prepare_broken_inputs(
+        batches, geometry, parameters, None, None, None, None,
+        device=device, dtype=dtype,
+    )
+
+
+def fit_helices_gauss_newton(
+    batches: TrackBatches,
+    geometry: NominalGeometry,
+    initial_parameters: torch.Tensor,
+    max_iters: int = GAUSS_NEWTON_MAX_ITERS,
+    chunk_rows: int = BROKEN_ARM_CHUNK_ROWS,
+    device: str | torch.device = "cpu",
+    dtype=torch.float64,
+) -> tuple[torch.Tensor, dict]:
+    """Refit helices to the non-holdout measurements by damped Gauss-Newton.
+
+    This is ``fit_helices_to_measurements`` minus the optimiser.  The objective,
+    the component mask and the held-out surface are identical; only the way the
+    minimum is reached changes.  Iteration 14 measured the difference on real
+    data: Adam stopped on budget at 17:8 interpolation LOC0 RMSE 0.076 mm where
+    the same objective, solved properly, reaches 0.022 mm.  What Iteration 10
+    read as unmodelled multiple scattering was largely this gap.
+
+    Runs through ``fit_broken_helix`` with zero nodes rather than a second
+    solver, so the main path and the Gate 4 single arm cannot drift apart.
+    """
+    reference = initial_parameters.to(device=device, dtype=dtype)
+    inputs = _measurement_fit_inputs(
+        batches, geometry, reference, device=device, dtype=dtype
+    )
+    n_rows = reference.shape[0]
+    step = n_rows if chunk_rows <= 0 else chunk_rows
+    fitted: list[torch.Tensor] = []
+    decrements: list[torch.Tensor] = []
+    stats: list[dict] = []
+    weights: list[float] = []
+    for start in range(0, n_rows, max(step, 1)):
+        stop = min(start + max(step, 1), n_rows)
+        piece = _slice_inputs(inputs, start, stop)
+        kinks = piece.node_s.new_zeros((stop - start, 0, 2))
+        block, block_kinks, block_stats = fit_broken_helix(
+            reference[start:stop],
+            kinks,
+            piece.node_s,
+            piece.node_valid,
+            piece.kink_sigma,
+            piece.measured,
+            piece.variance,
+            piece.mask,
+            piece.hit_s,
+            piece.centers,
+            piece.rotations,
+            max_iters=max_iters,
+        )
+        fitted.append(block)
+        decrements.append(
+            newton_decrement(
+                block,
+                block_kinks,
+                piece.node_s,
+                piece.node_valid,
+                piece.kink_sigma,
+                piece.measured,
+                piece.variance,
+                piece.mask,
+                piece.hit_s,
+                piece.centers,
+                piece.rotations,
+            )
+        )
+        stats.append(block_stats)
+        weights.append(float(stop - start))
+    parameters = torch.cat(fitted, dim=0)
+    decrement = torch.cat(decrements, dim=0)
+    return parameters, {
+        "solver": "gauss-newton",
+        "convergence": _merge_convergence(stats, weights),
+        "stationarity": stationarity_report(decrement),
+    }
+
+
+def measurement_newton_decrement(
+    batches: TrackBatches,
+    geometry: NominalGeometry,
+    parameters: torch.Tensor,
+    chunk_rows: int = BROKEN_ARM_CHUNK_ROWS,
+    device: str | torch.device = "cpu",
+    dtype=torch.float64,
+) -> torch.Tensor:
+    """Per-row ``g^T H^-1 g`` of the measurement fit, whatever produced it.
+
+    Applying the same scale-free stationarity test to the Adam output is how
+    "the solver stopped early" becomes a measured statement rather than an
+    inference from a large whitened gradient norm.  Chunked for the same reason
+    the arms are: one ``jacrev`` pass materialises a full per-row Jacobian.
+    """
+    reference = parameters.to(device=device, dtype=dtype)
+    inputs = _measurement_fit_inputs(
+        batches, geometry, reference, device=device, dtype=dtype
+    )
+    n_rows = reference.shape[0]
+    step = n_rows if chunk_rows <= 0 else chunk_rows
+    pieces = []
+    for start in range(0, n_rows, max(step, 1)):
+        stop = min(start + max(step, 1), n_rows)
+        piece = _slice_inputs(inputs, start, stop)
+        pieces.append(
+            newton_decrement(
+                reference[start:stop],
+                piece.node_s.new_zeros((stop - start, 0, 2)),
+                piece.node_s,
+                piece.node_valid,
+                piece.kink_sigma,
+                piece.measured,
+                piece.variance,
+                piece.mask,
+                piece.hit_s,
+                piece.centers,
+                piece.rotations,
+            )
+        )
+    return torch.cat(pieces, dim=0)
+
+
+def _run_broken_arm_chunk(
+    inputs: BrokenHelixInputs,
+    reference: torch.Tensor,
+    dampings: tuple[float, ...] = DAMPING_SCAN,
+    production_damping: float = PRODUCTION_DAMPING,
+    max_iters: int = GAUSS_NEWTON_MAX_ITERS,
+) -> dict:
+    """MAP-fit one arm and evaluate it on the held-out surface."""
+    n_rows = reference.shape[0]
+    n_nodes = inputs.node_s.shape[1]
+    kinks = inputs.node_s.new_zeros((n_rows, n_nodes, 2))
+    fitted_reference, fitted_kinks, stats = fit_broken_helix(
+        reference,
+        kinks,
+        inputs.node_s,
+        inputs.node_valid,
+        inputs.kink_sigma,
+        inputs.measured,
+        inputs.variance,
+        inputs.mask,
+        inputs.hit_s,
+        inputs.centers,
+        inputs.rotations,
+        max_iters=max_iters,
+    )
+    decrement = newton_decrement(
+        fitted_reference,
+        fitted_kinks,
+        inputs.node_s,
+        inputs.node_valid,
+        inputs.kink_sigma,
+        inputs.measured,
+        inputs.variance,
+        inputs.mask,
+        inputs.hit_s,
+        inputs.centers,
+        inputs.rotations,
+    )
+    predicted, hessian, prediction_jacobian = _broken_predictive_pieces(
+        fitted_reference,
+        fitted_kinks,
+        inputs.node_s,
+        inputs.node_valid,
+        inputs.kink_sigma,
+        inputs.variance,
+        inputs.mask,
+        inputs.hit_s,
+        inputs.centers,
+        inputs.rotations,
+        inputs.holdout_s,
+        inputs.holdout_centers,
+        inputs.holdout_rotations,
+    )
+    _local, valid = broken_helix_local_prediction(
+        fitted_reference,
+        fitted_kinks,
+        inputs.node_s,
+        inputs.node_valid,
+        inputs.holdout_s,
+        inputs.holdout_centers,
+        inputs.holdout_rotations,
+    )
+    variance_by_damping = {}
+    diagnostics_by_damping = {}
+    for damping in dict.fromkeys((*dampings, production_damping)):
+        try:
+            covariance, diagnostics = predictive_covariance(
+                hessian, prediction_jacobian, damping=damping
+            )
+        except torch.linalg.LinAlgError as error:
+            variance_by_damping[damping] = None
+            diagnostics_by_damping[damping] = {"error": str(error)}
+            continue
+        variance_by_damping[damping] = (
+            covariance.diagonal(dim1=1, dim2=2).reshape(n_rows, -1, 2).detach()
+        )
+        diagnostics_by_damping[damping] = diagnostics
+    production = variance_by_damping.get(production_damping)
+    if production is None:
+        raise FloatingPointError(
+            "Predictive covariance is not solvable at the pre-registered "
+            f"production damping {production_damping}."
+        )
+    return {
+        "reference": fitted_reference,
+        "kinks": fitted_kinks,
+        "convergence": stats,
+        "predicted": predicted[:, 0, :],
+        "predictive_variance": production[:, 0, :],
+        "predictive_variance_by_damping": {
+            key: None if value is None else value[:, 0, :]
+            for key, value in variance_by_damping.items()
+        },
+        "covariance_diagnostics": {
+            str(key): value for key, value in diagnostics_by_damping.items()
+        },
+        "newton_decrement": decrement,
+        "intersection_valid": valid[:, 0],
+        "segment_of_hit": assign_hit_segments(
+            inputs.node_s, inputs.holdout_s, inputs.node_valid
+        )[:, 0],
+    }
+
+
+def _component_arrays(
+    arm: dict, inputs: BrokenHelixInputs, component: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Residual, total sigma^2 and validity for one local component."""
+    residual = (arm["predicted"][:, component] - inputs.holdout_measured[:, 0, component])
+    total_variance = (
+        inputs.holdout_variance[:, 0, component].clamp_min(EPS_VARIANCE)
+        + arm["predictive_variance"][:, component].clamp_min(0.0)
+    )
+    valid = arm["intersection_valid"].clone()
+    if component == 1:
+        valid = valid & inputs.holdout_loc1_valid
+    valid = valid & torch.isfinite(residual) & torch.isfinite(total_variance)
+    return (
+        residual.detach().cpu().numpy(),
+        total_variance.detach().cpu().numpy(),
+        valid.detach().cpu().numpy(),
+    )
+
+
+def _diagonal_nll(residual: np.ndarray, total_variance: np.ndarray) -> np.ndarray:
+    """Component-wise diagonal Gaussian NLL, the pre-registered gate statistic."""
+    return 0.5 * (np.log(2.0 * math.pi * total_variance) + residual**2 / total_variance)
+
+
+def _rmse(values: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(values**2))) if values.size else float("nan")
+
+
+def paired_bootstrap_ci(
+    single: np.ndarray,
+    broken: np.ndarray,
+    statistic,
+    rng: np.random.Generator,
+    resamples: int = BOOTSTRAP_RESAMPLES,
+) -> dict[str, float]:
+    """Percentile CI of a paired statistic; rows are resampled together."""
+    n_rows = single.shape[0]
+    if n_rows == 0:
+        return {"point": float("nan"), "low": float("nan"), "high": float("nan")}
+    draws = rng.integers(0, n_rows, size=(resamples, n_rows))
+    samples = np.array(
+        [statistic(single[draw], broken[draw]) for draw in draws], dtype=np.float64
+    )
+    finite = samples[np.isfinite(samples)]
+    low, high = (
+        (float(np.percentile(finite, 2.5)), float(np.percentile(finite, 97.5)))
+        if finite.size
+        else (float("nan"), float("nan"))
+    )
+    return {
+        "point": float(statistic(single, broken)),
+        "low": low,
+        "high": high,
+        "n_finite_resamples": int(finite.size),
+    }
+
+
+def _relative_rmse_change(single: np.ndarray, broken: np.ndarray) -> float:
+    base = _rmse(single)
+    if not np.isfinite(base) or base <= 0.0:
+        return float("nan")
+    return (_rmse(broken) - base) / base
+
+
+def _mean_difference(single: np.ndarray, broken: np.ndarray) -> float:
+    return float(np.mean(broken) - np.mean(single))
+
+
+def compare_arms(
+    batches: TrackBatches,
+    inputs: BrokenHelixInputs,
+    arms: dict[str, dict],
+    holdout_layers,
+    rng: np.random.Generator,
+) -> dict:
+    """Per (layer, mode, component) paired comparison with bootstrap CIs."""
+    modes = np.array(batches.prediction_mode)
+    holdout_index = batches.holdout_mask.to(torch.int64).argmax(dim=1)
+    rows = torch.arange(batches.holdout_mask.shape[0])
+    holdout_volume = batches.volume_id[rows, holdout_index].numpy()
+    holdout_layer = batches.layer_id[rows, holdout_index].numpy()
+
+    arrays = {
+        arm: {
+            component: _component_arrays(arms[arm], inputs, component)
+            for component in (0, 1)
+        }
+        for arm in MODEL_ARMS
+    }
+    groups: dict[str, dict] = {}
+    for volume, layer in holdout_layers:
+        layer_key = f"{volume}:{layer}"
+        layer_rows = (holdout_volume == volume) & (holdout_layer == layer)
+        groups[layer_key] = {}
+        for mode in PREDICTION_MODES:
+            mode_rows = layer_rows & (modes == mode)
+            groups[layer_key][mode] = {}
+            for component, name in enumerate(COMPONENT_NAMES):
+                valid = mode_rows.copy()
+                for arm in MODEL_ARMS:
+                    valid &= arrays[arm][component][2]
+                selection = np.flatnonzero(valid)
+                entry = {
+                    "n": int(selection.size),
+                    "n_rows_in_group": int(np.count_nonzero(mode_rows)),
+                }
+                if selection.size == 0:
+                    groups[layer_key][mode][name] = entry
+                    continue
+                residuals = {}
+                nll = {}
+                for arm in MODEL_ARMS:
+                    residual, total_variance, _ok = arrays[arm][component]
+                    residuals[arm] = residual[selection]
+                    nll[arm] = _diagonal_nll(
+                        residual[selection], total_variance[selection]
+                    )
+                    pull = residual[selection] / np.sqrt(total_variance[selection])
+                    entry[arm] = {
+                        "rmse_mm": _rmse(residuals[arm]),
+                        "bias_mm": float(np.mean(residuals[arm])),
+                        "mean_nll": float(np.mean(nll[arm])),
+                        "pull_mean": float(np.mean(pull)),
+                        "pull_std": float(np.std(pull, ddof=1)) if pull.size > 1 else float("nan"),
+                        "predictive_chi2_per_component": float(np.mean(pull**2)),
+                        "intersection_failure_rate": float(
+                            1.0
+                            - np.count_nonzero(arrays[arm][component][2][mode_rows])
+                            / max(int(np.count_nonzero(mode_rows)), 1)
+                        ),
+                    }
+                entry["relative_rmse_change"] = paired_bootstrap_ci(
+                    residuals["single"], residuals["broken"], _relative_rmse_change, rng
+                )
+                entry["delta_mean_nll"] = paired_bootstrap_ci(
+                    nll["single"], nll["broken"], _mean_difference, rng
+                )
+                groups[layer_key][mode][name] = entry
+    return groups
+
+
+def _damping_sensitivity(
+    batches: TrackBatches,
+    inputs: BrokenHelixInputs,
+    arms: dict[str, dict],
+    holdout_layers,
+) -> dict:
+    """Does any gated conclusion flip across the pre-registered damping grid?"""
+    report: dict[str, dict] = {}
+    modes = np.array(batches.prediction_mode)
+    holdout_index = batches.holdout_mask.to(torch.int64).argmax(dim=1)
+    rows = torch.arange(batches.holdout_mask.shape[0])
+    holdout_volume = batches.volume_id[rows, holdout_index].numpy()
+    holdout_layer = batches.layer_id[rows, holdout_index].numpy()
+    for damping in DAMPING_SCAN:
+        entry: dict[str, dict] = {}
+        usable = True
+        for arm in MODEL_ARMS:
+            if arms[arm]["predictive_variance_by_damping"].get(damping) is None:
+                usable = False
+        if not usable:
+            report[str(damping)] = {"solvable": False}
+            continue
+        for volume, layer in holdout_layers:
+            layer_key = f"{volume}:{layer}"
+            entry[layer_key] = {}
+            layer_rows = (holdout_volume == volume) & (holdout_layer == layer)
+            for mode in PREDICTION_MODES:
+                mode_rows = layer_rows & (modes == mode)
+                per_component = {}
+                for component, name in enumerate(COMPONENT_NAMES):
+                    values = {}
+                    valid = mode_rows.copy()
+                    for arm in MODEL_ARMS:
+                        residual = (
+                            arms[arm]["predicted"][:, component]
+                            - inputs.holdout_measured[:, 0, component]
+                        )
+                        total = (
+                            inputs.holdout_variance[:, 0, component].clamp_min(EPS_VARIANCE)
+                            + arms[arm]["predictive_variance_by_damping"][damping][
+                                :, component
+                            ].clamp_min(0.0)
+                        )
+                        ok = arms[arm]["intersection_valid"].clone()
+                        if component == 1:
+                            ok = ok & inputs.holdout_loc1_valid
+                        ok = ok & torch.isfinite(residual) & torch.isfinite(total)
+                        values[arm] = (
+                            residual.detach().cpu().numpy(),
+                            total.detach().cpu().numpy(),
+                        )
+                        valid &= ok.detach().cpu().numpy()
+                    selection = np.flatnonzero(valid)
+                    if selection.size == 0:
+                        per_component[name] = None
+                        continue
+                    nll = {
+                        arm: float(
+                            np.mean(
+                                _diagonal_nll(
+                                    values[arm][0][selection], values[arm][1][selection]
+                                )
+                            )
+                        )
+                        for arm in MODEL_ARMS
+                    }
+                    per_component[name] = {
+                        "delta_mean_nll": nll["broken"] - nll["single"],
+                        "nll_improves": bool(nll["broken"] < nll["single"]),
+                    }
+                entry[layer_key][mode] = per_component
+        report[str(damping)] = {"solvable": True, "groups": entry}
+    verdicts: dict[str, set] = {}
+    for damping, payload in report.items():
+        if not payload.get("solvable"):
+            continue
+        for layer_key, by_mode in payload["groups"].items():
+            for mode, by_component in by_mode.items():
+                for name, values in by_component.items():
+                    if values is None:
+                        continue
+                    verdicts.setdefault(f"{layer_key}|{mode}|{name}", set()).add(
+                        values["nll_improves"]
+                    )
+    flipped = sorted(key for key, values in verdicts.items() if len(values) > 1)
+    return {"by_damping": report, "flipped_groups": flipped, "stable": not flipped}
+
+
+def write_holdout_keys(
+    path: Path, batches: TrackBatches, inputs: BrokenHelixInputs
+) -> str:
+    """Write the row identity list shared by both arms and return its SHA256."""
+    holdout_index = batches.holdout_mask.to(torch.int64).argmax(dim=1)
+    rows = torch.arange(batches.holdout_mask.shape[0])
+    sensor = batches.sensor_idx[rows, holdout_index].tolist()
+    holdout_s = inputs.holdout_s[:, 0].detach().cpu().numpy()
+    records = [
+        (
+            int(batches.event_track_ids[row, 0]),
+            int(batches.event_track_ids[row, 1]),
+            batches.prediction_mode[row],
+            int(sensor[row]),
+            float(holdout_s[row]),
+        )
+        for row in range(batches.holdout_mask.shape[0])
+    ]
+    records.sort()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(
+            ["event_nr", "track_nr", "mode", "holdout_sensor_idx", "holdout_path_s_mm"]
+        )
+        for record in records:
+            writer.writerow([record[0], record[1], record[2], record[3], f"{record[4]:.9e}"])
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def evaluate_broken_helix_gate(groups: dict, holdout_layers) -> tuple[str, list[str]]:
+    """Apply the pre-registered, mode-conditioned acceptance table."""
+    reasons: list[str] = []
+    inconclusive: list[str] = []
+    for volume, layer in holdout_layers:
+        layer_key = f"{volume}:{layer}"
+        for mode in REQUIRED_MODES:
+            entry = groups.get(layer_key, {}).get(mode, {}).get(REQUIRED_COMPONENT)
+            if entry is None or entry["n"] < MIN_GROUP_COMPONENTS:
+                count = 0 if entry is None else entry["n"]
+                inconclusive.append(
+                    f"required group {layer_key}|{mode}|{REQUIRED_COMPONENT} has "
+                    f"N={count} < {MIN_GROUP_COMPONENTS}"
+                )
+    for layer_key, by_mode in groups.items():
+        for mode, by_component in by_mode.items():
+            for name, entry in by_component.items():
+                if entry["n"] < MIN_GROUP_COMPONENTS:
+                    continue
+                label = f"{layer_key}|{mode}|{name}"
+                broken = entry["broken"]
+                if broken["intersection_failure_rate"] > DEFAULT_MAX_INTERSECTION_FAILURE_RATE:
+                    reasons.append(
+                        f"{label}: intersection failure rate "
+                        f"{broken['intersection_failure_rate']:.3f} > "
+                        f"{DEFAULT_MAX_INTERSECTION_FAILURE_RATE}"
+                    )
+                chi2 = broken["predictive_chi2_per_component"]
+                if not PREDICTIVE_CHI2_BAND[0] <= chi2 <= PREDICTIVE_CHI2_BAND[1]:
+                    reasons.append(
+                        f"{label}: predictive chi2/component {chi2:.3f} outside "
+                        f"{PREDICTIVE_CHI2_BAND}"
+                    )
+                if abs(broken["pull_mean"]) > MAX_ABS_PULL_MEAN:
+                    reasons.append(
+                        f"{label}: |pull mean| {abs(broken['pull_mean']):.3f} > "
+                        f"{MAX_ABS_PULL_MEAN}"
+                    )
+                nll_high = entry["delta_mean_nll"]["high"]
+                if not (np.isfinite(nll_high) and nll_high < 0.0):
+                    reasons.append(
+                        f"{label}: held-out NLL CI upper bound {nll_high:.4g} is not < 0"
+                    )
+                rmse_high = entry["relative_rmse_change"]["high"]
+                if mode == "interpolation" and name == "LOC0":
+                    limit = -INTERPOLATION_RMSE_IMPROVEMENT
+                    if not (np.isfinite(rmse_high) and rmse_high < limit):
+                        reasons.append(
+                            f"{label}: relative RMSE CI upper bound {rmse_high:.4g} is "
+                            f"not < {limit}"
+                        )
+                elif mode != "interpolation":
+                    limit = EXTRAPOLATION_RMSE_REGRESSION
+                    if not (np.isfinite(rmse_high) and rmse_high < limit):
+                        reasons.append(
+                            f"{label}: relative RMSE CI upper bound {rmse_high:.4g} is "
+                            f"not < {limit}"
+                        )
+    if inconclusive:
+        return "inconclusive", inconclusive + reasons
+    return ("passed" if not reasons else "failed"), reasons
+
+
+def energy_loss_reverification(
+    batches: TrackBatches,
+    geometry: NominalGeometry,
+    reference: torch.Tensor,
+    baseline: dict,
+    baseline_inputs: BrokenHelixInputs,
+    material: MaterialNodes,
+    device: str | torch.device,
+    dtype,
+    max_iters: int,
+) -> dict:
+    """Close (or reopen) the energy-loss item Gate 0 deliberately left open.
+
+    Gate 0 only bounded the effect by an order-of-magnitude argument.  This runs
+    the whole broken arm twice -- once on each node set -- and measures the two
+    quantities that were pre-registered there.
+    """
+    position, x_over_x0, present, q_over_p = gather_row_nodes(
+        batches, material, device=device, dtype=dtype
+    )
+    inputs = prepare_broken_inputs(
+        batches,
+        geometry,
+        reference,
+        position,
+        x_over_x0,
+        present,
+        q_over_p,
+        device=device,
+        dtype=dtype,
+    )
+    arm = run_broken_arm(inputs, reference, max_iters=max_iters)
+    flips = (arm["segment_of_hit"] != baseline["segment_of_hit"]).to(torch.float64)
+    flip_rate = float(flips.mean())
+    difference = (arm["predicted"] - baseline["predicted"]).abs()
+    sigma = baseline_inputs.holdout_variance[:, 0, :].clamp_min(EPS_VARIANCE).sqrt()
+    ratio = (difference / sigma).detach().cpu().numpy()
+    valid = (
+        baseline["intersection_valid"] & arm["intersection_valid"]
+    ).detach().cpu().numpy()
+    component_ratio = {}
+    worst = 0.0
+    for component, name in enumerate(COMPONENT_NAMES):
+        ok = valid.copy()
+        if component == 1:
+            ok &= baseline_inputs.holdout_loc1_valid.detach().cpu().numpy()
+        values = ratio[ok, component]
+        values = values[np.isfinite(values)]
+        p99 = float(np.percentile(values, 99)) if values.size else float("nan")
+        component_ratio[name] = {
+            "n": int(values.size),
+            "p99_ratio_to_sigma": p99,
+            "max_ratio_to_sigma": float(values.max()) if values.size else float("nan"),
+        }
+        if np.isfinite(p99):
+            worst = max(worst, p99)
+    passed = (
+        flip_rate <= ENERGY_LOSS_MAX_SEGMENT_FLIP_RATE
+        and worst <= ENERGY_LOSS_MAX_PREDICTION_SIGMA_P99
+    )
+    return {
+        "status": "closed" if passed else "open",
+        "artifact": material.source,
+        "segment_flip_rate": flip_rate,
+        "segment_flip_limit": ENERGY_LOSS_MAX_SEGMENT_FLIP_RATE,
+        "prediction_shift": component_ratio,
+        "prediction_shift_limit_p99": ENERGY_LOSS_MAX_PREDICTION_SIGMA_P99,
+        "convergence": arm["convergence"],
+    }
+
+
+def run_paired_holdout(
+    batches: TrackBatches,
+    geometry: NominalGeometry,
+    reference: torch.Tensor,
+    material: MaterialNodes,
+    holdout_layers,
+    output_dir: Path,
+    device: str | torch.device = "cpu",
+    dtype=torch.float64,
+    model: str = "both",
+    on_missing_material: str = "fail",
+    max_iters: int = GAUSS_NEWTON_MAX_ITERS,
+    energy_loss_material: MaterialNodes | None = None,
+) -> dict:
+    """Gate 4: run both arms on one shared row set and apply the gate."""
+    if model not in {"single", "broken", "both"}:
+        raise ValueError("model must be one of single, broken, both.")
+    if on_missing_material not in {"fail", "drop"}:
+        raise ValueError("on_missing_material must be fail or drop.")
+    present, missing = material_row_coverage(batches, material)
+    total_rows = batches.event_track_ids.shape[0]
+    missing_fraction = len(missing) / max(total_rows, 1)
+    if missing:
+        if on_missing_material == "fail":
+            raise ValueError(
+                f"{len(missing)} of {total_rows} batch rows have no material nodes; "
+                "pass --on-missing-material drop to accept a reduced row set."
+            )
+        if missing_fraction > MAX_MISSING_MATERIAL_FRACTION:
+            raise ValueError(
+                f"missing material fraction {missing_fraction:.4f} exceeds the "
+                f"pre-registered limit {MAX_MISSING_MATERIAL_FRACTION}"
+            )
+    # Both arms are handed this one object: identical rows by construction.
+    shared = filter_track_batches(batches, present) if missing else batches
+    reference = reference[torch.tensor(present, dtype=torch.long)] if missing else reference
+    reference = reference.to(device=device, dtype=dtype)
+
+    position, x_over_x0, node_present, q_over_p = gather_row_nodes(
+        shared, material, device=device, dtype=dtype
+    )
+    broken_inputs = prepare_broken_inputs(
+        shared, geometry, reference, position, x_over_x0, node_present, q_over_p,
+        device=device, dtype=dtype,
+    )
+    single_inputs = prepare_broken_inputs(
+        shared, geometry, reference, None, None, None, None, device=device, dtype=dtype
+    )
+    arms = {
+        "single": run_broken_arm(single_inputs, reference, max_iters=max_iters),
+        "broken": run_broken_arm(broken_inputs, reference, max_iters=max_iters),
+    }
+    keys_path = output_dir / "holdout_keys.csv"
+    keys_digest = write_holdout_keys(keys_path, shared, broken_inputs)
+    # Cheap but not redundant: the assertion is what turns "same object" from a
+    # code-reading claim into a checked one, and it costs one temporary file.
+    mirror = output_dir / "holdout_keys_single_arm.csv"
+    if write_holdout_keys(mirror, shared, single_inputs) != keys_digest:
+        raise ValueError("The two arms do not share an identical held-out row set.")
+    mirror.unlink()
+
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    groups = compare_arms(shared, broken_inputs, arms, holdout_layers, rng)
+    status, reasons = evaluate_broken_helix_gate(groups, holdout_layers)
+    sensitivity = _damping_sensitivity(shared, broken_inputs, arms, holdout_layers)
+    if not sensitivity["stable"]:
+        status = "failed" if status == "passed" else status
+        reasons.append(
+            "damping sensitivity: NLL verdict flips across the pre-registered grid "
+            f"for {sensitivity['flipped_groups']}"
+        )
+    stationarity = {}
+    for arm in MODEL_ARMS:
+        decrement = arms[arm]["newton_decrement"]
+        stationarity[arm] = stationarity_report(decrement)
+        fraction = stationarity[arm]["non_stationary_row_fraction"]
+        if fraction > MAX_NON_STATIONARY_ROW_FRACTION:
+            status = "inconclusive"
+            reasons.append(
+                f"{arm} arm: {fraction:.4f} of rows are non-stationary "
+                f"(Newton decrement > {NEWTON_DECREMENT_STATIONARY}), above the "
+                f"pre-registered {MAX_NON_STATIONARY_ROW_FRACTION}; this is a "
+                "numerical failure, not a physics result"
+            )
+    for arm in MODEL_ARMS:
+        if not arms[arm]["convergence"]["converged"]:
+            status = "failed" if status == "passed" else status
+            reasons.append(
+                f"{arm} arm did not converge (numerical failure, not a physics "
+                f"result): {arms[arm]['convergence']}"
+            )
+    energy_loss = {"status": "open", "reason": "no energyLoss=True artifact supplied"}
+    if energy_loss_material is not None:
+        energy_loss = energy_loss_reverification(
+            shared,
+            geometry,
+            reference,
+            arms["broken"],
+            broken_inputs,
+            energy_loss_material,
+            device,
+            dtype,
+            max_iters,
+        )
+    return {
+        "status": status,
+        "reasons": reasons,
+        "model": model,
+        "material_artifact": material.source,
+        "n_rows_total": total_rows,
+        "n_rows_used": int(shared.event_track_ids.shape[0]),
+        "n_rows_missing_material": len(missing),
+        "missing_material_fraction": missing_fraction,
+        "on_missing_material": on_missing_material,
+        "holdout_keys_sha256": keys_digest,
+        "holdout_keys_csv": str(keys_path),
+        "nodes_in_window": {
+            "min": int(broken_inputs.n_nodes_in_window.min()),
+            "median": int(broken_inputs.n_nodes_in_window.median()),
+            "max": int(broken_inputs.n_nodes_in_window.max()),
+        },
+        "convergence": {arm: arms[arm]["convergence"] for arm in MODEL_ARMS},
+        "stationarity": stationarity,
+        "covariance_diagnostics": {
+            arm: arms[arm]["covariance_diagnostics"] for arm in MODEL_ARMS
+        },
+        "groups": groups,
+        "damping_sensitivity": sensitivity,
+        "energy_loss_reverification": energy_loss,
+        "pre_registered": {
+            "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
+            "bootstrap_seed": BOOTSTRAP_SEED,
+            "min_group_components": MIN_GROUP_COMPONENTS,
+            "interpolation_rmse_improvement": INTERPOLATION_RMSE_IMPROVEMENT,
+            "extrapolation_rmse_regression": EXTRAPOLATION_RMSE_REGRESSION,
+            "predictive_chi2_band": list(PREDICTIVE_CHI2_BAND),
+            "max_abs_pull_mean": MAX_ABS_PULL_MEAN,
+            "production_damping": PRODUCTION_DAMPING,
+            "newton_decrement_stationary": NEWTON_DECREMENT_STATIONARY,
+            "max_non_stationary_row_fraction": MAX_NON_STATIONARY_ROW_FRACTION,
+            "damping_scan": list(DAMPING_SCAN),
+            "required_groups": [
+                f"{volume}:{layer}|{mode}|{REQUIRED_COMPONENT}"
+                for volume, layer in holdout_layers
+                for mode in REQUIRED_MODES
+            ],
+        },
+    }
 
 
 if __name__ == "__main__":
