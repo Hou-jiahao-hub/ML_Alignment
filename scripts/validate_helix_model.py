@@ -2320,7 +2320,12 @@ def predictive_covariance(
     # number wearing a physics label.  The standard numerical-rank test finds
     # them: on the full 20000-event set exactly one row of 70352 qualifies, a
     # single-arm fit with 4 hits against 5 gauge-fixed parameters.
-    rank_floor = maximum * torch.finfo(symmetric.dtype).eps * n_parameters
+    # Per row, against that row's own largest eigenvalue.  Using the batch-wide
+    # maximum would scale every row's floor by the stiffest track in the chunk
+    # and condemn healthy rows wholesale.
+    rank_floor = (
+        eigenvalues[..., -1] * torch.finfo(symmetric.dtype).eps * n_parameters
+    )
     degenerate = smallest_active <= rank_floor
     if symmetric.ndim == 2:
         # One matrix and nothing to fall back on: fail loudly, as the docstring

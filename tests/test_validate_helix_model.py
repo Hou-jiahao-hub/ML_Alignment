@@ -1359,6 +1359,43 @@ def test_rank_deficient_rows_are_dropped_not_regularised():
     torch.testing.assert_close(covariance[0], alone, rtol=0.0, atol=0.0)
 
 
+def test_rank_deficiency_is_judged_per_row_not_against_the_batch():
+    """One stiff row must not condemn the soft-but-healthy rows beside it.
+
+    The rank test is relative to the largest eigenvalue.  Taking that maximum
+    over the whole batch scales every row's floor by the stiffest track present,
+    which on real data marked 50 healthy rows of 70352 as rank deficient -- and
+    dropping them moved 24:4 backward LOC0 from 0.84mm to 0.49mm, i.e. it removed
+    exactly the rows that made the group look bad.  The numbers below mirror the
+    real spread: the broken arm's own condition numbers reach 1e7 while its
+    largest eigenvalue spans some ten orders across rows.
+    """
+    module = load_module()
+    dtype = torch.float64
+    vectors = torch.linalg.qr(torch.randn((3, 3), dtype=dtype, generator=
+        torch.Generator().manual_seed(5)))[0]
+    # Healthy but genuinely soft: condition number 1e6, well inside float64.
+    soft_values = torch.tensor([1.0e-6, 1.0e-3, 1.0], dtype=dtype)
+    soft = vectors @ torch.diag(soft_values) @ vectors.T
+    soft = 0.5 * (soft + soft.T)
+    # A far stiffer row in the same batch.
+    stiff = soft * 1.0e10
+
+    prediction = torch.randn((2, 2, 3), dtype=dtype)
+    batch = torch.stack((soft, stiff))
+    covariance, diagnostics = module.predictive_covariance(
+        batch, prediction, damping=module.PRODUCTION_DAMPING
+    )
+    assert diagnostics["n_rank_deficient_rows"] == 0
+    assert torch.isfinite(covariance).all()
+
+    # And the soft row gets exactly what it would get alone.
+    alone, _diagnostics = module.predictive_covariance(
+        soft, prediction[0], damping=module.PRODUCTION_DAMPING
+    )
+    torch.testing.assert_close(covariance[0], alone, rtol=1e-12, atol=0.0)
+
+
 def test_rank_deficient_fraction_is_pre_registered_and_gated(tmp_path):
     """Dropping rows silently would let a shrinking row set look like a result."""
     module = load_module()
