@@ -507,3 +507,473 @@ merged_df["var_eLOC1"] = (merged_df["err_eLOC1_ubs"]**2).clip(lower=1e-8)
 - 新增稳定事件切分、nominal bootstrap acceptance profile、归一化 polish score 和
   blind-validation 编排。trial-007 只有四个 validation 分量全部通过且 joint 有非零
   有效更新时才可标记通过。
+
+---
+
+## Iteration 13 — 材料感知 broken-helix：Gate 0/1/2/3 实现与验收
+**日期**: 2026-08-25 | **状态**: Gate 0 **有条件通过**（能损条目仍 open），Gate 1 契约冻结，
+Gate 2/3 closure 通过，Gate 4 未做
+
+### 相对 Iteration 12 改变的假设
+- Iteration 10 已证明单 helix 的 holdout RMSE 下限来自未建模的多重散射（bias≈0、
+  RMSE 大 1–2 量级）。本轮按 `docs/research/material_aware_tracks/decision_record.md`
+  实现 GBL 风格「六参数 reference helix + 材料节点二维 kink」的前三个工作包。
+- 本轮**不改** `ml_alignment_autograd.py`，**不回答 joint 校准是否改善**。
+
+### 环境更正
+`/cvmfs/sft.cern.ch/lcg/views/LCG_109` 已挂载、ACTS 绑定可用。Iteration 9–12 记录的
+"ACTS 重建被阻塞"不再成立。
+
+### 决定实现形态的 ACTS 源码事实
+| 事实 | 出处 |
+|---|---|
+| 材料 ROOT 丢弃 track 索引且遍历 `unordered_map` | `RootMaterialTrackWriter.cpp:87` |
+| `v_px/v_py/v_pz` 是 `parameters.direction()`，**单位向量**，无动量信息 | `RootMaterialTrackIo.cpp:189-191` |
+| `mat_step_length` 已含 `pathCorrection` | `PointwiseMaterialInteraction.cpp:45` |
+| `RootPropagationSummaryWriter` 提供 `(event_nr, track_nr)` + 5 个 start bound 参数 | `RootPropagationSummaryWriter.cpp:54-77` |
+| `nMaterials` 只数 stepping summary 中有 surface material 的 step | 同上 `:141-151` |
+| `sterileLogger=True` 会清空 `summary.steps` → `nMaterials` 恒为 0 | `PropagatorInterface.hpp:89,123` |
+| volume material 节点 `sur_id` 写成 0 | `RootMaterialTrackIo.cpp:245` |
+| ACTS Highland 用逐 slab `x/X0` 进 log 项 | `Interactions.cpp:484-491,516` |
+
+因此三方 join 必须走 `material ↔ propsummary ↔ tracksummary`；`nMaterials` 只能作诊断。
+
+### 实现
+- `alignment_odd.py`：新增 `material` 子命令。**复用 `runReconstruction` 同一函数**
+  （加 `recordMaterial` 参数）而非复制链路，保证 geometry/field/seed/KF/TrackSelector
+  逐项一致；states/summary/material/propsummary 由同一次运行产出。
+  新增 `reserve_reconstruction_output()` 覆盖保护（ACTS writer 全是 RECREATE）；
+  Sequencer 启动前建 running manifest，异常时 finalize 为 `failed`。
+  记录 pass 用 `energyLoss=False, multipleScattering=False`（与恒定曲率首版边界自洽）。
+- `material_artifact.py`（新建，ACTS-free）：schema 1.1（新增 `volume_geometry_id`）、
+  Join A 五参数硬校验、Join B 事件内双射、双向传播覆盖校验、`t_X0` closure、
+  相对增量路径 closure、先聚合后剔除、按材料占比而非节点数的丢弃门槛、
+  聚合 `Σθ0²` 变化上界、全部 fail-closed + manifest。
+- `helix_model.py`：只新增 `highland_kink_sigma`（与 `Interactions.cpp:484-491` 逐项对齐，
+  含 `q²/β²`）、`node_arc_lengths`、`segment_origin_path`、`assign_hit_segments`、
+  `broken_helix_segments`、`broken_helix_local_path`、`broken_helix_track_parameters`；
+  既有函数一行未改。新函数返回 `[T,H,6]`，正是现有 forward 的 `expand` 形状，下游不用改。
+
+### 坐标契约（本轮第一个关键设计修正）
+helix 的 `s` 原点由 `(x0,y0,z0)` 决定，**不是轨迹的全局不变量**；validation 每一行按
+自己的 fit window 拟合各自的 reference。因此：
+- artifact 的 `path_length_mm` 定义为**累计横向弦长**，仅用于排序与完整性诊断，
+  不参与任何下游裁剪或段分配（manifest 中显式注明）。
+- 消费方必须用自己冻结的 reference 从 `position_mm` 重算 `node_s` 与 `hit_s`。
+- `node_arc_lengths` 返回 detached 值；`assign_hit_segments` 返回 detached int64。
+- 回归测试 `test_reference_reparameterisation_leaves_prediction_invariant`：
+  同一轨迹用两个不同 `s` 原点的 reference，段分配一致、预测点 atol 1e-9 一致。
+
+### Gate 0 验收（1000 events，`--output-suffix mat0 --record-steps`）——**有条件通过**
+| 硬门控 | 结果 |
+|---|---|
+| 传播失败数 | **0**（tracksummary 与 propsummary 逐事件计数完全相等） |
+| Join A 五参数校验 | 100% 通过 |
+| Join B 事件内双射 | 100% 成立，unmatched=0 |
+| `mat_*` jagged 分支长度一致 | 通过（992/992 轨迹） |
+| 方向归一 / `mat_X0>0` / `x/X0` 有限非负 | 通过 |
+| `t_X0` closure | max 1.12e-7 ≤ 1e-4 |
+| 三维路径 closure（相对增量） | max 2.27e-4 ≤ 1e-3 |
+| 每轨迹丢弃材料占比 | max 1.66e-4 ≤ 1e-2 |
+| 聚合 `Σθ0²` 变化 | 0.0 ≤ 2e-2 |
+
+产物：992 轨迹 / 13508 节点（原始 13513，丢弃 5 个薄节点）。
+
+**perigee 假设通过率 = 1.0** → 按计划升格为 Join B 硬校验
+（`PERIGEE_HYPOTHESIS_REQUIRED = True`，`(v_x,v_y,v_z) == (-d0 sinφ, d0 cosφ, z0)`）。
+
+**判为「有条件」的唯一原因见下一节：能损条目未关闭。**
+
+### Gate 0 的 open 条目：能损对节点位置的影响（**未关闭，推迟到 Gate 4 判定**）
+
+> **后续状态（Iteration 14）**：该条目已于 2026-08-25 的 Gate 4 复检中**关闭**，判据全部满足。
+
+计划要求「`energyLoss=True/False` 的节点位置差 ≪ 传感器分辨率」。200 事件对照实测：
+
+| 区域 | n | max 位置差 [mm] | p99 |
+|---|---:|---|---|
+| r<200（像素） | 1114 | 1.54e-3 | 2.57e-4 |
+| 200<r<700 | 1100 | 5.23e-2 | 1.48e-2 |
+| 700<r<1200（条形） | 494 | **2.44e-1** | 1.54e-1 |
+
+**按原文措辞不通过**：条形层 0.244 mm 不是 ≪ 像素分辨率。节点位置只通过两条路径
+进入模型，二者的间接估计都远小于该位置差本身：
+1. **段分配**：最大偏差 / 最小节点间距 = 3.4e-2，量级上不可能翻转段归属；
+2. **kink 到下游 hit 的杠杆臂**：θ0 × 0.24 mm ≈ 1e-3 rad × 0.24 mm ≈ **2.4e-4 mm**。
+
+`x/X0` 差异 max 2.2e-5（可忽略）。
+
+**但以上是量级论证，不是对模型输出的直接检验，因此该门控条目保持 open。**
+生产配置暂用 `energyLoss=False`，消融开关 `--energy-loss` 与本表一并留在仓库中。
+Gate 4 必须在**真实 holdout 行**上用两套节点（`energyLoss=True` / `False`）
+直接复检，判据在此**预注册**：
+
+| 复检量 | 定义 | 通过条件 |
+|---|---|---|
+| 段分配翻转率 | 两套节点各自算 `segment_of_hit`，逐 holdout 行比较 | **== 0** |
+| 预测位移 | \|Δ 预测局部坐标\| 相对该分量测量 σ 的比值 | **p99 ≤ 10%** |
+
+两条同时成立 → 该条目关闭、Gate 0 记为完全通过；任一不成立 →
+`energyLoss=False` 的生产选择必须重新评估（改用 `energyLoss=True` 导出，
+或把能损纳入模型），**不得沿用本轮的量级论证结论**。
+
+### 本轮发现并修复的两个数据契约缺陷
+- **D1 — manifest 互相覆盖（数据丢失）**：导出端（`alignment_odd.py`）与转换端
+  （`material_artifact.py`）都把 `manifest.json` 写进 `<run_tag>/`，
+  后跑的转换端**静默覆盖**了导出端 manifest（其中含 `exporter_config` 与
+  ACTS 输入哈希）。`gate0-20260825` 与 `gate0-smoke` 的导出记录已实际丢失。
+  修复：
+  1. `experiment_manifest.write_experiment_manifest` 增加 `_guard_existing_manifest`，
+     检测到目标 manifest 的 `command` 属于**另一个 stage 脚本**时抛 `FileExistsError`
+     ——从根因上禁止跨阶段覆盖，而不只是改路径；
+  2. 路径分层为 `<run_tag>/export/manifest.json` 与 `<run_tag>/convert/manifest.json`；
+  3. 旧目录保留为 `*__pre-layout-fix`（未删除），导出重跑后记录已补齐。
+- **D2 — 路径清单模板错误**：`path_inventory.py` 声明的材料 ROOT 名为
+  `material_kf_{run_tag}.root`，而实际文件名由 `--output-suffix` 决定。
+  更糟的是我最初写的测试**断言了这个错误行为**。已同时修正模板与测试，
+  测试改为绑定 `artifact_filename`，不再复制常量。
+
+### 本轮证据的已知局限（不得外推）
+- 该仿真样本**每事件只有 0 或 1 条轨迹**（`max_tracks_per_event = 1`），
+  因此 Join B 的歧义消解在真实数据上**从未被触发**，只有合成单测覆盖。
+- ODD 材料**全部是 surface material**，volume 节点总数为 0；
+  且无连续相同 `sur_id`（无 pre/post split）。聚合与体材料分组逻辑在真实数据上是 no-op，
+  仅由单测覆盖，属防御性代码。
+- `nMaterials`（13–18，均值 15.4）与 surface 节点数（9–17，均值 13.6）仅 8.97% 相等，
+  最大差 6 —— 与 F5/F6 的语义差异一致，证实不能作为门控。
+
+### Gate 2 — 规范固定（gauge fixing）：本轮第二个关键设计修正
+broken-helix 的 MAP 拟合最初**不收敛**：60 次迭代后 Hessian 条件数 4.6e13、
+最小特征值 7.4e-6、梯度范数仍约 1e4。
+
+我最初把原因归给「toy 平面法向与轨迹近乎平行」，据此把平面改成径向——**这条归因是错的，
+已撤回**：改完毫无改善。真实原因是 **reference helix 的六参数存在精确规范自由度**：
+沿轨迹平移原点 `ds` 同时把 `psi0` 旋转 `rho·ds`，描出的是**同一条曲线**。
+冻结的 `node_s` 只在 O(kink) ≈ 3e-4 的量级上打破这个简并，因此留下一个近零本征方向。
+
+修复：`reference_gauge_frame(reference)` 用初始方向的正交补给出 `(origin, axis0, axis1)`，
+参数化从 6 个降为 5 个 —— 位置写成 `origin + u·axis0 + v·axis1`，
+沿轨迹方向的平移被显式消掉。参数向量为 `[u, v, psi0, tanl, rho_scaled, kinks...]`。
+
+| 量 | 修复前 | 修复后 |
+|---|---|---|
+| 条件数 | 4.6e13 | 1.4e6 |
+| 最小特征值 | 7.4e-6 | 262 |
+| 收敛后 max\|grad\| | 384 | 1.2e-6 |
+| 迭代次数 | 60（未收敛） | 3 |
+
+相应地测试断言也从「拟合出的 reference 参数等于真值」改成**规范不变**的判据
+（refit 的局部预测复现测量，atol 1e-4 —— 该量级由软方向决定，底噪 3.7e-5 mm）。
+`predictive_covariance` 同时改为 batch-aware（`[T,P,P]`）。
+
+### Gate 2 — 合成 MC ensemble closure（**通过**）
+`MC_ENSEMBLE_SIZE = 1200`、`MC_SEED = 20260825`，kink σ = 3.2756e-4 rad、
+测量 σ = 0.05 mm，每个成员按已知 `Q_j` 抽 kink → 生成测量 → 阻尼 Gauss–Newton 拟合
+→ 在 holdout 面上取预测与预测方差。容差全部 Gate 1 预注册。
+
+| 量 | 结果 | 预注册容差 |
+|---|---|---|
+| 拟合收敛 | 3 次迭代，max\|grad\| 5.166e-3 | — |
+| holdout 残差 RMS | 0.12436 mm | — |
+| 预测 σ（LOC0 / LOC1） | 0.15462 / 0.09015 mm | — |
+| pull mean（LOC0 / LOC1） | −0.0093 / +0.0134 | \|·\| ≤ 0.06 |
+| pull std（LOC0 / LOC1） | 0.9868 / 0.9716 | [0.93, 1.07] |
+| 覆盖率 @1σ | 0.7033 / 0.6983 | 0.6827 ± 0.03 |
+| 覆盖率 @1.96σ | 0.9542 / 0.9575 | 0.9500 ± 0.03 |
+
+这是「单次已知 kink 恢复不算证明」的正式替代品：pull 的**均值与宽度同时**落在带内，
+说明预测协方差的绝对尺度正确，而非仅偏置为零。
+
+### Gate 3 — predictive covariance（**通过**）
+`validate_helix_model.py` 新增 `gauss_newton_hessian` 与 `predictive_covariance`：
+- 显式声明目标为 `F = ½χ²`，故 `H = JᵀV⁻¹J + blkdiag(Q⁻¹)` 即后验精度，无额外因子；
+  测试用 `torch.autograd.functional.hessian` 对 `½χ²` 二阶求导逐元素对拍（atol 1e-9）。
+- 禁止显式求逆：Cholesky 分解 + `cholesky_solve`；测试用源码检查钉死这一点。
+- **factor-of-two 的独立验证**：无先验时 MAP 估计量的抽样协方差**就是**后验协方差，
+  故用 40000 次噪声实现的经验协方差交叉检验绝对尺度——它不复用被测公式。
+  结果：矩阵范数偏差 < 5%，对角比值落在 [0.95, 1.05]。差两倍会是 100% 的偏离。
+- 诊断：对称性残差、Cholesky 成败、min/max 特征值、条件数。
+  奇异 Hessian 在 `damping=0` 时如实抛 `LinAlgError`，加阻尼后可解。
+- `PRODUCTION_DAMPING = 1e-10` 与 `DAMPING_SCAN = (0, 1e-12, 1e-10, 1e-8, 1e-6)`
+  在 Gate 1 预注册；测试断言生产值在网格内、网格有序，且阻尼只会缩小方差不会放大。
+
+### 测试
+新增 `tests/test_material_artifact.py`（23 项，含合成三表 ROOT 端到端往返，验证行序
+被打乱后仍落到正确轨迹）、`tests/test_helix_model.py` 11 项新用例
+（Highland 与 ACTS 逐项对拍、`x/X0==0` masked limit 精确为 0 且梯度有限、
+节点拆分的解析比值、zero-material 极限含梯度、两个 kink 分量等角度、
+分段位置连续、padding 恒等传递、段分配确定性、坐标契约）、
+`tests/test_validate_helix_model.py` 9 项（Gate 3 协方差 6 项、Gate 2 拟合与
+MC ensemble 3 项）、`tests/test_experiment_manifest.py` 2 项（D1 跨阶段覆盖守卫）、
+`tests/test_path_inventory.py` 1 项（D2 模板）。
+`make test`：改动前 210 passed / 35 failed，改动后 **255 passed / 35 failed**
+——新增 45 项全绿，零新增失败。既有 35 项失败与本轮无关
+（它们用 `/usr/bin/python` 3.9 起子进程，导入即失败；已用 stash 复核确认）。
+
+### 尚未宣称的结果
+- Gate 0 的**能损条目仍 open**，判据已预注册，等 Gate 4 用真实 holdout 行复检。
+- Gate 4（`--model both` 单进程双臂 paired holdout、bootstrap CI 门控、
+  `holdout_keys.csv` + SHA256、必需组 `N≥200` 判定）**未实现**。
+- 因此**本轮没有任何「broken-helix 优于 single helix」的结论**，也没有 joint 校准结论。
+  Gate 2/3 只证明了数学实现与协方差尺度自洽，这是必要条件、不是物理结论。
+
+## Iteration 14 — Gate 4：全量 paired holdout（**未通过**）与 Gate 0 能损条目关闭
+
+**日期**：2026-08-25
+**状态**：Gate 0 **完全通过**（能损条目已关闭），Gate 4 **执行完毕、判定 failed**。
+**结论方向**：broken-helix 的改善是**真实但微小**的，与预注册门槛差一个量级；
+外推组无改善甚至回退。**首版材料感知模型按预注册标准未通过。**
+
+### 运行配置
+
+```
+python scripts/validate_helix_model.py \
+  --states data/reconstruction/nominal/Vol17_Lay8__Vol24_Lay4/trackstates_kf_mat1.root \
+  --material-artifact       .../gate4-20260825/material_nodes.npz \
+  --material-artifact-energy-loss .../gate4-20260825-eloss/material_nodes.npz \
+  --model both --max-tracks 0
+```
+
+- ACTS 导出 **20000 events**（非计划书写的 100000）；两次导出各约 4 分钟。
+- artifact：19781 tracks / 268434 nodes（eloss 版 268436），schema 1.1，Gate 0 全部 fail-closed 检查通过。
+- holdout 行数 **70352**，`n_rows_missing_material = 0`，`on_missing_material=fail` 未触发。
+- `holdout_keys.csv` SHA256 `4ecf9804…4398`；两臂 key 清单逐行相同（镜像文件摘要相等断言通过）。
+- 窗口内节点数 min/median/max = 0 / 7 / 13。
+- 单次运行耗时约 53 分钟（35 个 2048 行 chunk）。
+
+**样本量说明**：计划书写 100000 events，实跑 20000。但六个必需组的有效分量数为
+5034–14324，全部远超预注册的 `N ≥ 200`，因此**判定在统计上有效**，
+不构成 `inconclusive`。样本量只影响 CI 宽度，而失败原因是点估计本身离门槛太远。
+
+### 收敛与稳定性（先判数值，再判物理）
+
+| 臂 | iterations | 初始 objective | 最终 objective | max‖g‖ |
+|---|---|---|---|---|
+| single | 32 | 18.8299 | 2.3758 | 7678.7 |
+| broken | 37 | 18.8299 | 2.2969 | 3527.2 |
+
+`max_relative_decrease` 5.1e-11 / 9.2e-11，`converged: true`。但**「相对下降 < 1e-10」
+对停滞行同样成立**，`max‖g‖` 高达数千说明存在个别未到驻点的行。为此新增
+**Newton decrement** `λ² = gᵀH⁻¹g`（尺度无关，白化梯度范数不是）：
+
+| 臂 | p50 | p90 | p99 | max | 非驻点行占比 |
+|---|---|---|---|---|---|
+| single | 4.5e-23 | 1.9e-15 | 3.4e-13 | 14.93 | **1.71e-4** |
+| broken | 1.6e-19 | 3.9e-15 | 7.8e-13 | 0.538 | **8.53e-5** |
+
+阈值 `NEWTON_DECREMENT_STATIONARY = 1e-6`，预注册上限
+`MAX_NON_STATIONARY_ROW_FRACTION = 1e-2`。两臂都低两个量级
+→ **本轮的 failed 是物理/模型结论，不是数值失败**，可以据此判定。
+（该门控与阈值在读取结果**之前**写入代码并跑测试，非事后设定。）
+
+### 分组结果（production damping 1e-10，paired bootstrap 1000 次，seed 20260825）
+
+| 组 | N | RMSE single | RMSE broken | ΔRMSE 95% CI | ΔNLL 95% CI | pull_std single→broken |
+|---|---|---|---|---|---|---|
+| 17:8 interp LOC0 † | 8346 | 0.021723 | 0.021470 | [−1.84%, **−0.60%**] | [−0.0295, −0.0129] | 1.042 → 1.001 |
+| 17:8 interp LOC1 | 8346 | 0.032497 | 0.031464 | [−5.29%, −1.40%] | [−0.127, −0.0615] | 1.126 → 0.988 |
+| 17:8 fwd LOC0 † | 5034 | 0.213453 | 0.213394 | [−0.058%, +0.003%] | [−0.0004, **+0.0090**] | 0.987 → 0.992 |
+| 17:8 fwd LOC1 | 5034 | 0.070582 | 0.070352 | [−0.90%, +0.13%] | [−0.102, −0.0378] | 1.115 → 1.000 |
+| 17:8 bwd LOC0 † | 14190 | 0.187964 | 0.187950 | [−0.019%, +0.003%] | [−0.0038, −0.0006] | 0.998 → 0.982 |
+| 17:8 bwd LOC1 | 14190 | 1.433637 | 1.433514 | [−0.027%, +0.009%] | [+0.0002, **+0.0038**] | 0.980 → 1.016 |
+| 24:4 interp LOC0 † | 14197 | 0.050144 | 0.049868 | [−0.82%, **−0.32%**] | [−0.0094, −0.0037] | 1.003 → 0.984 |
+| 24:4 interp LOC1 | 14197 | 1.187356 | 1.185249 | [−0.27%, −0.08%] | [−0.0025, −0.0008] | 0.985 → 0.981 |
+| 24:4 fwd LOC0 † | 14261 | 0.259487 | 0.259476 | [−0.016%, +0.005%] | [−0.0011, **+0.0014**] | 0.999 → 0.990 |
+| 24:4 fwd LOC1 | 14261 | 1.210019 | 1.210019 | [−0.039%, +0.037%] | [−0.0006, **+0.0003**] | 0.986 → 0.983 |
+| 24:4 bwd LOC0 † | 14324 | 0.846021 | **0.864379** | [−0.89%, **+8.69%**] | [+0.0532, **+0.159**] | 0.991 → **1.102** |
+| 24:4 bwd LOC1 | 14324 | 3.282800 | 3.299087 | [−1.33%, +2.23%] | [+0.0051, **+0.0136**] | 0.977 → 1.022 |
+
+†＝预注册必需组。全部组 intersection failure rate = 0，|pull mean| ≤ 0.035，
+predictive χ²/component ∈ [0.96, 1.27]（均在 [0.7, 1.5] 带内）。
+
+### 失败原因（预注册判据，逐条）
+
+1. **interpolation RMSE 改善量级不足**：门槛「CI 上界 < −20%」，实测
+   17:8 −0.60%、24:4 −0.32%。**方向对、统计显著、幅度差 30–60 倍。**
+2. **多个组 NLL CI 上界 ≥ 0**：17:8 fwd LOC0、17:8 bwd LOC1、24:4 fwd LOC0/LOC1、
+   24:4 bwd LOC0/LOC1。
+3. **24:4 backward LOC0 实质回退**：RMSE CI 上界 +8.69%，超出「回退 ≤ 5%」；
+   NLL CI 完全在正侧 [+0.053, +0.159]；pull_std 从 0.991 恶化到 1.102。
+4. **阻尼敏感性翻转**：8 个外推组的 NLL 判定随预注册 damping 网格翻转。
+
+### 阻尼敏感性——本轮最值得记录的数值发现
+
+`damping = 0` 时两臂 Cholesky 都失败（single 在 batch 元素 214 的 5 阶主子式，
+broken 在元素 0 的 26 阶主子式），即 **H 在有限精度下并非严格正定**，
+production damping 不是可选项。而 damping 对外推 NLL 的影响**远非中性**：
+
+| damping | 17:8 fwd LOC0 | 17:8 bwd LOC0 | 24:4 fwd LOC0 | 24:4 bwd LOC0 |
+|---|---|---|---|---|
+| 1e-12 | −0.00066 ✓ | −0.00211 ✓ | −0.00027 ✓ | −0.00121 ✓ |
+| **1e-10（production）** | +0.00384 ✗ | −0.00210 ✓ | +0.00024 ✗ | **+0.106 ✗** |
+| 1e-08 | +1.144 ✗ | +0.0462 ✗ | +0.153 ✗ | +5.337 ✗ |
+| 1e-06 | +15.20 ✗ | +3.947 ✗ | +3.441 ✗ | +29.18 ✗ |
+
+ΔNLL 随 damping **单调恶化数个量级**——阻尼项 `damping·mean(diag H)·I` 在
+外推方向上系统性放大 broken 臂的 predictive variance（broken 臂的 H 含
+`2N` 个 kink 参数，`mean(diag H)` 被 `Q⁻¹` 块抬高，同一相对 damping 对
+broken 的绝对扰动远大于 single）。**这意味着两臂在同一 damping 下并不公平。**
+
+- **interpolation 组不在翻转名单里** → 那两条「改善但微小」的结论是稳健的。
+- **所有外推组的 NLL 结论都不可信**，按预注册规则不得宣称任何方向。
+- 后续必须先解决「damping 对两臂不等价」，否则外推 NLL 这条指标本身无意义。
+  候选：按臂各自的 `mean(diag H)` 归一改为**绝对**阻尼、或对 kink 块与
+  reference 块分别加阻尼、或改用 pivoted Cholesky / LDLᵀ 免阻尼求解。
+
+### Gate 0 能损条目——**已关闭**
+
+用第二份 `energyLoss=True` 的 artifact 在**同一批 70352 个 holdout 行**上复检：
+
+| 判据 | 预注册上限 | 实测 |
+|---|---|---|
+| 段分配翻转率 | 0.0 | **0.0** |
+| p99 \|Δpredicted\|/σ (LOC0) | 0.10 | **2.03e-6** |
+| p99 \|Δpredicted\|/σ (LOC1) | 0.10 | **1.71e-5** |
+
+max 比值分别 0.375 / 0.056（个别行），p99 低于上限 4–5 个量级。
+**「记录 pass 用 `energyLoss=False` 与首版模型自洽」这一假设成立**，
+Gate 0 由「有条件通过」升为**完全通过**。
+
+### 意外发现：Gauss–Newton 求解器本身就把单 helix 的插值残差降了 3.5 倍
+
+同一次运行同时产出旧路径（Adam refit）与新路径（GN）的 17:8 interpolation LOC0：
+
+| 求解器 | 同一批 8346 行的 RMSE | 拟合 objective |
+|---|---|---|
+| Adam（Iteration 10 路径，200 iters） | **0.076261 mm** | 18.83 → — |
+| Gauss–Newton single 臂 | **0.021723 mm** | 18.83 → **2.376** |
+
+χ² 降到约 1/8，RMSE 降到 1/3.5。**Iteration 10 的诊断「RMSE 比 bias 高 1–2 个量级
+⇒ 未建模的多重散射」在很大程度上其实是优化器未收敛**，不是物理。
+这直接解释了本轮 broken-helix 收益为何这么小：GN 收敛之后，
+留给材料 kink 去解释的残差已经所剩无几。
+
+无泄漏复核：拟合掩码 `mask = stack((fit_mask, fit_mask & loc1_valid))`
+不含 holdout hit，两条路径用的是同一批行、同一 holdout 定义。
+
+### 本轮结论
+
+- **不得宣称 broken-helix 优于 single helix。** 按预注册标准判定 **failed**。
+- 可以宣称的：(a) broken 臂**确实修正了一个真实的过散**——
+  17:8 interp LOC1 pull_std 1.126→0.988、17:8 fwd LOC1 1.115→1.000、
+  interp χ² 1.267→0.976；(b) 插值 RMSE 改善统计显著但仅 0.3–1.8%；
+  (c) 24:4 backward 明确回退。
+- **优先级已经变了**：先修 Adam → GN 的求解器落差（收益 3.5 倍，已实证），
+  再谈材料模型的边际收益（0.3–1.8%）。
+- 工作包 ④（joint 校准）按 Gate 5 规则**不得启动**——Gate 4 未通过。
+
+### 尚未宣称的结果（更新）
+
+- 「材料感知模型能否改善 joint 校准」仍**无任何证据**，且本轮不具备启动条件。
+- 外推方向的 NLL 优劣**未判定**（阻尼污染），不是「无改善」而是「不可测」。
+- 24:4 backward 的回退**尚未归因**：可能是 strip 层 LOC1 弱约束下 kink 吸收了
+  几何自由度，也可能纯粹是 damping 不等价的产物——两者本轮无法区分。
+- 20000 events 的结论对必需组统计有效，但**未在 100000 events 上复现**。
+
+## Iteration 15 — 测量 refit 换成 Gauss–Newton：求解器落差已消除
+
+**日期**：2026-08-25
+**状态**：实现完成、全量复跑完毕。Iteration 14 发现的 Adam↔GN 落差**已修掉**。
+**这不是新模型**：目标函数、分量掩码、holdout 划分一律未动，只换了下降方式。
+
+### 改动
+
+`scripts/validate_helix_model.py`：
+
+- `fit_helices_gauss_newton()`：主路径的测量 refit 改走 `fit_broken_helix`（`N == 0`），
+  **与 Gate 4 single 臂是同一个求解器实例**，不是并排的第二份实现。
+  测试 `test_gauss_newton_measurement_fit_matches_the_gate4_single_arm`
+  断言两者输出逐位相等——防止主路径与门控路径日后悄悄分叉。
+- `measurement_newton_decrement()`：对**任意**求解器的输出算 `λ² = gᵀH⁻¹g`。
+  这把「Adam 提前停」从推断变成实测。两处均按 2048 行分块。
+- `stationarity_report()` / `_merge_convergence()`：从 Gate 4 抽出复用，
+  删掉了 `run_broken_arm` 里的重复实现。
+- `--fit-solver {gauss-newton,adam}`，默认 `gauss-newton`。
+  保留 `adam` 只为复现 Iteration 14 的发现，不是受支持的运行方式。
+- **主路径新增驻点门控**：非驻点行占比 > `MAX_NON_STATIONARY_ROW_FRACTION` 直接判 fail。
+  没到最优的 refit 不能当成对模型的陈述——这条门槛与 Gate 4 两臂用的是同一个。
+
+`seed_helices`（对 SMT 点的几何预拟合）仍用 Adam，只提供 GN 的起点，本轮未动。
+
+### 决定性证据：Adam 从未到过驻点
+
+同一批 70352 行、同一目标函数：
+
+| 求解器 | 非驻点行占比 | decrement p50 | decrement p99 | 迭代数 |
+|---|---|---|---|---|
+| Adam（2000 轨迹子集实测） | **1.0000** | **1.26e+01** | — | 200（预算耗尽） |
+| Gauss–Newton（全量） | **1.28e-4** | 9.61e-23 | 7.40e-13 | **16** |
+
+Adam **每一行**的 Newton decrement 都在 1e-6 门槛之上，中位数 12.6
+——不是「个别行停滞」，是整批都没收敛。objective 4912.8 → 2.376。
+
+### 全量 holdout 对照（70352 行，绝对同一批数据与划分）
+
+| 层\|模式 | 分量 | Adam RMSE | GN RMSE | 比值 |
+|---|---|---|---|---|
+| 17:8 interp | LOC0 | 0.076261 | **0.021723** | **÷3.5** |
+| 17:8 interp | LOC1 | 0.033937 | 0.032497 | ÷1.04 |
+| 17:8 fwd | LOC0 | 0.237998 | 0.213453 | ÷1.12 |
+| 17:8 fwd | LOC1 | 0.060489 | **0.070582** | **×1.17** |
+| 17:8 bwd | LOC0 | 0.567832 | **0.187964** | **÷3.0** |
+| 17:8 bwd | LOC1 | 1.727658 | 1.433637 | ÷1.21 |
+| 24:4 interp | LOC0 | 0.173330 | **0.050144** | **÷3.5** |
+| 24:4 interp | LOC1 | 1.198811 | 1.187356 | ÷1.01 |
+| 24:4 fwd | LOC0 | 0.356660 | 0.259487 | ÷1.37 |
+| 24:4 fwd | LOC1 | 1.209467 | 1.210019 | ×1.00 |
+| 24:4 bwd | LOC0 | 0.945433 | 0.842530 | ÷1.12 |
+| 24:4 bwd | LOC1 | 5.140685 | 3.247682 | **÷1.58** |
+
+方向角 RMS 全线改善（17:8 bwd 0.005003→0.002968，24:4 bwd 0.009356→0.006670）。
+bias 在外推组显著回中（24:4 fwd −0.0196→+0.0012，24:4 bwd −0.0214→+0.0024）
+——Adam 的欠收敛此前把系统性偏移留在了外推方向上。
+
+**门控**：失败项 11 → 8，其中**三条是真的通过了**，不是数字变小：
+17:8 interpolation LOC0（0.0763→0.0217，门槛 0.05）、
+24:4 interpolation LOC0（0.1733→0.0501，门槛 0.1）、
+17:8 backward 方向角（0.005003→0.002968，门槛 0.005）。
+**两个插值组第一次落进 Iteration 10 定的绝对阈值内。**
+其余 8 条仍失败，但都是单边外推组——Iteration 10 已说明该阈值对外推不合适。
+
+### 唯一的回退：17:8 forward LOC1（+16.7%）
+
+0.060489 → 0.070582。这条必须照实记：Adam 的欠收敛相当于朝 SMT 种子的隐式收缩，
+对单边外推的曲率外插恰好起了正则作用；GN 把拟合窗内的似然做到最优，
+曲率的过拟合会被外推放大。**这是「正确求解」的代价，不是 bug**，
+但它说明外推预测需要的是显式先验（如材料 kink 的 `Q`），不是靠优化器欠收敛白捡。
+
+（2000 轨迹子集上 24:4 bwd LOC0 也曾回退 ×1.27，全量下变为 ÷1.12
+——那是小样本假象，已被全量推翻。记在这里以免日后误引。）
+
+### 对 Iteration 14 结论的影响
+
+- **Gate 4 的数字不再逐位可复现**：`fitted_parameters` 同时是 Gate 4 的冻结参考，
+  换成 GN 后参考变了。需要重跑（约 53 分钟）才能给出新的 broken-vs-single 判定。
+- 但方向上不会翻案：Iteration 14 的 GN single 臂本来就是从 Adam 点再优化到同一最优
+  （17:8 interp LOC0 两处都是 0.021723，24:4 interp LOC0 两处都是 0.050144）。
+  变的是 broken 臂的起点与线性化点，不是 single 臂的水平。
+- **Iteration 10 的物理归因正式作废**：「RMSE 比 bias 高 1–2 量级 ⇒ 未建模多重散射」
+  在插值组上有 3.5 倍来自优化器，不是散射。
+
+### 已知的同类缺陷（本轮未修，标记）
+
+`scripts/ml_alignment_autograd.py:604` 有**另一个** Adam 版
+`fit_helices_to_measurements`，是 block-LM 里 nuisance 轨迹的 refit。
+同样的欠收敛极可能存在，且它直接决定 joint 校准结果。
+本轮未动：参数化不同（position/direction/rho_scaled 三组独立 lr），
+改动会改变 joint 校准行为，而那属于工作包 ④，Gate 5 规定 Gate 4 未通过不得启动。
+
+### 测试
+
+`tests/test_validate_helix_model.py` 新增 8 项（先写失败测试再实现）：
+GN 目标值须比 Adam 低一个量级以上、GN 达驻点、**Adam 不达驻点**（把缺陷写成断言）、
+GN 主路径 == Gate 4 single 臂、两处分块逐位一致、solver 名校验、默认值。
+`make test`：**284 passed / 35 failed**，35 项为既有的 `/usr/bin/python` 3.9
+子进程失败，与本轮无关；零新增失败。
+
+### 尚未宣称的结果
+
+- **Gate 4 尚未在新参考下重跑**，broken-vs-single 的判定暂时悬空。
+- `seed_helices` 的 Adam 预拟合未检验是否也欠收敛（它只定起点，影响面小但未测）。
+- `ml_alignment_autograd.py` 侧的同类缺陷**只是标记，未测量、未修**。
+- 17:8 forward LOC1 的回退未做归因外的进一步验证。

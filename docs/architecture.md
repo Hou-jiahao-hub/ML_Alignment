@@ -17,15 +17,16 @@ simulation -> ROOT/geometry JSON -> loaders -> solver -> aligned geometry
 
 | Component | Responsibility | ACTS dependency |
 |---|---|---|
-| `alignment_odd.py` | Simulation, misalignment injection, reconstruction | Required |
+| `alignment_odd.py` | Simulation, misalignment injection, reconstruction, material export | Required |
 | `generate_odd_transform.py` | Export nominal ODD surface geometry | Required |
 | `alignment_artifact_layout.py` | Compatibility API for paths and target-layer naming | None |
 | `project_config.py` | Typed TOML configuration and validation | None |
 | `ml_alignment.py` | Analytic-Jacobian surface solver | AlignDerivLib only |
 | `ml_alignment_autograd.py` | Autograd surface and joint track/geometry solvers | None |
-| `helix_model.py` | Shared six-parameter helix, Newton intersections, and curvature scaling | None |
+| `helix_model.py` | Shared six-parameter helix, Newton intersections, curvature scaling, broken-helix segments and the Highland kink prior | None |
 | `ml_alignment_helix.py` | Frozen-helix holdout alignment | None |
-| `validate_helix_model.py` | Holdout validation and acceptance gates | None |
+| `material_artifact.py` | Per-track material-node artifact from ACTS ROOT output | None |
+| `validate_helix_model.py` | Holdout validation, acceptance gates, paired single/broken-helix comparison | None |
 | `reconstruction_acceptance.py` | Reconstructed measurement/smoothed-state chi2 acceptance | None |
 | `plot_*.py` | Residual, chi2/NDF, and hit diagnostics | ROOT/uproot |
 | `experiment_manifest.py` | Reproducibility metadata and input hashes | None |
@@ -69,12 +70,76 @@ data/
     iterative_ml/
     surface_helix/
     helix_validation/
+    material/
     ablation/
   archive/                  historical logs, figures, and retired artifacts
 ```
 
 The directory is local-only. Git stores code, small test fixtures, experiment
 manifests, and metric summaries—not bulk ROOT files or generated plots.
+
+## Material artifact contract
+
+`alignment_odd.py material` runs the standard reconstruction chain and adds a
+material-recording propagation over the same selected tracks, writing
+`material_kf_*.root` and `propsummary_kf_*.root` next to the usual states and
+summary. `material_artifact.py` joins the three tables and emits a schema-1.1
+NPZ with a manifest.
+
+The join needs all three files: `RootMaterialTrackWriter` drops the track index
+and iterates an unordered map, and the direction it stores carries no momentum,
+so `propsummary_kf` is the bridge that supplies `(event_nr, track_nr)` next to
+the same start bound parameters.
+
+The artifact's `path_length_mm` is a cumulative transverse chord length used
+only for ordering and completeness checks. It is not a track-level invariant:
+a helix `s` origin belongs to whichever fit produced it. Consumers must
+recompute node and hit arc lengths from `position_mm` against their own frozen
+reference before clipping windows or assigning segments.
+
+## Measurement refit solver
+
+`validate_helix_model.py --fit-solver {gauss-newton,adam}` chooses how the
+non-holdout measurement refit is minimised. Both solvers minimise the *same*
+half-chi2 over the same component mask; only the descent differs.
+
+`gauss-newton` is the default and runs through `fit_broken_helix` with zero
+material nodes, i.e. the identical solver the Gate 4 single arm uses. `adam` is
+the pre-Iteration-14 first-order refit, kept only so that finding stays
+reproducible: on real data every one of its rows stops short of a stationary
+point (Newton decrement median ~12 against a 1e-6 threshold), which inflated the
+held-out residual by a factor of 2.7-3.9 on the LOC0 groups and was previously
+mis-read as unmodelled multiple scattering.
+
+The run records `measurement_fit.stationarity` in the summary and fails when the
+non-stationary row fraction exceeds `MAX_NON_STATIONARY_ROW_FRACTION` -- the same
+threshold that gates the Gate 4 arms, so a refit that never reached its optimum
+cannot be reported as a statement about the model.
+
+`seed_helices` is a separate geometric prefit to the SMT points and still uses
+Adam; it only supplies the Gauss-Newton starting point.
+
+## Paired holdout contract (Gate 4)
+
+`validate_helix_model.py --material-artifact ...` evaluates two track models on
+**one** row set built by a single `build_track_batches` call: `single` (no
+material nodes) and `broken` (kinks at every node inside the row's fit window).
+Both arms run the same damped Gauss-Newton MAP solver -- the single arm is the
+broken arm with `N == 0` nodes -- so no optimiser difference can be mistaken for
+a model difference.
+
+Every row recomputes `node_s` and `hit_s` from its own frozen reference, then
+clips nodes to `[min, max]` of that row's hit arc lengths and sorts them; the
+segment assignment is detached integer data. The row identity list is written to
+`holdout_keys.csv` and its SHA256 recorded in the summary, and the two arms'
+lists are compared byte for byte before any metric is formed.
+
+Acceptance is per `(layer, mode, component)`: a group needs
+`N >= MIN_GROUP_COMPONENTS` to be gated, and any *required* group below that
+makes the whole verdict `inconclusive` rather than `passed`. Improvement means
+the paired-bootstrap 95% CI bound clears the threshold, never the point
+estimate. All thresholds, the bootstrap seed and the production damping are
+module-level constants pre-registered at Gate 1.
 
 ## Input/output contracts
 

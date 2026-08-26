@@ -15,6 +15,12 @@ geometry; core solvers must remain usable without importing ACTS.
 The optimization history records failed approaches and observability limits.
 Do not repeat an experiment without explaining what changed in its assumptions.
 
+## Code comprehension
+
+Before accessing or using any variable, read its definition and the relevant
+surrounding implementation. Never infer a variable's actual purpose from its
+name alone.
+
 ## Environments
 
 - ACTS simulation/reconstruction: source `setup_acts.sh` in a fresh shell.
@@ -35,6 +41,13 @@ Do not repeat an experiment without explaining what changed in its assumptions.
 - Never delete or overwrite source ROOT/JSON artifacts while migrating data.
   Copy, inventory, verify, switch configuration, then request explicit approval
   before removing the source.
+
+## Experiment records
+
+Every algorithm experiment, including failed or aborted runs, must write a
+schema-versioned `manifest.json` recording the effective configuration,
+command, input hashes, metrics available at termination, outputs, status, and
+Git commit. An experiment is not complete until its manifest has been written.
 
 ## Dependency boundaries
 

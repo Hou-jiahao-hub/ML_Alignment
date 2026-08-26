@@ -21,6 +21,8 @@ ML_Alignment/
 
 The detailed component and data flow is in [docs/architecture.md](docs/architecture.md).
 The complete input/output contract is in [docs/io-paths.md](docs/io-paths.md).
+Research notes and the model decision for material-aware track fitting are in
+[docs/research/material_aware_tracks/](docs/research/material_aware_tracks/README.md).
 
 ## Environment setup
 
