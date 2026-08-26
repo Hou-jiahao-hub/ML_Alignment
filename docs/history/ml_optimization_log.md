@@ -1292,3 +1292,97 @@ component mask 也是同一个 `batches.fit_mask`。
 - `seed_helices` 的 Adam 预拟合仍未检验（P4）。
 - `24:4|backward_extrapolation|LOC0` 的 NLL 结论仍不可引用（P1'）。
 - `min_extrapolation_fit_hits = 4` 仍未动（P3）。
+
+---
+
+## Iteration 19 — joint refit 换成 Gauss-Newton（P2'）
+
+**改动**：`scripts/ml_alignment_autograd.py`、`tests/test_ml_alignment_autograd.py`、
+`tests/test_joint_alignment.py`、`tests/test_component_mask_wiring.py`
+**性质**：**求解器变更**。这是一次预注册变更，`refitted_parameters` 及全部下游产物改变。
+
+### 1. 预注册在先
+
+判据在跑之前写死，事后未做任何调整：
+
+| 常量 | 值 | 来源 |
+|---|---|---|
+| `JOINT_REFIT_SOLVER` | `"gauss-newton"` | 本轮 |
+| `JOINT_REFIT_PREREGISTRATION_VERSION` | 1 | 本轮新建的 joint 侧版本线 |
+| `JOINT_REFIT_MAX_NON_STATIONARY_ROW_FRACTION` | 1.0e-3 | 类比 `MAX_RANK_DEFICIENT_ROW_FRACTION` |
+
+驻点阈值本身**复用**已预注册的 `NEWTON_DECREMENT_STATIONARY = 1e-6`，未另定义。
+非有限行要求为 0。任一不满足 → raise，不产出结果。
+
+**`PREREGISTRATION_VERSION` 保持 2，未动。** 它的注释写明治理范围是「this block」——
+Gate 4 的判决常量，且只写进 Gate 4 的 summary。本轮不碰任何 Gate 4 常量，Gate 4 也不
+消费 joint 输出；升它会让此后每份 Gate 4 summary 声称判决规则变过，而实际未变。
+故 joint 侧另立 `JOINT_REFIT_PREREGISTRATION_VERSION`。
+
+### 2. 「不收敛行丢弃」在这条路径上不存在
+
+本轮核实推翻了一个想当然的设计：`fit_broken_helix` 对每行都返回参数（per-track 阻尼 +
+步长接受），不产生 NaN 行；`converged` 是 per-chunk 的 bool，不是 per-row。秩亏 NaN 丢弃
+是协方差路径 `_run_broken_arm_chunk` 的事，不在拟合路径上。而且 joint 场景下丢一条
+nuisance 轨迹 = 改变 nuisance 集合，与 Gate 4 丢一行语义完全不同。
+**per-row 判据只能落在 Newton decrement 上**，判据据此设计。
+
+### 3. 接线比预期机械
+
+`fit_helices_gauss_newton` 与 Iteration 18 已在用的 `measurement_newton_decrement`
+走**同一个** `_measurement_fit_inputs`，因此 `_validation_batches_from_joint` 这个适配器
+早已被实测验证可直接喂给 GN 拟合路径。`prepare_broken_inputs` 确实读 `holdout_mask`，
+但拟合用的 `component_mask` 只由 `fit_mask` 构成，holdout 只流向 `holdout_*` 输出字段
+——这正是 Iteration 18 目标函数能逐位等价的原因，占位符对 GN 拟合同样无害。
+
+**GN 分支强制 float64**：预注册阈值 1e-6 低于 float32 分辨率，而 joint 管线在 GPU 上
+跑的就是 float32（`seed_helices` 的 dtype 由 `--gpu` 决定）。解完再转回调用方 dtype。
+
+**判据不受 `--no-joint-refit-stationarity` 影响**：它读的是 GN 求解器自己算出的
+decrement（`solver_stats["stationarity"]`），不是那个可关的诊断测量。关掉诊断不等于
+关掉验收。
+
+### 4. 结果
+
+真实数据，`--track-mode free --max-tracks 300`，两臂只差一个 flag：
+
+| 量 | Adam | **Gauss-Newton** |
+|---|---|---|
+| `n_components` | 5616 | **5616** |
+| `chi2_per_component` | 7992.76 | **0.741103** |
+| 非驻点行占比 | 100.00% | **0.00%** |
+| Newton decrement p90 | 4.17e5 | **1.87e-17** |
+| 非有限行 | 0 | 0 |
+
+**先核对的是 `n_components`**（Iteration 17 §4.1 的教训）：两臂相同，说明没有行被悄悄
+丢掉，chi2 的四个数量级改善不是样本变化换来的。
+
+Adam 臂逐位复现 Iteration 18 的数字（7992.76 / 5.36e5 → 4.17e5 / 100%），说明重构没有
+改变 Adam 的行为。
+
+`chi2/component` 从 7992.76 降到 0.741 另有物理意义：一个正确归一的 per-component chi2
+在测量噪声主导时应当在 1 附近。7992 是荒谬的，0.741 是合理的。
+
+### 5. Adam 保留
+
+`--joint-refit-solver {gauss-newton,adam}`，默认 GN。Adam 代码原封不动搬进
+`_refit_helices_adam`，Iteration ≤18 的产物仍可复现，A/B 对照随时可跑。
+`best_iteration` / `improved` / `first_step` 是 Adam 语义，**只在 adam 分支出现**——
+不给占位值，免得读 summary 的人把 GN 运行误认成「checkpoint 恰好没改善过」的 Adam 运行。
+
+### 6. 测试
+
+新增 4 项，全量 **337 passed / 0 failed / 3 skipped**（基线 333 + 4）。
+
+判据的双向测试是关键：单测「GN 解满足判据」的话，一个永不触发的 gate 也能通过。因此
+同时用 `max_iters=1` 的截断 GN 解构造真实的不达标输入，断言它**确实 raise**
+（实测 1 次迭代非驻点行 100%，完整解 0%）。
+
+### 尚未宣称
+
+- 本轮只在 300 条轨迹上做过 A/B，全量 joint 运行未复现。
+- 下游对齐结果（`target_metrics` 等）的变化未系统评估，只验证了 refit 本身。
+- `seed_helices` 的 Adam 预拟合仍未检验（P4）。
+- `24:4|backward_extrapolation|LOC0` 的 NLL 结论仍不可引用（P1'）。
+- `min_extrapolation_fit_hits = 4` 仍未动（P3）。
+- Gate 4 维持 failed，工作包 ④ 仍被 Gate 5 阻塞。

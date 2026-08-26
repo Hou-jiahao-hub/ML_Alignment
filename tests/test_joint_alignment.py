@@ -342,10 +342,10 @@ def test_measurement_refit_ignores_target_measurements_and_reports_chi2():
     initial = torch.zeros((1, 6), dtype=torch.float64)
 
     fitted_a, stats_a = m.fit_helices_to_measurements(
-        batches_a, geometry, initial, n_iter=3, dtype=torch.float64
+        batches_a, geometry, initial, n_iter=3, dtype=torch.float64, solver="adam"
     )
     fitted_b, stats_b = m.fit_helices_to_measurements(
-        batches_b, geometry, initial, n_iter=3, dtype=torch.float64
+        batches_b, geometry, initial, n_iter=3, dtype=torch.float64, solver="adam"
     )
 
     torch.testing.assert_close(fitted_a, fitted_b, rtol=0.0, atol=0.0)

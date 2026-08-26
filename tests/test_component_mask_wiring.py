@@ -132,7 +132,12 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
         "fit_helices_to_measurements",
         lambda *_a, **_k: (
             seeded,
-            {"chi2_per_component": 0.0, "n_components": 4, "invalid_fraction": 0.0},
+            {
+                "solver": "gauss-newton",
+                "chi2_per_component": 0.0,
+                "n_components": 4,
+                "invalid_fraction": 0.0,
+            },
         ),
     )
     monkeypatch.setattr(

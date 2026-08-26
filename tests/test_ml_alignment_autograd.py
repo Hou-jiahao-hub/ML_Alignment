@@ -556,10 +556,10 @@ def test_refit_stationarity_measurement_leaves_the_fit_untouched():
     batches, geometry, _truth, seed = build_synthetic_joint_case(m)
 
     measured_fit, measured_stats = m.fit_helices_to_measurements(
-        batches, geometry, seed, n_iter=20, stationarity=True
+        batches, geometry, seed, n_iter=20, stationarity=True, solver="adam"
     )
     plain_fit, plain_stats = m.fit_helices_to_measurements(
-        batches, geometry, seed, n_iter=20, stationarity=False
+        batches, geometry, seed, n_iter=20, stationarity=False, solver="adam"
     )
 
     assert torch.equal(measured_fit, plain_fit)
@@ -583,10 +583,10 @@ def test_refit_stationarity_separates_a_truncated_fit_from_a_solved_one():
     batches, geometry, _truth, seed = build_synthetic_joint_case(m)
 
     _one, one_step = m.fit_helices_to_measurements(
-        batches, geometry, seed, n_iter=1, stationarity=True
+        batches, geometry, seed, n_iter=1, stationarity=True, solver="adam"
     )
     _many, many_steps = m.fit_helices_to_measurements(
-        batches, geometry, seed, n_iter=20, stationarity=True
+        batches, geometry, seed, n_iter=20, stationarity=True, solver="adam"
     )
     assert (
         many_steps["stationarity"]["refit"]["newton_decrement_p50"]
@@ -602,3 +602,96 @@ def test_refit_stationarity_separates_a_truncated_fit_from_a_solved_one():
         solved_report["newton_decrement_max"]
         < solved_report["stationary_threshold"]
     )
+
+
+def test_gauss_newton_is_the_default_joint_refit_and_meets_the_criterion():
+    """Iteration 19: the default path must land on the pre-registered criterion.
+
+    The Adam keys must be absent rather than carrying a placeholder, so a reader
+    of ``initialization_stats`` cannot mistake a Gauss-Newton run for one whose
+    checkpoint happened never to improve.
+    """
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, _truth, seed = build_synthetic_joint_case(m)
+
+    _fitted, stats = m.fit_helices_to_measurements(batches, geometry, seed)
+
+    assert stats["solver"] == m.JOINT_REFIT_SOLVER_GAUSS_NEWTON
+    assert (
+        stats["joint_refit_preregistration_version"]
+        == m.JOINT_REFIT_PREREGISTRATION_VERSION
+    )
+    gate = stats["stationarity_gate"]
+    assert gate["n_non_finite"] == 0
+    assert (
+        gate["non_stationary_row_fraction"]
+        <= m.JOINT_REFIT_MAX_NON_STATIONARY_ROW_FRACTION
+    )
+    assert stats["convergence"]["converged"] is True
+    for adam_only in ("best_iteration", "improved", "first_step"):
+        assert adam_only not in stats
+
+
+def test_joint_refit_rejects_a_truncated_gauss_newton_solution(monkeypatch):
+    """Both directions, so a gate that can never fire cannot pass.
+
+    One Gauss-Newton iteration on this case leaves every row non-stationary; the
+    full solve leaves none.  Asserting only the second half would also pass for a
+    criterion that is never evaluated.
+    """
+    m = load_ml_alignment_autograd_module()
+    v = load_validate_helix_model_module()
+    batches, geometry, _truth, seed = build_synthetic_joint_case(m)
+
+    class TruncatedSolver:
+        def __getattr__(self, name):
+            return getattr(v, name)
+
+        @staticmethod
+        def fit_helices_gauss_newton(*args, **kwargs):
+            return v.fit_helices_gauss_newton(*args, **{**kwargs, "max_iters": 1})
+
+    monkeypatch.setattr(m, "_load_validation_module", TruncatedSolver)
+    with pytest.raises(ValueError, match="pre-registered stationary point"):
+        m.fit_helices_to_measurements(batches, geometry, seed)
+
+    monkeypatch.undo()
+    _fitted, stats = m.fit_helices_to_measurements(batches, geometry, seed)
+    assert stats["stationarity_gate"]["non_stationary_row_fraction"] == 0.0
+
+
+def test_gauss_newton_refit_improves_on_adam_at_the_same_component_count():
+    """The swap changes the optimiser and nothing else.
+
+    ``n_components`` is the first thing checked: the two paths share a component
+    mask by construction, so a difference there would be a wiring bug, and a chi2
+    comparison across different component counts would be meaningless.
+    """
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, _truth, seed = build_synthetic_joint_case(m)
+
+    _adam_fit, adam_stats = m.fit_helices_to_measurements(
+        batches, geometry, seed, n_iter=20, solver="adam"
+    )
+    _gn_fit, gn_stats = m.fit_helices_to_measurements(
+        batches, geometry, seed, solver="gauss-newton"
+    )
+
+    assert gn_stats["n_components"] == adam_stats["n_components"]
+    assert (
+        gn_stats["initial_chi2_per_component"]
+        == adam_stats["initial_chi2_per_component"]
+    )
+    assert gn_stats["chi2_per_component"] <= adam_stats["chi2_per_component"]
+    assert (
+        gn_stats["stationarity"]["refit"]["non_stationary_row_fraction"]
+        < adam_stats["stationarity"]["refit"]["non_stationary_row_fraction"]
+    )
+
+
+def test_unknown_joint_refit_solver_is_rejected():
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, _truth, seed = build_synthetic_joint_case(m)
+
+    with pytest.raises(ValueError, match="Unknown joint measurement refit solver"):
+        m.fit_helices_to_measurements(batches, geometry, seed, solver="lbfgs")

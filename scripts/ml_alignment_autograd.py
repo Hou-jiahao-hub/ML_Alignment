@@ -79,6 +79,35 @@ JOINT_SEED_MIN_SPAN = 300.0
 JOINT_SMT_SEED_ITERS = 200
 JOINT_MEASUREMENT_REFIT_ITERS = 200
 JOINT_SOLVER = "block-lm"
+
+#: Solver for the joint initialization's measurement refit.  Iteration 18 measured
+#: the Adam path on real data: Newton decrement p90 = 4.17e5 against a threshold of
+#: 1e-6, with 100% of rows non-stationary after the full 200-iteration budget.  The
+#: same objective solved by Gauss-Newton comes back stationary, and the two
+#: objectives were shown to agree bit-for-bit, so the optimiser is the only thing
+#: that changes here.  Adam stays reachable so runs made before Iteration 19 remain
+#: reproducible and so the two can be compared under one command.
+JOINT_REFIT_SOLVER_GAUSS_NEWTON = "gauss-newton"
+JOINT_REFIT_SOLVER_ADAM = "adam"
+JOINT_REFIT_SOLVERS = (JOINT_REFIT_SOLVER_GAUSS_NEWTON, JOINT_REFIT_SOLVER_ADAM)
+JOINT_REFIT_SOLVER = JOINT_REFIT_SOLVER_GAUSS_NEWTON
+
+#: Pre-registration for the joint refit, kept separate from the Gate 4 block's
+#: ``PREREGISTRATION_VERSION``.  That constant governs the verdict rules in
+#: ``validate_helix_model``; none of them change here, and Gate 4 does not consume
+#: joint output, so bumping it would make every Gate 4 summary claim a rules change
+#: that never happened.  Bump this one whenever a constant below changes meaning.
+#: v1: Iteration 19, the Adam -> Gauss-Newton swap.
+JOINT_REFIT_PREREGISTRATION_VERSION = 1
+
+#: Acceptance criterion for the Gauss-Newton refit, fixed before the swap was run.
+#: The per-row threshold itself is not redefined here: it is the pre-registered
+#: ``NEWTON_DECREMENT_STATIONARY = 1e-6`` in the ``F = 0.5 * chi2`` gauge.  This is
+#: only how many rows may miss it, and the value is carried over by analogy from
+#: ``MAX_RANK_DEFICIENT_ROW_FRACTION`` -- a handful of pathological rows does not
+#: invalidate a fit, above that the fit is not usable.  It was set from that
+#: precedent, not from looking at what the solver produced.
+JOINT_REFIT_MAX_NON_STATIONARY_ROW_FRACTION = 1.0e-3
 LM_MAX_ITERS = 20
 LM_INITIAL_DAMPING = 1e-3
 FISHER_EIGEN_FLOOR = 1e-4
@@ -253,6 +282,7 @@ class AlignmentRunConfig:
     measurement_refit_lr_position: float = MEASUREMENT_REFIT_LR_POSITION
     measurement_refit_lr_direction: float = MEASUREMENT_REFIT_LR_DIRECTION
     measurement_refit_lr_rho_scaled: float = MEASUREMENT_REFIT_LR_RHO_SCALED
+    joint_refit_solver: str = JOINT_REFIT_SOLVER
     joint_refit_stationarity: bool = True
     event_partition: str | None = None
     event_split_seed: int = DEFAULT_SPLIT_SEED
@@ -704,28 +734,23 @@ def measure_joint_refit_stationarity(
     return validation.stationarity_report(decrement)
 
 
-def fit_helices_to_measurements(
+def _refit_helices_adam(
     batches,
     geometry,
-    initial_parameters,
-    n_iter=JOINT_MEASUREMENT_REFIT_ITERS,
-    device="cpu",
-    dtype=torch.float64,
-    max_invalid_fraction=0.05,
-    lr_position=MEASUREMENT_REFIT_LR_POSITION,
-    lr_direction=MEASUREMENT_REFIT_LR_DIRECTION,
-    lr_rho_scaled=MEASUREMENT_REFIT_LR_RHO_SCALED,
-    stationarity=True,
+    initial,
+    n_iter,
+    max_invalid_fraction,
+    lr_position,
+    lr_direction,
+    lr_rho_scaled,
+    initial_loss,
 ):
-    """Refit helices using only non-target local measurements and fixed surfaces.
+    """The first-order refit, kept reachable so pre-Iteration-19 runs reproduce.
 
-    ``stationarity`` adds a read-only Newton-decrement measurement of the seed and
-    of the refit output.  It does not touch the returned parameters: the seed
-    figure is what separates "Adam converged" from "the seed was already close".
+    Iteration 18 measured what it actually delivers: after the full 200-iteration
+    budget the Newton decrement p90 is 4.17e5 against a 1e-6 threshold, so this is
+    a truncated descent, not a minimum.  Nothing in it changed with the swap.
     """
-    if n_iter < 1:
-        raise ValueError("joint measurement refit iterations must be at least 1.")
-    initial = initial_parameters.to(device=device, dtype=dtype)
     linear_initial, rho_initial = split_joint_track_parameters(initial)
     position = nn.Parameter(linear_initial[:, :3].clone())
     direction = nn.Parameter(linear_initial[:, 3:].clone())
@@ -738,18 +763,7 @@ def fit_helices_to_measurements(
         )
     )
     checkpoint = JointBestCheckpoint((position, direction, rho_scaled))
-    with torch.no_grad():
-        initial_loss_tensor, initial_invalid, initial_component_mask = _measurement_refit_objective(
-            initial, batches, geometry
-        )
-    initial_loss = float(initial_loss_tensor.cpu())
-    if initial_invalid > max_invalid_fraction:
-        raise ValueError(
-            "Initial non-target measurement refit exceeds invalid-intersection limit: "
-            f"{initial_invalid:.2%} > {max_invalid_fraction:.2%}."
-        )
     checkpoint.observe(initial_loss, iteration=-1)
-    final_invalid = initial_invalid
     first_step = None
     for iteration in range(n_iter):
         optimizer.zero_grad()
@@ -806,11 +820,117 @@ def fit_helices_to_measurements(
                 },
             }
         checkpoint.observe(evaluated_value, iteration=iteration)
-        final_invalid = evaluated_invalid
     checkpoint.restore()
     fitted = assemble_joint_track_parameters(
         torch.cat((position, direction), dim=1), rho_scaled
     ).detach()
+    return fitted, {
+        "best_iteration": checkpoint.best_iteration,
+        "first_step": first_step,
+    }
+
+
+def _refit_helices_gauss_newton(batches, geometry, initial, device):
+    """Solve the same objective, and refuse to return a solution that is not one.
+
+    Routed through the validation module's solver rather than a second
+    implementation, for the same reason the measurement was: the joint path and
+    the Gate 4 single arm cannot drift apart if there is only one solver.  The
+    adapter and the input preparation are the ones Iteration 18 already validated,
+    so the objective here is the one that was shown to agree bit-for-bit.
+
+    Always float64.  The pre-registered stationarity threshold is 1e-6, which is
+    below float32 resolution, and the joint pipeline runs float32 whenever it runs
+    on the GPU.  The caller casts the result back to its own dtype.
+    """
+    validation = _load_validation_module()
+    measured = _validation_batches_from_joint(batches, validation)
+    fitted, solver_stats = validation.fit_helices_gauss_newton(
+        measured, geometry, initial, device=device, dtype=torch.float64
+    )
+    report = solver_stats["stationarity"]
+    if report["n_non_finite"]:
+        raise FloatingPointError(
+            "Gauss-Newton joint refit produced non-finite Newton decrements on "
+            f"{report['n_non_finite']} rows."
+        )
+    fraction = float(report["non_stationary_row_fraction"])
+    if fraction > JOINT_REFIT_MAX_NON_STATIONARY_ROW_FRACTION:
+        raise ValueError(
+            "Gauss-Newton joint refit did not reach the pre-registered stationary "
+            f"point: {fraction:.3%} of rows exceed a Newton decrement of "
+            f"{report['stationary_threshold']:.3g} (limit "
+            f"{JOINT_REFIT_MAX_NON_STATIONARY_ROW_FRACTION:.3%}, p90 "
+            f"{report['newton_decrement_p90']:.6g})."
+        )
+    return fitted, {
+        "convergence": solver_stats["convergence"],
+        "stationarity_gate": report,
+    }
+
+
+def fit_helices_to_measurements(
+    batches,
+    geometry,
+    initial_parameters,
+    n_iter=JOINT_MEASUREMENT_REFIT_ITERS,
+    device="cpu",
+    dtype=torch.float64,
+    max_invalid_fraction=0.05,
+    lr_position=MEASUREMENT_REFIT_LR_POSITION,
+    lr_direction=MEASUREMENT_REFIT_LR_DIRECTION,
+    lr_rho_scaled=MEASUREMENT_REFIT_LR_RHO_SCALED,
+    stationarity=True,
+    solver=JOINT_REFIT_SOLVER,
+):
+    """Refit helices using only non-target local measurements and fixed surfaces.
+
+    ``solver`` selects how the minimum is reached; the objective, the component
+    mask and the seed are the same either way.  ``n_iter`` and the three ``lr_``
+    arguments only reach the Adam path.
+
+    ``stationarity`` adds a read-only Newton-decrement measurement of the seed and
+    of the refit output.  It does not touch the returned parameters: the seed
+    figure is what separates "the optimiser converged" from "the seed was already
+    close".  It is a diagnostic, and switching it off does not switch off the
+    pre-registered acceptance criterion the Gauss-Newton path is held to -- that
+    one reads the decrement the solver computes for itself.
+    """
+    if solver not in JOINT_REFIT_SOLVERS:
+        raise ValueError(
+            f"Unknown joint measurement refit solver {solver!r}; "
+            f"expected one of {JOINT_REFIT_SOLVERS}."
+        )
+    if n_iter < 1:
+        raise ValueError("joint measurement refit iterations must be at least 1.")
+    initial = initial_parameters.to(device=device, dtype=dtype)
+    with torch.no_grad():
+        initial_loss_tensor, initial_invalid, _initial_mask = _measurement_refit_objective(
+            initial, batches, geometry
+        )
+    initial_loss = float(initial_loss_tensor.cpu())
+    if initial_invalid > max_invalid_fraction:
+        raise ValueError(
+            "Initial non-target measurement refit exceeds invalid-intersection limit: "
+            f"{initial_invalid:.2%} > {max_invalid_fraction:.2%}."
+        )
+    if solver == JOINT_REFIT_SOLVER_ADAM:
+        fitted, solver_stats = _refit_helices_adam(
+            batches,
+            geometry,
+            initial,
+            n_iter,
+            max_invalid_fraction,
+            lr_position,
+            lr_direction,
+            lr_rho_scaled,
+            initial_loss,
+        )
+    else:
+        fitted, solver_stats = _refit_helices_gauss_newton(
+            batches, geometry, initial, device
+        )
+        fitted = fitted.to(device=initial.device, dtype=dtype)
     with torch.no_grad():
         evaluated_loss, final_invalid, component_mask = _measurement_refit_objective(
             fitted, batches, geometry
@@ -822,19 +942,23 @@ def fit_helices_to_measurements(
             f"{final_invalid:.2%} > {max_invalid_fraction:.2%}."
         )
     stats = {
+        "solver": solver,
+        "joint_refit_preregistration_version": JOINT_REFIT_PREREGISTRATION_VERSION,
         "chi2_per_component": final_loss,
         "initial_chi2_per_component": initial_loss,
         "n_components": int(component_mask.sum().cpu()),
         "invalid_fraction": final_invalid,
-        "best_iteration": checkpoint.best_iteration,
-        "improved": bool(checkpoint.best_iteration >= 0 and final_loss < initial_loss),
         "parameter_updates": {
             "position_rms": float(torch.sqrt(torch.mean((fitted[:, :3] - initial[:, :3]).square())).cpu()),
             "direction_rms": float(torch.sqrt(torch.mean((fitted[:, 3:5] - initial[:, 3:5]).square())).cpu()),
             "rho_rms": float(torch.sqrt(torch.mean((fitted[:, 5] - initial[:, 5]).square())).cpu()),
         },
-        "first_step": first_step,
     }
+    stats.update(solver_stats)
+    if solver == JOINT_REFIT_SOLVER_ADAM:
+        stats["improved"] = bool(
+            stats["best_iteration"] >= 0 and final_loss < initial_loss
+        )
     if stationarity:
         stats["stationarity"] = {
             "seed": measure_joint_refit_stationarity(batches, geometry, initial),
@@ -2262,6 +2386,7 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
         lr_direction=config.measurement_refit_lr_direction,
         lr_rho_scaled=config.measurement_refit_lr_rho_scaled,
         stationarity=config.joint_refit_stationarity,
+        solver=config.joint_refit_solver,
     )
     print(
         "Joint initialization: "
@@ -2269,7 +2394,9 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
         f"retained={batches.selection_stats.get('retained_tracks', len(batches.event_track_ids))} "
         f"excluded={batches.selection_stats.get('excluded_tracks', 0)} "
         f"SMT loss={smt_stats['loss']:.6g} "
-        f"measurement chi2/component={measurement_stats['chi2_per_component']:.6g}."
+        f"refit solver={measurement_stats['solver']} "
+        f"measurement chi2/component={measurement_stats['chi2_per_component']:.6g} "
+        f"n_components={measurement_stats['n_components']}."
     )
     if "stationarity" in measurement_stats:
         seed_report = measurement_stats["stationarity"]["seed"]
@@ -2823,6 +2950,12 @@ def build_argument_parser():
         default=MEASUREMENT_REFIT_LR_RHO_SCALED,
     )
     p.add_argument(
+        "--joint-refit-solver",
+        choices=JOINT_REFIT_SOLVERS,
+        default=JOINT_REFIT_SOLVER,
+        help="Solver for the joint initialization measurement refit.",
+    )
+    p.add_argument(
         "--no-joint-refit-stationarity",
         action="store_true",
         help="Skip the Newton-decrement measurement of the measurement refit.",
@@ -2905,6 +3038,7 @@ def alignment_config_from_args(a):
         measurement_refit_lr_position=a.measurement_refit_lr_position,
         measurement_refit_lr_direction=a.measurement_refit_lr_direction,
         measurement_refit_lr_rho_scaled=a.measurement_refit_lr_rho_scaled,
+        joint_refit_solver=a.joint_refit_solver,
         joint_refit_stationarity=not a.no_joint_refit_stationarity,
         alignment_gain=a.alignment_gain,
     )
