@@ -84,6 +84,37 @@ def _atomic_write_json(destination: Path, payload: Mapping[str, Any]) -> Path:
     return destination
 
 
+def _stage_name(command: Sequence[str]) -> str | None:
+    """Identify the producing script so two stages cannot share a run directory."""
+    for entry in command[1:]:
+        text = str(entry)
+        if text.endswith(".py"):
+            return Path(text).name
+    return None
+
+
+def _guard_existing_manifest(destination: Path, command: Sequence[str]) -> None:
+    """Refuse to overwrite a manifest that a different stage wrote.
+
+    A pipeline stage that reuses another stage's run directory used to replace
+    its ``manifest.json`` outright, destroying that stage's input hashes and
+    configuration with no error.  Re-running the same stage stays allowed.
+    """
+    if not destination.exists():
+        return
+    try:
+        existing = json.loads(destination.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    previous = _stage_name(existing.get("command", []))
+    current = _stage_name(command)
+    if previous and current and previous != current:
+        raise FileExistsError(
+            f"refusing to overwrite {destination}: it belongs to a different stage "
+            f"('{previous}', not '{current}'). Give each stage its own run directory."
+        )
+
+
 def write_experiment_manifest(
     run_dir: str | Path,
     *,
@@ -107,6 +138,7 @@ def write_experiment_manifest(
     destination_dir = resolve_project_path(run_dir, base=config.repository_root)
     destination_dir.mkdir(parents=True, exist_ok=True)
     destination = destination_dir / "manifest.json"
+    _guard_existing_manifest(destination, command)
     manifest_created_at = created_at or datetime.now(timezone.utc).isoformat().replace(
         "+00:00", "Z"
     )

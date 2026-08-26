@@ -280,3 +280,73 @@ def test_manifest_cli_start_and_finalize_support_driver_exit_trap(tmp_path):
     manifest = json.loads(manifest_path.read_text())
     assert manifest["status"] == "failed"
     assert manifest["metrics"]["stop_reason"] == "interrupted"
+
+
+def test_manifest_refuses_to_clobber_another_stage_in_the_same_directory(tmp_path):
+    """Two stages sharing a run directory silently destroyed each other's record.
+
+    The exporter and the converter both wrote ``manifest.json`` into
+    ``<target>/<run_tag>/``; whichever ran last won, and the ACTS-side
+    ``exporter_config`` plus input hashes were lost without any error.
+    """
+    import pytest
+    from project_config import load_project_config
+
+    import experiment_manifest as module
+
+    config = load_project_config()
+    source = tmp_path / "input.txt"
+    source.write_text("payload", encoding="utf-8")
+
+    first = module.write_experiment_manifest(
+        tmp_path / "run",
+        run_id="shared-tag",
+        command=["/usr/bin/python", "/repo/scripts/alignment_odd.py", "material"],
+        config=config,
+        inputs={"simulation_dir": source},
+        status="completed",
+    )
+    assert json.loads(first.read_text())["metrics"] == {}
+
+    with pytest.raises(FileExistsError, match="different stage"):
+        module.write_experiment_manifest(
+            tmp_path / "run",
+            run_id="shared-tag",
+            command=["/usr/bin/python", "/repo/scripts/material_artifact.py"],
+            config=config,
+            inputs={"material_root": source},
+            status="running",
+        )
+    # The original record survives untouched.
+    kept = json.loads(first.read_text())
+    assert kept["command"][1].endswith("alignment_odd.py")
+    assert "simulation_dir" in kept["inputs"]
+
+
+def test_manifest_allows_rerunning_the_same_stage(tmp_path):
+    from project_config import load_project_config
+
+    import experiment_manifest as module
+
+    config = load_project_config()
+    source = tmp_path / "input.txt"
+    source.write_text("payload", encoding="utf-8")
+    command = ["/usr/bin/python", "/repo/scripts/material_artifact.py"]
+
+    module.write_experiment_manifest(
+        tmp_path / "run",
+        run_id="tag",
+        command=command,
+        config=config,
+        inputs={"material_root": source},
+        status="failed",
+    )
+    again = module.write_experiment_manifest(
+        tmp_path / "run",
+        run_id="tag",
+        command=command,
+        config=config,
+        inputs={"material_root": source},
+        status="running",
+    )
+    assert json.loads(again.read_text())["status"] == "running"

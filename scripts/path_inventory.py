@@ -31,6 +31,7 @@ def build_path_inventory(config: ProjectConfig | None = None) -> dict[str, Any]:
     iterative_logs = data / "experiments" / "iterative_ml" / target_dir
     surface_helix_logs = data / "experiments" / "surface_helix" / target_dir
     helix_validation = data / "experiments" / "helix_validation" / target_dir
+    material_export = data / "experiments" / "material" / target_dir
 
     return {
         "schema_version": 1,
@@ -80,6 +81,7 @@ def build_path_inventory(config: ProjectConfig | None = None) -> dict[str, Any]:
             "iterative_logs": str(iterative_logs),
             "surface_helix_logs": str(surface_helix_logs),
             "helix_validation": str(helix_validation),
+            "material_export": str(material_export),
         },
         "default_outputs": {
             "aligned_geometry": str(
@@ -106,6 +108,7 @@ def build_path_inventory(config: ProjectConfig | None = None) -> dict[str, Any]:
             "helix_measurement_validation_csv": str(
                 helix_validation / "helix_measurement_comparison.csv"
             ),
+            "helix_holdout_keys": str(helix_validation / "holdout_keys.csv"),
         },
         "output_templates": {
             "iterative_geometry": str(
@@ -132,6 +135,27 @@ def build_path_inventory(config: ProjectConfig | None = None) -> dict[str, Any]:
             ),
             "residual_root": str(
                 residuals / "{label}_res_{axis}_{layer}_comparison.root"
+            ),
+            "material_root": str(
+                nominal_reconstruction / "material_kf_{output_suffix}.root"
+            ),
+            "propsummary_root": str(
+                nominal_reconstruction / "propsummary_kf_{output_suffix}.root"
+            ),
+            "material_artifact": str(
+                material_export / "{run_tag}" / "material_nodes.npz"
+            ),
+            "material_export_manifest": str(
+                material_export / "{run_tag}" / "export" / "manifest.json"
+            ),
+            "material_convert_manifest": str(
+                material_export / "{run_tag}" / "convert" / "manifest.json"
+            ),
+            "material_artifact_metadata": str(
+                material_export
+                / "{run_tag}"
+                / "convert"
+                / "material_artifact_metadata.json"
             ),
         },
     }

@@ -24,6 +24,7 @@ _LEGACY_DATA_ROOTS = {
     "surface_helix_logs": DATA_ROOT / "experiments" / "surface_helix",
     "helix_validation_output": DATA_ROOT / "experiments" / "helix_validation",
     "ablation": DATA_ROOT / "experiments" / "ablation",
+    "material_output": DATA_ROOT / "experiments" / "material",
     "archive": DATA_ROOT / "archive",
 }
 

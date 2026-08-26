@@ -22,7 +22,16 @@ from alignment_artifact_layout import (
     target_subdir,
     target_volume_map,
 )
-from project_config import absolute_project_path, add_config_argument, resolve_project_path
+from experiment_manifest import (
+    finalize_experiment_manifest,
+    write_experiment_manifest,
+)
+from project_config import (
+    absolute_project_path,
+    add_config_argument,
+    load_project_config,
+    resolve_project_path,
+)
 
 u = acts.UnitConstants
 
@@ -40,6 +49,23 @@ def reconstruction_output_name(stem: str, output_suffix: str = "") -> str:
     if output_suffix:
         return f"{stem}_{output_suffix}.root"
     return artifact_filename(stem, ".root")
+
+
+def reserve_reconstruction_output(
+    output_dir: Path, stem: str, output_suffix: str, overwrite: bool
+) -> Path:
+    """Return an output path, refusing to let RECREATE clobber existing data.
+
+    Every ACTS ROOT writer opens its file with fileMode="RECREATE", so reusing a
+    suffix silently destroys a previous run's artifact.
+    """
+    destination = Path(output_dir) / reconstruction_output_name(stem, output_suffix)
+    if destination.exists() and not overwrite:
+        raise FileExistsError(
+            f"refusing to overwrite existing ROOT output: {destination}. "
+            "Pass --overwrite or choose a different --output-suffix."
+        )
+    return destination
 
 
 def parse_geoid(id_str):
@@ -985,6 +1011,10 @@ def runReconstruction(
     alignmentDir: Path = None,  # Directory containing alignment output files
     alignedFile: str = None,  # Override path for the aligned transforms JSON
     outputSuffix: str = "",  # Appended as _{suffix} to output ROOT file names
+    recordMaterial: bool = False,  # Also record per-track material interactions
+    recordSteps: bool = False,  # Keep the stepping logger alive for diagnostics
+    materialEnergyLoss: bool = False,  # Gate 0 ablation only; see below
+    overwriteOutputs: bool = False,  # Allow RECREATE over an existing ROOT file
 ):
     """
     Run reconstruction with different geometry modes.
@@ -1189,6 +1219,80 @@ def runReconstruction(
     )
     s.addWhiteboardAlias("tracks", "selected-tracks")
 
+    if recordMaterial:
+        # Material export shares this exact chain -- same geometry, field, seed,
+        # particle selection, fitter and track selection -- so the recorded nodes
+        # belong to the very tracks written by RootTrackStatesWriter below.
+        #
+        # RootMaterialTrackWriter drops the material map key and iterates an
+        # unordered_map (RootMaterialTrackWriter.cpp:87), so the material rows
+        # carry no track index.  RootPropagationSummaryWriter is the index
+        # bridge: it emits (event_nr, track_nr) alongside the same start bound
+        # parameters that PropagationAlgorithm handed to the material recorder.
+        #
+        # energyLoss/multipleScattering stay off on purpose.  The first
+        # broken-helix version keeps curvature constant between segments and
+        # does not model energy loss; letting q/p evolve here would record nodes
+        # along a trajectory the fitted model cannot represent.
+        s.addAlgorithm(
+            acts.examples.TracksToParameters(
+                level=acts.logging.INFO,
+                inputTracks="tracks",
+                outputTrackParameters="params-from-tracks",
+            )
+        )
+        propagator = acts.examples.ConcretePropagator(
+            acts.Propagator(
+                acts.EigenStepper(field),
+                acts.Navigator(trackingGeometry=trackingGeometry),
+            )
+        )
+        s.addAlgorithm(
+            acts.examples.PropagationAlgorithm(
+                level=acts.logging.INFO,
+                propagatorImpl=propagator,
+                # A sterile SteppingLogger empties PropagationSummary::steps, which
+                # is what RootPropagationSummaryWriter counts nMaterials from
+                # (RootPropagationSummaryWriter.cpp:141-151).  Keeping it sterile
+                # is cheap for production; Gate 0 turns it on so nMaterials becomes
+                # a real cross-check of the recorded surface-material nodes.
+                sterileLogger=not recordSteps,
+                recordMaterialInteractions=True,
+                energyLoss=materialEnergyLoss,
+                multipleScattering=False,
+                covarianceTransport=False,
+                inputTrackParameters="params-from-tracks",
+                outputSummaryCollection="propagation_summary",
+                outputMaterialCollection="material_tracks",
+            )
+        )
+        s.addWriter(
+            acts.examples.root.RootMaterialTrackWriter(
+                level=acts.logging.INFO,
+                inputMaterialTracks="material_tracks",
+                filePath=str(
+                    reserve_reconstruction_output(
+                        outputDir, "material_kf", outputSuffix, overwriteOutputs
+                    )
+                ),
+                storeSurface=True,
+                storeVolume=True,
+                prePostStep=False,
+                collapseInteractions=False,
+            )
+        )
+        s.addWriter(
+            acts.examples.root.RootPropagationSummaryWriter(
+                level=acts.logging.INFO,
+                inputSummaryCollection="propagation_summary",
+                filePath=str(
+                    reserve_reconstruction_output(
+                        outputDir, "propsummary_kf", outputSuffix, overwriteOutputs
+                    )
+                ),
+            )
+        )
+
     s.addWriter(
         acts.examples.root.RootTrackStatesWriter(
             level=acts.logging.INFO,
@@ -1197,7 +1301,11 @@ def runReconstruction(
             inputTrackParticleMatching="track_particle_matching",
             inputSimHits="simhits",
             inputMeasurementSimHitsMap="measurement_simhits_map",
-            filePath=str(outputDir / reconstruction_output_name("trackstates_kf", outputSuffix)),
+            filePath=str(
+                reserve_reconstruction_output(
+                    outputDir, "trackstates_kf", outputSuffix, overwriteOutputs
+                )
+            ),
         )
     )
 
@@ -1207,7 +1315,11 @@ def runReconstruction(
             inputTracks="tracks",
             inputParticles="particles_selected",
             inputTrackParticleMatching="track_particle_matching",
-            filePath=str(outputDir / reconstruction_output_name("tracksummary_kf", outputSuffix)),
+            filePath=str(
+                reserve_reconstruction_output(
+                    outputDir, "tracksummary_kf", outputSuffix, overwriteOutputs
+                )
+            ),
         )
     )
 
@@ -1217,7 +1329,11 @@ def runReconstruction(
             inputTracks="tracks",
             inputParticles="particles_selected",
             inputTrackParticleMatching="track_particle_matching",
-            filePath=str(outputDir / reconstruction_output_name("performance_kf", outputSuffix)),
+            filePath=str(
+                reserve_reconstruction_output(
+                    outputDir, "performance_kf", outputSuffix, overwriteOutputs
+                )
+            ),
         )
     )
 
@@ -1341,6 +1457,61 @@ if "__main__" == __name__:
         type=str,
         default="",
         help="Suffix appended to output ROOT file names (e.g. 'ml' -> trackstates_kf_ml.root)",
+    )
+
+    # Material export command
+    material_parser = subparsers.add_parser(
+        "material",
+        help="Reconstruct and additionally record per-track material interactions",
+    )
+    material_parser.add_argument(
+        "--num-events", type=int, default=100000, help="Number of events"
+    )
+    material_parser.add_argument(
+        "--input-dir",
+        type=absolute_project_path,
+        default=None,
+        help="Input directory (default: simulation_output)",
+    )
+    material_parser.add_argument(
+        "--output-dir",
+        type=absolute_project_path,
+        default=None,
+        help="Output directory (default: reconstruction_output)",
+    )
+    material_parser.add_argument(
+        "--output-suffix",
+        type=str,
+        default="",
+        help="Suffix appended to output ROOT file names (e.g. 'mat0')",
+    )
+    material_parser.add_argument(
+        "--run-tag",
+        type=str,
+        required=True,
+        help="Manifest run identifier for this material export",
+    )
+    material_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow RECREATE to replace existing ROOT outputs",
+    )
+    material_parser.add_argument(
+        "--energy-loss",
+        action="store_true",
+        help=(
+            "Gate 0 ablation only: let q/p evolve during the recording pass. "
+            "Production keeps this off so the recorded nodes stay consistent "
+            "with the constant-curvature broken-helix model."
+        ),
+    )
+    material_parser.add_argument(
+        "--record-steps",
+        action="store_true",
+        help=(
+            "Keep the stepping logger alive so nMaterials is populated. "
+            "Costs memory per track; intended for Gate 0 diagnostics."
+        ),
     )
 
     args = parser.parse_args()
@@ -1577,6 +1748,7 @@ if "__main__" == __name__:
             mode=args.mode,
             alignedFile=args.aligned_file,
             outputSuffix=args.output_suffix,
+            overwriteOutputs=True,
         ).run()
 
         print("\n" + "=" * 60)
@@ -1587,3 +1759,106 @@ if "__main__" == __name__:
         print(f"  - {reconstruction_output_name('trackstates_kf', args.output_suffix)}: Track states")
         print(f"  - {reconstruction_output_name('tracksummary_kf', args.output_suffix)}: Track summary")
         print(f"  - {reconstruction_output_name('performance_kf', args.output_suffix)}: Reconstruction performance")
+
+    elif args.command == "material":
+        inputDir = (
+            Path(args.input_dir) if args.input_dir else data_path("simulation_output")
+        )
+        baseoutputDir = (
+            Path(args.output_dir)
+            if args.output_dir
+            else data_path("reconstruction_output")
+        )
+        outputDir = target_subdir(baseoutputDir / "nominal")
+        outputDir.mkdir(parents=True, exist_ok=True)
+
+        if not inputDir.exists():
+            print(f"Error: Input directory {inputDir} does not exist!")
+            print("Please run simulation first to generate simulation data.")
+            sys.exit(1)
+
+        # Material export is itself an algorithm experiment: the manifest is
+        # created before the Sequencer starts so an abort still leaves a record.
+        # Export and conversion are separate experiments; giving each its own
+        # run directory is what keeps both manifests from colliding.
+        manifest_dir = (
+            target_subdir(data_path("material_output")) / args.run_tag / "export"
+        )
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        material_root = outputDir / reconstruction_output_name(
+            "material_kf", args.output_suffix
+        )
+        propsummary_root = outputDir / reconstruction_output_name(
+            "propsummary_kf", args.output_suffix
+        )
+        manifest = write_experiment_manifest(
+            manifest_dir,
+            run_id=args.run_tag,
+            command=[sys.executable, *sys.argv],
+            config=load_project_config(),
+            inputs={"simulation_dir": inputDir},
+            outputs={
+                "material_root": material_root,
+                "propsummary_root": propsummary_root,
+                "trackstates_root": outputDir
+                / reconstruction_output_name("trackstates_kf", args.output_suffix),
+                "tracksummary_root": outputDir
+                / reconstruction_output_name("tracksummary_kf", args.output_suffix),
+            },
+            metrics={
+                "exporter_config": {
+                    "stepper": "EigenStepper",
+                    "navigator": "Navigator",
+                    "energy_loss": args.energy_loss,
+                    "multiple_scattering": False,
+                    "covariance_transport": False,
+                    "record_material_interactions": True,
+                    "sterile_logger": not args.record_steps,
+                    "store_surface": True,
+                    "store_volume": True,
+                    "pre_post_step": False,
+                    "collapse_interactions": False,
+                    "num_events": args.num_events,
+                    "random_seed": 42,
+                    "particle_hypothesis": "muon",
+                    "min_measurements": 5,
+                    "pt_min_gev": 2.0,
+                }
+            },
+            status="running",
+        )
+
+        detector = get_configured_open_data_detector(misaligned=False)
+        trackingGeometry = detector.trackingGeometry()
+        try:
+            runReconstruction(
+                trackingGeometry=trackingGeometry,
+                field=field,
+                digiConfigFile=digiConfigFile,
+                inputDir=inputDir,
+                outputDir=outputDir,
+                detector=detector,
+                numEvents=args.num_events,
+                mode="nominal",
+                outputSuffix=args.output_suffix,
+                recordMaterial=True,
+                recordSteps=args.record_steps,
+                materialEnergyLoss=args.energy_loss,
+                overwriteOutputs=args.overwrite,
+            ).run()
+        except BaseException as error:
+            finalize_experiment_manifest(
+                manifest,
+                status="failed",
+                metrics={"error": f"{type(error).__name__}: {error}"},
+            )
+            raise
+        finalize_experiment_manifest(manifest, status="completed")
+
+        print("\n" + "=" * 60)
+        print("Material export completed successfully!")
+        print("=" * 60)
+        print(f"\nOutput files saved to: {outputDir}")
+        print(f"  - {material_root.name}: material interactions")
+        print(f"  - {propsummary_root.name}: propagation summary (track index bridge)")
+        print(f"\nManifest: {manifest}")

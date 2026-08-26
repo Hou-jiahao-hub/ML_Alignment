@@ -77,3 +77,60 @@ def test_inventory_cli_is_independent_of_current_working_directory(tmp_path):
     assert json.loads(from_repository.stdout) == json.loads(
         from_external_directory.stdout
     )
+
+
+def test_inventory_exposes_the_material_artifact_contract():
+    """Material export writes below data/ and must be discoverable."""
+    import importlib
+
+    inventory = importlib.import_module("scripts.path_inventory").build_path_inventory()
+    directories = inventory["output_directories"]
+    templates = inventory["output_templates"]
+
+    assert "/data/experiments/material/" in directories["material_export"]
+    # ROOT names come from --output-suffix; only the experiment directory is
+    # keyed by --run-tag.  Tie the template to the producer so it cannot drift.
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from alignment_artifact_layout import artifact_filename
+
+    for name in ("material_root", "propsummary_root"):
+        assert "{output_suffix}" in templates[name], name
+        assert "/data/reconstruction/nominal/" in templates[name], name
+        stem = name.replace("_root", "") + "_kf"
+        assert templates[name].format(output_suffix="mat0").endswith(
+            f"{stem}_mat0.root"
+        )
+        # An empty suffix must fall back to the repository-wide naming rule.
+        assert artifact_filename(stem, ".root").startswith(f"{stem}_")
+
+    for name in (
+        "material_artifact",
+        "material_export_manifest",
+        "material_convert_manifest",
+        "material_artifact_metadata",
+    ):
+        assert "{run_tag}" in templates[name], name
+
+    # Export and conversion must never share a manifest path.
+    assert (
+        templates["material_export_manifest"]
+        != templates["material_convert_manifest"]
+    )
+    assert templates["material_artifact"].endswith("material_nodes.npz")
+
+
+def test_inventory_exposes_the_paired_holdout_key_list():
+    """Gate 4's row-identity list is the paired contract; it must be locatable."""
+    import importlib
+
+    inventory = importlib.import_module("scripts.path_inventory").build_path_inventory()
+    keys = inventory["default_outputs"]["helix_holdout_keys"]
+    assert keys.endswith("/holdout_keys.csv")
+    assert "/data/experiments/helix_validation/" in keys
+    # It lives beside the summary whose SHA256 refers to it.
+    assert (
+        Path(keys).parent
+        == Path(inventory["default_outputs"]["helix_validation_summary"]).parent
+    )
