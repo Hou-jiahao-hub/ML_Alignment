@@ -1325,6 +1325,62 @@ def test_predictive_covariance_is_damping_insensitive_when_padded():
     )
 
 
+def test_rank_deficient_rows_are_dropped_not_regularised():
+    """An underdetermined row gets NaN, not a number invented by the damping.
+
+    On the full set exactly one row of 70352 is like this: a single-arm fit with
+    4 hits against 5 gauge-fixed parameters.  Damping would have handed it a
+    finite variance that says nothing about the fit.  NaN propagates into the
+    callers' finite checks, which drop the row from BOTH arms, so the paired row
+    set stays shared.
+    """
+    module = load_module()
+    dtype = torch.float64
+    torch.manual_seed(11)
+    design = torch.randn((6, 3), dtype=dtype)
+    variance = torch.ones(6, dtype=dtype)
+    healthy = module.gauss_newton_hessian(design, variance, None)
+    # Fewer independent residuals than parameters: rank deficient by structure.
+    thin = module.gauss_newton_hessian(design[:2], variance[:2], None)
+
+    batch = torch.stack((healthy, thin, healthy))
+    prediction = torch.randn((3, 2, 3), dtype=dtype)
+    covariance, diagnostics = module.predictive_covariance(
+        batch, prediction, damping=module.PRODUCTION_DAMPING
+    )
+    assert diagnostics["n_rank_deficient_rows"] == 1
+    assert bool(torch.isnan(covariance[1]).all())
+    # The healthy rows are untouched -- bit for bit what they get on their own.
+    assert torch.isfinite(covariance[0]).all()
+    assert torch.isfinite(covariance[2]).all()
+    alone, _diagnostics = module.predictive_covariance(
+        healthy, prediction[0], damping=module.PRODUCTION_DAMPING
+    )
+    torch.testing.assert_close(covariance[0], alone, rtol=0.0, atol=0.0)
+
+
+def test_rank_deficient_fraction_is_pre_registered_and_gated(tmp_path):
+    """Dropping rows silently would let a shrinking row set look like a result."""
+    module = load_module()
+    assert module.MAX_RANK_DEFICIENT_ROW_FRACTION > 0.0
+    fixture = _gate4_fixture(module, n_tracks=8, noise=2.0e-3)
+    material = module.load_material_artifact(
+        _write_material_npz(tmp_path / "mat.npz", fixture)
+    )
+    report = module.run_paired_holdout(
+        fixture["batches"],
+        fixture["geometry"],
+        fixture["reference"],
+        material,
+        ((17, 8),),
+        tmp_path,
+    )
+    for arm in module.MODEL_ARMS:
+        entry = report["covariance_diagnostics"][arm][str(module.PRODUCTION_DAMPING)]
+        assert entry["n_rank_deficient_rows"] == 0
+    assert not any("rank deficient" in reason for reason in report["reasons"])
+
+
 def test_predictive_covariance_still_fails_on_a_genuinely_singular_direction():
     """Only exactly-null directions are excused; a real degeneracy still raises.
 

@@ -166,6 +166,15 @@ arm. `DAMPING_SCAN` is still recorded in full as a diagnostic, but only
 decides the sensitivity gate; a verdict that moves only under a large,
 deliberate bias is not a flip.
 
+A row whose *active* subspace is rank deficient is a third case, and neither the
+filler nor the damping may rescue it: there is no posterior width to report, so
+any number would be the regulariser's. Those rows are returned as NaN and the
+callers' finite checks drop them from **both** arms, keeping the paired row set
+shared; the count is gated by `MAX_RANK_DEFICIENT_ROW_FRACTION` so a silently
+shrinking row set cannot pass as a result. On the full 20000-event set exactly
+one row of 70352 qualifies -- a single-arm fit with 4 hits against 5 gauge-fixed
+parameters. Passing a single such matrix, rather than a batch, still raises.
+
 ## Input/output contracts
 
 - Geometry JSON contains surface IDs, translations, and rotation matrices.

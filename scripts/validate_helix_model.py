@@ -2219,6 +2219,12 @@ PRODUCTION_DAMPING = 0.0
 #: regularisation.  It does not gate, because a large damping is a large bias by
 #: definition and "the conclusion changes if you bias it" is trivially true.
 DAMPING_SCAN = (0.0, 1e-12, 1e-10, 1e-8, 1e-6)
+#: A row whose active subspace is rank deficient has no posterior to report.  On
+#: the full 20000-event set exactly one row of 70352 hits this: 4 hits against 5
+#: gauge-fixed reference parameters, an underdetermined fit whose prediction is
+#: meaningless.  Rows above this fraction make the verdict inconclusive rather
+#: than quietly resting on a reduced row set.
+MAX_RANK_DEFICIENT_ROW_FRACTION = 1.0e-3
 #: What does gate: the verdict must not move across dampings whose bias is
 #: numerically negligible.  Measured on real rows, 1e-12 shifts the broken arm's
 #: predictive variance by 0.34% (p99) and the single arm's by 4.5e-6.
@@ -2304,12 +2310,49 @@ def predictive_covariance(
     # are filled to the same scale, which leaves the factorisation as well
     # conditioned as the solvable subspace and, because J is zero there, leaves
     # the covariance analytically untouched.
+    # A rank-deficient active subspace is a different animal from a rounding
+    # problem, and the ladder below must not paper over it: a direction the fit
+    # genuinely cannot resolve has no posterior width, and any number reported
+    # for it would come from the regulariser alone.  The standard numerical-rank
+    # test separates the two.
+    # A rank-deficient active subspace has no posterior width to report, and no
+    # damping can honestly supply one -- it would return the regulariser's own
+    # number wearing a physics label.  The standard numerical-rank test finds
+    # them: on the full 20000-event set exactly one row of 70352 qualifies, a
+    # single-arm fit with 4 hits against 5 gauge-fixed parameters.
+    rank_floor = maximum * torch.finfo(symmetric.dtype).eps * n_parameters
+    degenerate = smallest_active <= rank_floor
+    if symmetric.ndim == 2:
+        # One matrix and nothing to fall back on: fail loudly, as the docstring
+        # promises, rather than handing back a silent NaN.
+        if bool(degenerate):
+            raise torch.linalg.LinAlgError(
+                "The active subspace is rank deficient (smallest active "
+                f"eigenvalue {float(smallest_active):.3e} <= {float(rank_floor):.3e}); "
+                "the posterior is undefined."
+            )
     level = torch.where(active, damping * scale.unsqueeze(-1), scale.unsqueeze(-1))
     regularized = symmetric + torch.diag_embed(level)
+    if bool(degenerate.any()):
+        # Keep the batch factorisable; the rows below are masked to NaN anyway,
+        # and the callers' finite checks drop them from BOTH arms, so the paired
+        # row set stays shared.
+        identity = torch.eye(
+            n_parameters, device=symmetric.device, dtype=symmetric.dtype
+        )
+        regularized = torch.where(
+            degenerate.reshape(degenerate.shape + (1, 1)), identity, regularized
+        )
     factor = torch.linalg.cholesky(regularized)
     solved = torch.cholesky_solve(prediction_jacobian.transpose(-1, -2), factor)
     covariance = prediction_jacobian @ solved
     covariance = 0.5 * (covariance + covariance.transpose(-1, -2))
+    if bool(degenerate.any()):
+        covariance = torch.where(
+            degenerate.reshape(degenerate.shape + (1, 1)),
+            torch.full_like(covariance, float("nan")),
+            covariance,
+        )
     diagnostics = {
         "cholesky_ok": True,
         "damping": float(damping),
@@ -2322,6 +2365,7 @@ def predictive_covariance(
         "max_eigenvalue": maximum,
         "condition_number": float("inf") if minimum <= 0 else maximum / minimum,
         "n_inactive_directions": int((n_parameters - n_active).max()),
+        "n_rank_deficient_rows": int(degenerate.sum()),
     }
     return covariance, diagnostics
 
@@ -3112,6 +3156,14 @@ def _merge_covariance_diagnostics(entries: list[dict]) -> dict:
         "min_eigenvalue": min(entry["min_eigenvalue"] for entry in entries),
         "max_eigenvalue": max(entry["max_eigenvalue"] for entry in entries),
         "condition_number": max(entry["condition_number"] for entry in entries),
+        "n_inactive_directions": max(
+            entry["n_inactive_directions"] for entry in entries
+        ),
+        # Summed, not maxed: these rows are dropped from the comparison and the
+        # gate needs the total, not the worst chunk.
+        "n_rank_deficient_rows": sum(
+            entry["n_rank_deficient_rows"] for entry in entries
+        ),
     }
 
 
@@ -3925,6 +3977,19 @@ def run_paired_holdout(
             f"dampings {list(DAMPING_STABILITY_SCAN)} for "
             f"{sensitivity['unstable_groups']}"
         )
+    n_rows_used = int(shared.event_track_ids.shape[0])
+    for arm in MODEL_ARMS:
+        production = arms[arm]["covariance_diagnostics"].get(str(PRODUCTION_DAMPING))
+        deficient = int((production or {}).get("n_rank_deficient_rows", 0))
+        fraction = deficient / max(n_rows_used, 1)
+        if deficient and fraction > MAX_RANK_DEFICIENT_ROW_FRACTION:
+            status = "inconclusive"
+            reasons.append(
+                f"{arm} arm: {deficient} of {n_rows_used} rows ({fraction:.2%}) are "
+                "rank deficient on their active subspace and were dropped from the "
+                f"comparison, above the pre-registered "
+                f"{MAX_RANK_DEFICIENT_ROW_FRACTION:.2%}"
+            )
     stationarity = {}
     for arm in MODEL_ARMS:
         decrement = arms[arm]["newton_decrement"]
@@ -3964,7 +4029,7 @@ def run_paired_holdout(
         "model": model,
         "material_artifact": material.source,
         "n_rows_total": total_rows,
-        "n_rows_used": int(shared.event_track_ids.shape[0]),
+        "n_rows_used": n_rows_used,
         "n_rows_missing_material": len(missing),
         "missing_material_fraction": missing_fraction,
         "on_missing_material": on_missing_material,
