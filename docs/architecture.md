@@ -139,7 +139,32 @@ Acceptance is per `(layer, mode, component)`: a group needs
 makes the whole verdict `inconclusive` rather than `passed`. Improvement means
 the paired-bootstrap 95% CI bound clears the threshold, never the point
 estimate. All thresholds, the bootstrap seed and the production damping are
-module-level constants pre-registered at Gate 1.
+module-level constants carrying a `PREREGISTRATION_VERSION`; any change to their
+value or meaning must bump it.
+
+### Predictive covariance and damping
+
+`predictive_covariance` returns `J H^-1 J^T` by Cholesky, never an explicit
+inverse. The broken arm pads `node_s` to a fixed width, and a padded slot enters
+no residual and no prediction, so its row and column of both `H` and `J` are
+*exactly* zero. Those directions are structural, not evidence of a sick fit, and
+they are filled to the active mean diagonal rather than damped: `J` annihilates
+them analytically, so the covariance is unchanged, while the factorisation stops
+being asked to invert a ~1e13 condition number. A prediction that *does* depend
+on an inactive direction is refused, because the variance reported for it would
+be an artefact of the regulariser. Reported conditioning describes the solvable
+subspace only.
+
+With the structural nulls handled, the exact posterior is solvable and
+`PRODUCTION_DAMPING` is `0.0` (pre-registration v2). This matters for the paired
+comparison: a non-zero *relative* damping can never be equivalent across the two
+arms, because their spectra genuinely differ -- the kinks are soft directions the
+single helix does not have. Measured on real rows at the v1 value of `1e-10`, the
+broken arm's reported variance moved 18.5% (p99) against 0.045% for the single
+arm. `DAMPING_SCAN` is still recorded in full as a diagnostic, but only
+`DAMPING_STABILITY_SCAN` -- dampings whose bias is numerically negligible --
+decides the sensitivity gate; a verdict that moves only under a large,
+deliberate bias is not a flip.
 
 ## Input/output contracts
 

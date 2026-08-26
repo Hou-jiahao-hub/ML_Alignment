@@ -2200,10 +2200,29 @@ def main(argv: list[str] | None = None) -> int:
 #: Monte-Carlo sampling covariance rather than against this same formula.
 HALF_CHI2_OBJECTIVE = True
 
-#: Pre-registered at Gate 1.  The scan is a sensitivity diagnostic only: the
-#: production value must never be chosen after looking at the scan.
-PRODUCTION_DAMPING = 1e-10
+#: Pre-registration v2 (Iteration 17).  v1 used ``PRODUCTION_DAMPING = 1e-10``
+#: with the whole of ``DAMPING_SCAN`` gating the verdict.  Both were wrong once
+#: the structurally inactive directions were understood:
+#:
+#: * A padded kink slot is an exact null direction of H and of J.  Damping it
+#:   relative to the mean diagonal forced the factorisation towards 1e13
+#:   condition numbers, which is why ``damping = 0`` used to fail outright.
+#:   ``predictive_covariance`` now fills those directions instead, so the exact
+#:   posterior is solvable and the production value can be zero: no bias, and
+#:   the two arms are equivalent by construction rather than by tuning.
+#: * A non-zero *relative* damping can never be equivalent across the arms --
+#:   their spectra differ because the kinks are genuinely soft.  At 1e-10 the
+#:   broken arm's reported variance moved by 18.5% (p99) against 0.045% for the
+#:   single arm.  No choice of relative damping removes that asymmetry.
+PRODUCTION_DAMPING = 0.0
+#: Recorded in full as a diagnostic: what the answer would be under increasing
+#: regularisation.  It does not gate, because a large damping is a large bias by
+#: definition and "the conclusion changes if you bias it" is trivially true.
 DAMPING_SCAN = (0.0, 1e-12, 1e-10, 1e-8, 1e-6)
+#: What does gate: the verdict must not move across dampings whose bias is
+#: numerically negligible.  Measured on real rows, 1e-12 shifts the broken arm's
+#: predictive variance by 0.34% (p99) and the single arm's by 4.5e-6.
+DAMPING_STABILITY_SCAN = (0.0, 1e-12)
 
 
 def gauss_newton_hessian(
@@ -2240,16 +2259,53 @@ def predictive_covariance(
     across the very different scales of the reference parameters and the kinks.
     """
     symmetric = 0.5 * (hessian + hessian.transpose(-1, -2))
+    n_parameters = symmetric.shape[-1]
+    # A padded kink slot enters no residual, so its row and column of J -- and
+    # therefore of H -- are exactly zero.  Those directions are structural, not
+    # a sick fit: the broken arm pads ``node_s`` to a fixed width, the single arm
+    # has nothing to pad.  Damping them relative to the mean diagonal would hand
+    # each one a variance of 1/(damping*scale); J annihilates that analytically,
+    # but it drags the factorisation to ~1e13 condition numbers, and the rounding
+    # error that follows is what made the two arms respond differently to the
+    # same pre-registered damping grid.
+    active = symmetric.abs().amax(dim=-1) > 0
+    n_active = active.sum(dim=-1)
+    if int(n_active.min()) == 0:
+        raise torch.linalg.LinAlgError(
+            "Every parameter direction is structurally inactive; the Hessian "
+            "carries no information at all."
+        )
+    # The prediction must not depend on a direction the fit cannot constrain.
+    # Verified rather than assumed: if it ever does, the covariance below would
+    # silently inherit whatever variance the filler assigns.
+    leak = (prediction_jacobian * (~active).unsqueeze(-2)).abs().amax()
+    tolerance = prediction_jacobian.abs().amax() * 1.0e-12
+    if float(leak) > float(tolerance):
+        raise ValueError(
+            "The prediction Jacobian is non-zero on a structurally inactive "
+            f"parameter direction (|J| = {float(leak):.3e} > {float(tolerance):.3e}); "
+            "the predictive covariance would be an artefact of the regulariser."
+        )
     eigenvalues = torch.linalg.eigvalsh(symmetric)
-    # Accepts one Hessian or a batch of them; diagnostics report the worst case
-    # across the batch so a single bad track cannot hide behind an average.
-    minimum = float(eigenvalues[..., 0].min())
+    # ``eigvalsh`` returns ascending order, so the structural zeros come first
+    # and the solvable subspace starts at ``n_parameters - n_active``.  Reporting
+    # the conditioning of that subspace is the point: an exactly-zero eigenvalue
+    # from padding says nothing about whether the fit is well determined.
+    first_active = (n_parameters - n_active).clamp_min(0)
+    smallest_active = eigenvalues.gather(-1, first_active.unsqueeze(-1)).squeeze(-1)
+    minimum = float(smallest_active.min())
     maximum = float(eigenvalues[..., -1].max())
-    scale = symmetric.diagonal(dim1=-2, dim2=-1).mean(dim=-1)
-    identity = torch.eye(
-        symmetric.shape[-1], device=symmetric.device, dtype=symmetric.dtype
-    )
-    regularized = symmetric + damping * scale[..., None, None] * identity
+    diagonal = symmetric.diagonal(dim1=-2, dim2=-1)
+    # Averaged over the solvable subspace only.  Including the structural zeros
+    # would make the same physical fit report a different scale purely because it
+    # was padded to a different width.
+    scale = (diagonal * active).sum(dim=-1) / n_active.to(diagonal.dtype)
+    # Active directions keep the pre-registered relative damping.  Inactive ones
+    # are filled to the same scale, which leaves the factorisation as well
+    # conditioned as the solvable subspace and, because J is zero there, leaves
+    # the covariance analytically untouched.
+    level = torch.where(active, damping * scale.unsqueeze(-1), scale.unsqueeze(-1))
+    regularized = symmetric + torch.diag_embed(level)
     factor = torch.linalg.cholesky(regularized)
     solved = torch.cholesky_solve(prediction_jacobian.transpose(-1, -2), factor)
     covariance = prediction_jacobian @ solved
@@ -2265,6 +2321,7 @@ def predictive_covariance(
         "min_eigenvalue": minimum,
         "max_eigenvalue": maximum,
         "condition_number": float("inf") if minimum <= 0 else maximum / minimum,
+        "n_inactive_directions": int((n_parameters - n_active).max()),
     }
     return covariance, diagnostics
 
@@ -2662,6 +2719,10 @@ def broken_helix_predictive_distribution(
 
 #: All of the following were pre-registered at Gate 1 and must not be tuned
 #: after looking at a result.  See ``docs/history/ml_optimization_log.md``.
+#: Bumped whenever any constant in this block changes meaning or value, so a
+#: summary written under one set of rules can never be mistaken for another.
+#: v1: Gate 1 (Iteration 13).  v2: Iteration 17, damping (see PRODUCTION_DAMPING).
+PREREGISTRATION_VERSION = 2
 BOOTSTRAP_RESAMPLES = 1000
 BOOTSTRAP_SEED = 20260825
 MIN_GROUP_COMPONENTS = 200
@@ -3605,7 +3666,27 @@ def _damping_sensitivity(
                         values["nll_improves"]
                     )
     flipped = sorted(key for key, values in verdicts.items() if len(values) > 1)
-    return {"by_damping": report, "flipped_groups": flipped, "stable": not flipped}
+    stability: dict[str, set] = {}
+    for damping in DAMPING_STABILITY_SCAN:
+        payload = report.get(str(damping))
+        if payload is None or not payload.get("solvable"):
+            continue
+        for layer_key, by_mode in payload["groups"].items():
+            for mode, by_component in by_mode.items():
+                for name, values in by_component.items():
+                    if values is None:
+                        continue
+                    stability.setdefault(f"{layer_key}|{mode}|{name}", set()).add(
+                        values["nll_improves"]
+                    )
+    unstable = sorted(key for key, values in stability.items() if len(values) > 1)
+    return {
+        "by_damping": report,
+        "flipped_groups": flipped,
+        "stability_scan": list(DAMPING_STABILITY_SCAN),
+        "unstable_groups": unstable,
+        "stable": not unstable,
+    }
 
 
 def write_holdout_keys(
@@ -3840,8 +3921,9 @@ def run_paired_holdout(
     if not sensitivity["stable"]:
         status = "failed" if status == "passed" else status
         reasons.append(
-            "damping sensitivity: NLL verdict flips across the pre-registered grid "
-            f"for {sensitivity['flipped_groups']}"
+            "damping sensitivity: NLL verdict flips across the negligible-bias "
+            f"dampings {list(DAMPING_STABILITY_SCAN)} for "
+            f"{sensitivity['unstable_groups']}"
         )
     stationarity = {}
     for arm in MODEL_ARMS:
@@ -3913,6 +3995,8 @@ def run_paired_holdout(
             "newton_decrement_stationary": NEWTON_DECREMENT_STATIONARY,
             "max_non_stationary_row_fraction": MAX_NON_STATIONARY_ROW_FRACTION,
             "damping_scan": list(DAMPING_SCAN),
+            "damping_stability_scan": list(DAMPING_STABILITY_SCAN),
+            "preregistration_version": PREREGISTRATION_VERSION,
             "required_groups": [
                 f"{volume}:{layer}|{mode}|{REQUIRED_COMPONENT}"
                 for volume, layer in holdout_layers

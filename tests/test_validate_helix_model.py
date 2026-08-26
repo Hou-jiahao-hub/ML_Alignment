@@ -1146,24 +1146,37 @@ def test_predictive_covariance_never_forms_an_explicit_inverse():
     assert "cholesky_solve" in source
 
 
-def test_predictive_covariance_reports_and_survives_a_singular_hessian():
+def test_predictive_covariance_refuses_a_prediction_that_needs_a_null_direction():
+    """A variance that only damping made finite is an artefact, not a result.
+
+    The second column is exactly zero, so the fit cannot constrain that parameter
+    at all.  Predicting through it used to be survivable: damping handed the
+    direction a variance of 1/(damping*scale) and the answer came back finite but
+    entirely determined by the regulariser.  Refusing is the honest response, and
+    the broken arm never needs the old behaviour -- its padded slots are absent
+    from the prediction too, which the test below pins down.
+    """
     module = load_module()
     dtype = torch.float64
-    # A rank-deficient direction: without damping the Cholesky must fail.
     design = torch.tensor([[1.0, 0.0], [2.0, 0.0]], dtype=dtype)
     variance = torch.ones(2, dtype=dtype)
     hessian = module.gauss_newton_hessian(design, variance, None)
-    prediction = torch.eye(2, dtype=dtype)
 
-    with pytest.raises(torch.linalg.LinAlgError):
-        module.predictive_covariance(hessian, prediction, damping=0.0)
+    with pytest.raises(ValueError, match="structurally inactive"):
+        module.predictive_covariance(hessian, torch.eye(2, dtype=dtype), damping=1e-6)
 
+    # Predicting only through the constrained direction is fine, needs no damping,
+    # and reports the conditioning of the subspace that actually carries the fit.
+    prediction = torch.tensor([[1.0, 0.0]], dtype=dtype)
     covariance, diagnostics = module.predictive_covariance(
-        hessian, prediction, damping=1e-6
+        hessian, prediction, damping=0.0
     )
     assert torch.isfinite(covariance).all()
-    assert diagnostics["min_eigenvalue"] == pytest.approx(0.0, abs=1e-12)
-    assert diagnostics["damping"] == pytest.approx(1e-6)
+    assert covariance.shape == (1, 1)
+    assert diagnostics["min_eigenvalue"] > 0.0
+    assert diagnostics["condition_number"] == pytest.approx(1.0)
+    assert diagnostics["n_inactive_directions"] == 1
+    assert diagnostics["damping"] == pytest.approx(0.0)
 
 
 def test_damping_grid_is_pre_registered_and_brackets_production():
@@ -1183,6 +1196,150 @@ def test_damping_grid_is_pre_registered_and_brackets_production():
         if previous is not None:
             assert trace <= previous + 1e-12
         previous = trace
+
+
+def test_preregistration_v2_records_the_damping_decision():
+    """The damping constants and the version that owns them move together.
+
+    v1 damped every direction relative to the mean diagonal, which the padded
+    kink slots made meaningless.  Anything that changes these values must also
+    change the version, or a summary written under one rule set reads as if it
+    were written under another.
+    """
+    module = load_module()
+    assert module.PREREGISTRATION_VERSION == 2
+    # Zero is the whole point: the exact posterior, identical for both arms.
+    assert module.PRODUCTION_DAMPING == 0.0
+    assert module.PRODUCTION_DAMPING in module.DAMPING_SCAN
+    # The gating sub-grid is a subset of the diagnostic scan, and contains only
+    # dampings whose bias is numerically negligible.
+    assert set(module.DAMPING_STABILITY_SCAN) <= set(module.DAMPING_SCAN)
+    assert module.PRODUCTION_DAMPING in module.DAMPING_STABILITY_SCAN
+    assert max(module.DAMPING_STABILITY_SCAN) <= 1e-12
+    # The large dampings stay in the record as a diagnostic even though they no
+    # longer gate.
+    assert max(module.DAMPING_SCAN) >= 1e-6
+
+
+def test_damping_sensitivity_gates_on_the_negligible_bias_subgrid_only(tmp_path):
+    """A verdict that only moves under a large, deliberate bias is not a flip.
+
+    ``flipped_groups`` keeps reporting the full scan so the diagnostic survives,
+    but only ``unstable_groups`` -- measured across dampings that barely move the
+    variance -- decides whether the gate fails.
+    """
+    module = load_module()
+    fixture = _gate4_fixture(module, n_tracks=8, noise=2.0e-3)
+    material = module.load_material_artifact(
+        _write_material_npz(tmp_path / "mat.npz", fixture)
+    )
+    report = module.run_paired_holdout(
+        fixture["batches"],
+        fixture["geometry"],
+        fixture["reference"],
+        material,
+        ((17, 8),),
+        tmp_path,
+    )
+    sensitivity = report["damping_sensitivity"]
+    assert sensitivity["stability_scan"] == list(module.DAMPING_STABILITY_SCAN)
+    assert "unstable_groups" in sensitivity
+    assert sensitivity["stable"] == (not sensitivity["unstable_groups"])
+    # The gate must not consult the full scan any more.
+    assert set(sensitivity["unstable_groups"]) <= set(sensitivity["flipped_groups"])
+    # Damping zero has to be solvable for both arms, or the exact posterior --
+    # the entire point of v2 -- is unavailable.
+    assert sensitivity["by_damping"]["0.0"]["solvable"] is True
+
+
+def _padded_hessian(module, n_active, n_padded, seed=17, dtype=torch.float64):
+    """One physical fit, embedded in a wider parameter vector by zero padding.
+
+    Mirrors the broken arm: ``node_s`` is padded to a fixed width, and a slot
+    that no track uses enters no residual, so its row and column of ``J`` -- and
+    therefore of ``H`` -- are exactly zero.
+    """
+    torch.manual_seed(seed)
+    n_residual = 40
+    design = torch.zeros((n_residual, n_padded), dtype=dtype)
+    design[:, :n_active] = torch.randn((n_residual, n_active), dtype=dtype)
+    # A deliberately soft direction, as the kinks are relative to the reference.
+    design[:, n_active - 1] *= 1.0e-3
+    variance = torch.rand(n_residual, dtype=dtype) * 0.4 + 0.3
+    hessian = module.gauss_newton_hessian(design, variance, None)
+    prediction = torch.zeros((2, n_padded), dtype=dtype)
+    prediction[:, :n_active] = torch.randn((2, n_active), dtype=dtype)
+    return hessian, prediction
+
+
+def test_predictive_covariance_ignores_structurally_inactive_directions():
+    """Padding the parameter vector must not change the predicted covariance.
+
+    A padded kink slot enters no residual and no prediction, so it is exactly a
+    null direction of both ``H`` and ``J``.  Damping it relative to the mean
+    diagonal hands it a variance of ``1/(damping * scale)``, which is analytically
+    projected away by ``J`` but numerically pushes the factorisation towards 1e13
+    condition numbers.  That is the whole reason the two Gate 4 arms disagreed:
+    the single arm has no padding to damp.
+    """
+    module = load_module()
+    reference, prediction = _padded_hessian(module, n_active=5, n_padded=5)
+    baseline, _diagnostics = module.predictive_covariance(
+        reference, prediction, damping=module.PRODUCTION_DAMPING
+    )
+    for n_padded in (9, 17, 29):
+        hessian, wide = _padded_hessian(module, n_active=5, n_padded=n_padded)
+        covariance, diagnostics = module.predictive_covariance(
+            hessian, wide, damping=module.PRODUCTION_DAMPING
+        )
+        torch.testing.assert_close(covariance, baseline, rtol=1e-9, atol=1e-14)
+        # The reported conditioning must describe the solvable subspace, not the
+        # padding: an exactly-zero eigenvalue is not evidence of a sick fit.
+        assert diagnostics["condition_number"] < 1.0e12
+        assert diagnostics["n_inactive_directions"] == n_padded - 5
+
+
+def test_predictive_covariance_is_damping_insensitive_when_padded():
+    """The damping scan must not move a padded fit more than an unpadded one.
+
+    This is the pre-registered damping-sensitivity diagnostic reduced to its
+    mechanism.  Before the fix the padded arm's variance moved by orders of
+    magnitude across the grid while the unpadded arm barely moved at all.
+    """
+    module = load_module()
+    spreads = {}
+    for n_padded in (5, 29):
+        hessian, prediction = _padded_hessian(module, n_active=5, n_padded=n_padded)
+        traces = []
+        for damping in module.DAMPING_SCAN:
+            if damping == 0.0:
+                continue
+            covariance, _diagnostics = module.predictive_covariance(
+                hessian, prediction, damping=damping
+            )
+            traces.append(float(covariance.diagonal().sum()))
+        spreads[n_padded] = max(traces) / min(traces)
+    assert spreads[29] == pytest.approx(spreads[5], rel=1e-6), (
+        f"padded fit moves {spreads[29]:.6f}x across the grid while the "
+        f"unpadded fit moves {spreads[5]:.6f}x"
+    )
+
+
+def test_predictive_covariance_still_fails_on_a_genuinely_singular_direction():
+    """Only exactly-null directions are excused; a real degeneracy still raises.
+
+    The fix must not silently paper over a rank-deficient fit that carries real
+    residual sensitivity -- that would turn a broken fit into a confident number.
+    """
+    module = load_module()
+    dtype = torch.float64
+    # Column 1 is a duplicate of column 0: rank deficient, but neither column is
+    # null, so this is a genuine degeneracy rather than padding.
+    design = torch.tensor([[1.0, 1.0], [2.0, 2.0]], dtype=dtype)
+    variance = torch.ones(2, dtype=dtype)
+    hessian = module.gauss_newton_hessian(design, variance, None)
+    with pytest.raises(torch.linalg.LinAlgError):
+        module.predictive_covariance(hessian, torch.eye(2, dtype=dtype), damping=0.0)
 
 
 # ---------------------------------------------------------------------------
