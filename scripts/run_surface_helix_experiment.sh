@@ -35,6 +35,7 @@ JOINT_SMT_SEED_ITERS=200
 JOINT_MEASUREMENT_REFIT_ITERS=200
 LM_MAX_ITERS=20
 MAX_TRACKS=0
+SKIP_BLIND_VALIDATION=0
 LAMBDA_L2=1e-5
 ALIGNMENT_DIR="$ALIGNMENT_ROOT"
 SIMULATION_DIR="$SIMULATION_ROOT"
@@ -82,6 +83,8 @@ Options:
   --event-split-seed N       Stable 80/10/10 event split seed (default: 6006)
   --baseline-ratio VALUE     Deprecated; ignored
   --helix-candidates SPEC    Deprecated; ignored
+  --skip-blind-validation    Stop after calibration; leave the one-shot blind
+                             validation split untouched
   --dry-run                  Print both conditional polish candidates
 EOF
 }
@@ -114,6 +117,7 @@ while [[ $# -gt 0 ]]; do
         --conda-sh) CONDA_SH="$2"; shift 2 ;;
         --conda-env) CONDA_ENV="$2"; shift 2 ;;
         --event-split-seed) EVENT_SPLIT_SEED="$2"; shift 2 ;;
+        --skip-blind-validation) SKIP_BLIND_VALIDATION=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1" ;;
@@ -379,6 +383,7 @@ current_summary="$joint_summary"
 current_acceptance="$joint_acceptance"
 stop_reason="joint_acceptance_passed"
 polish_attempts=0
+joint_adopted=1
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
     joint_improved="$(python3 -c 'import json,sys; from reconstruction_acceptance import acceptance_score,polish_improves; joint=json.load(open(sys.argv[1])); warm=json.load(open(sys.argv[2])); print("1" if polish_improves(acceptance_score(joint),acceptance_score(warm)) else "0")' "$joint_acceptance" "$warm2_acceptance")"
@@ -389,6 +394,7 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
         current_summary="$warm2_summary"
         current_acceptance="$warm2_acceptance"
         stop_reason="joint_not_improved"
+        joint_adopted=0
     fi
 fi
 
@@ -440,9 +446,13 @@ done
 
 calibration_acceptance="$current_acceptance"
 final_validation_acceptance="$(acceptance_path "${RUN_TAG}_validation")"
-CURRENT_STAGE="blind_validation"
-run_acceptance "${RUN_TAG}_validation" "$current_states" "$final_validation_acceptance" validation || true
-current_acceptance="$final_validation_acceptance"
+if [[ "$SKIP_BLIND_VALIDATION" -eq 1 ]]; then
+    echo "note: --skip-blind-validation is set; the validation split stays untouched" >&2
+else
+    CURRENT_STAGE="blind_validation"
+    run_acceptance "${RUN_TAG}_validation" "$current_states" "$final_validation_acceptance" validation || true
+    current_acceptance="$final_validation_acceptance"
+fi
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
     require_file "$current_geom"
@@ -464,10 +474,26 @@ run_conda "$RUN_DIR/geometry_comparison.log" \
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
     CURRENT_STAGE="finalize"
-    python3 -c 'import json,sys; acceptance=json.load(open(sys.argv[1])); joint=json.load(open(sys.argv[8])); joint_effective=joint.get("best_iteration",-1)>=0 and joint.get("correction_max_abs",0)>0; passed=bool(acceptance["passed"] and joint_effective); out={"schema_version":2,"run_tag":sys.argv[2],"workflow":"surface-warm2_block-lm_surface-polish2_blind-validation","target_layers":["17:8","24:4"],"active_dof":[0,1,5],"event_split":{"seed":int(sys.argv[10]),"train":80,"calibration":10,"validation":10},"acceptance_baseline":sys.argv[11],"final_geometry":sys.argv[3],"final_trackstates":sys.argv[4],"final_tracksummary":sys.argv[5],"joint_free":joint,"joint_effective":joint_effective,"calibration_acceptance":json.load(open(sys.argv[12])),"final_acceptance":acceptance,"polish_attempts":int(sys.argv[6]),"stop_reason":"blind_validation_passed" if passed else "blind_validation_failed","diagnostics":{"truth_and_nominal":"diagnostic_only"},"passed":passed}; json.dump(out,open(sys.argv[9],"w"),indent=2)' \
-        "$current_acceptance" "$RUN_TAG" "$current_geom" "$current_states" "$current_summary" \
-        "$polish_attempts" "$stop_reason" "$joint_solver_summary" "$RUN_DIR/experiment_summary.json" \
-        "$EVENT_SPLIT_SEED" "$BASELINE_PROFILE" "$calibration_acceptance"
+    summary_args=(
+        --run-tag "$RUN_TAG"
+        --joint-summary "$joint_solver_summary"
+        --joint-adopted "$joint_adopted"
+        --calibration-acceptance "$calibration_acceptance"
+        --acceptance-baseline "$BASELINE_PROFILE"
+        --final-geometry "$current_geom"
+        --final-trackstates "$current_states"
+        --final-tracksummary "$current_summary"
+        --polish-attempts "$polish_attempts"
+        --selection-stop-reason "$stop_reason"
+        --event-split-seed "$EVENT_SPLIT_SEED"
+        --output "$RUN_DIR/experiment_summary.json"
+    )
+    if [[ "$SKIP_BLIND_VALIDATION" -eq 1 ]]; then
+        summary_args+=(--skip-blind-validation)
+    else
+        summary_args+=(--final-acceptance "$current_acceptance")
+    fi
+    python3 write_experiment_summary.py "${summary_args[@]}"
     manifest_outputs=(
         --output "surface_warm1_geometry=$(geometry_path "${RUN_TAG}_surface_warm1")"
         --output "surface_warm1_states=$(states_path "${RUN_TAG}_surface_warm1")"
@@ -487,11 +513,13 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
         --output "final_states=$current_states"
         --output "final_summary=$current_summary"
         --output "acceptance=$current_acceptance"
-        --output "validation_acceptance=$final_validation_acceptance"
         --output "experiment_summary=$RUN_DIR/experiment_summary.json"
         --output "track_chi2_comparison=$RUN_DIR/track_chi2_ndf_comparison.png"
         --output "geometry_comparison=$RUN_DIR/geometry_comparison"
     )
+    if [[ "$SKIP_BLIND_VALIDATION" -eq 0 ]]; then
+        manifest_outputs+=(--output "validation_acceptance=$final_validation_acceptance")
+    fi
     for ((polish_index=1; polish_index<=polish_attempts; polish_index++)); do
         polish_label="${RUN_TAG}_surface_polish${polish_index}"
         manifest_outputs+=(

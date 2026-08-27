@@ -80,3 +80,24 @@ if bash "$SCRIPT" --dry-run > /dev/null 2>&1; then
     echo "driver accepted a missing --run-tag" >&2
     exit 1
 fi
+
+# --skip-blind-validation must leave the one-shot validation split untouched.
+skip_output="$(mktemp)"
+trap 'rm -f "$output" "$skip_output"' EXIT
+
+bash "$SCRIPT" \
+    --run-tag tdd_skip \
+    --dry-run \
+    --skip-blind-validation \
+    --input-geom inputs/current.json \
+    --states inputs/states.root \
+    --summary inputs/summary.root \
+    --nominal-states inputs/nominal.root \
+    > "$skip_output" 2>&1
+
+grep -Fq -- "the validation split stays untouched" "$skip_output"
+[[ "$(grep -Fc -- "--event-partition validation" "$skip_output")" -eq 0 ]]
+[[ "$(grep -Fc -- "acceptance_tdd_skip_validation.json" "$skip_output")" -eq 0 ]]
+# every calibration-side acceptance still runs
+[[ "$(grep -Fc -- "--event-partition calibration" "$skip_output")" -eq 4 ]]
+[[ "$(grep -Fc -- "python reconstruction_acceptance.py" "$skip_output")" -eq 4 ]]
