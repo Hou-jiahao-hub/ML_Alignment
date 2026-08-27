@@ -79,6 +79,15 @@ DEFAULT_MIN_FIT_HITS = 8
 DEFAULT_MIN_FIT_SPAN = 300.0
 DEFAULT_MIN_EXTRAPOLATION_FIT_HITS = 4
 DEFAULT_MIN_EXTRAPOLATION_FIT_SPAN = 100.0
+#: A hit count is only a proxy for what actually determines the fit: a strip hit
+#: contributes LOC0 alone, a pixel hit contributes LOC0 and LOC1.  Iteration 22
+#: measured the real distribution over the 47809 extrapolation rows -- three rows
+#: carry 4 residual components against 5 gauge-fixed reference parameters and 299
+#: carry exactly 5 -- so the floor belongs on the residual count.  Raising
+#: ``DEFAULT_MIN_EXTRAPOLATION_FIT_HITS`` instead would empty a whole group
+#: (17:8 forward drops from 5034 rows to 42 at a floor of 6) to remove three bad
+#: ones.  5 parameters plus one degree of redundancy.
+DEFAULT_MIN_EXTRAPOLATION_FIT_RESIDUALS = 6
 DEFAULT_MAX_TRACKS = 1000
 DEFAULT_FIT_ITERS = 200
 #: ``fit_iters`` only bounds the Adam arm.  Gauss-Newton is the default because
@@ -111,6 +120,7 @@ class HelixValidationConfig:
     min_fit_span: float = DEFAULT_MIN_FIT_SPAN
     min_extrapolation_fit_hits: int = DEFAULT_MIN_EXTRAPOLATION_FIT_HITS
     min_extrapolation_fit_span: float = DEFAULT_MIN_EXTRAPOLATION_FIT_SPAN
+    min_extrapolation_fit_residuals: int = DEFAULT_MIN_EXTRAPOLATION_FIT_RESIDUALS
     max_tracks: int = DEFAULT_MAX_TRACKS
     fit_iters: int = DEFAULT_FIT_ITERS
     gpu: bool = False
@@ -934,6 +944,7 @@ def build_track_batches(
     context_hits_after: int = 0,
     min_extrapolation_fit_hits: int | None = None,
     min_extrapolation_fit_span: float | None = None,
+    min_extrapolation_fit_residuals: int = DEFAULT_MIN_EXTRAPOLATION_FIT_RESIDUALS,
 ) -> TrackBatches:
     """Build one local fit window for every held-out measurement state."""
     if context_hits_before < 0 or context_hits_after < 0:
@@ -952,6 +963,8 @@ def build_track_batches(
         raise ValueError("min_extrapolation_fit_hits must be at least 2.")
     if extrapolation_span < 0:
         raise ValueError("min_extrapolation_fit_span must be non-negative.")
+    if min_extrapolation_fit_residuals < 1:
+        raise ValueError("min_extrapolation_fit_residuals must be at least 1.")
     holdout_layers = {tuple(map(int, layer)) for layer in holdout_layers}
     positions = inputs.hit_global_positions.detach().cpu().numpy()
     event_ids = inputs.hit_event_ids.detach().cpu().numpy()
@@ -960,6 +973,7 @@ def build_track_batches(
     layer_ids = inputs.hit_layer_ids.detach().cpu().numpy()
     module_ids = inputs.hit_module_ids.detach().cpu().numpy()
     sensor_ids = inputs.hit_sensor_ids.detach().cpu().numpy()
+    loc1_valid_hits = inputs.loc1_valid.detach().cpu().numpy()
     radius = np.hypot(positions[:, 0], positions[:, 1])
     supplied_path = (
         inputs.hit_path_length.detach().cpu().numpy()
@@ -1058,6 +1072,16 @@ def build_track_batches(
                 )
                 if len(fit_indices) < required_hits:
                     continue
+                if mode != "interpolation":
+                    # Every hit gives LOC0; only a valid LOC1 gives a second
+                    # residual.  A window below the floor cannot determine the
+                    # reference helix, and its prediction would report the
+                    # arbitrariness of an underdetermined fit as model error.
+                    fit_residuals = len(fit_indices) + int(
+                        np.count_nonzero(loc1_valid_hits[fit_indices])
+                    )
+                    if fit_residuals < min_extrapolation_fit_residuals:
+                        continue
                 fit_paths = path_values[fit_indices]
                 fit_span = float(np.max(fit_paths) - np.min(fit_paths))
                 if fit_span < required_span:
@@ -1563,6 +1587,8 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
         raise ValueError("min_extrapolation_fit_hits must be at least 2.")
     if config.min_extrapolation_fit_span < 0:
         raise ValueError("min_extrapolation_fit_span must be non-negative.")
+    if config.min_extrapolation_fit_residuals < 1:
+        raise ValueError("min_extrapolation_fit_residuals must be at least 1.")
     if config.fit_iters < 1:
         raise ValueError("fit_iters must be at least 1.")
     if config.max_tracks < 0:
@@ -1656,6 +1682,7 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
                 "min_fit_span_mm": config.min_fit_span,
                 "min_extrapolation_fit_hits": config.min_extrapolation_fit_hits,
                 "min_extrapolation_fit_span_mm": config.min_extrapolation_fit_span,
+                "min_extrapolation_fit_residuals": config.min_extrapolation_fit_residuals,
                 "max_tracks_per_mode": config.max_tracks,
                 "fit_iters": config.fit_iters,
                 "context_hits_before": config.context_hits_before,
@@ -1701,6 +1728,7 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
         context_hits_after=config.context_hits_after,
         min_extrapolation_fit_hits=config.min_extrapolation_fit_hits,
         min_extrapolation_fit_span=config.min_extrapolation_fit_span,
+        min_extrapolation_fit_residuals=config.min_extrapolation_fit_residuals,
     )
     initial_parameters = initialize_helices(batches, device=device, dtype=dtype)
     seeded_parameters = seed_helices(
@@ -1827,6 +1855,7 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
             "min_fit_span_mm": config.min_fit_span,
             "min_extrapolation_fit_hits": config.min_extrapolation_fit_hits,
             "min_extrapolation_fit_span_mm": config.min_extrapolation_fit_span,
+            "min_extrapolation_fit_residuals": config.min_extrapolation_fit_residuals,
             "max_tracks": config.max_tracks,
             "root_entry_stop": entry_stop,
             "fit_iters": config.fit_iters,
@@ -2053,6 +2082,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=float,
         default=defaults.min_extrapolation_fit_span,
     )
+    parser.add_argument(
+        "--min-extrapolation-fit-residuals",
+        type=int,
+        default=defaults.min_extrapolation_fit_residuals,
+    )
     parser.add_argument("--max-tracks", type=int, default=defaults.max_tracks)
     parser.add_argument("--fit-iters", type=int, default=defaults.fit_iters)
     parser.add_argument(
@@ -2146,6 +2180,7 @@ def config_from_args(args: argparse.Namespace) -> HelixValidationConfig:
         min_fit_hits=args.min_fit_hits,
         min_fit_span=args.min_fit_span,
         min_extrapolation_fit_hits=args.min_extrapolation_fit_hits,
+        min_extrapolation_fit_residuals=args.min_extrapolation_fit_residuals,
         min_extrapolation_fit_span=args.min_extrapolation_fit_span,
         max_tracks=args.max_tracks,
         fit_iters=args.fit_iters,
@@ -2771,7 +2806,11 @@ def broken_helix_predictive_distribution(
 #: Bumped whenever any constant in this block changes meaning or value, so a
 #: summary written under one set of rules can never be mistaken for another.
 #: v1: Gate 1 (Iteration 13).  v2: Iteration 17, damping (see PRODUCTION_DAMPING).
-PREREGISTRATION_VERSION = 2
+#: v3: Iteration 22, the extrapolation residual floor (see
+#: DEFAULT_MIN_EXTRAPOLATION_FIT_RESIDUALS).  That constant lives outside this
+#: block, but it decides which rows reach Gate 4 at all, so a v2 summary and a v3
+#: summary are not comparable and must not be read as one series.
+PREREGISTRATION_VERSION = 3
 BOOTSTRAP_RESAMPLES = 1000
 BOOTSTRAP_SEED = 20260825
 MIN_GROUP_COMPONENTS = 200

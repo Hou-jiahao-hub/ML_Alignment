@@ -1816,3 +1816,105 @@ p50 已到 1.02e-08。此项不作为幅度结论，只作为方向佐证。
   （300 轨迹上 +1800 → 38.2，+2800 → 102.9，`n_effective` 未变），加预算会把一个
   「未收敛但稳定」的 seed 换成一个「可能发散」的 seed。
 
+
+---
+
+## Iteration 22 — 外推窗口的欠定行：hits 阈值被证伪，改用残差数判据（P3）
+
+**改动**：`scripts/validate_helix_model.py`、`tests/test_validate_helix_model.py`
+**性质**：**预注册变更**。`PREREGISTRATION_VERSION` 2 → 3。
+
+### 1. 预注册（写在跑任何一次全量之前，事后不得改）
+
+#### 1.1 起点
+
+Iteration 16 §6 把 `24:4|backward_extrapolation` 的秩亏行归因到预注册的
+`min_extrapolation_fit_hits = 4` 过松：single 臂 4 hits 撑 5 个 gauge-fixed 参数，
+丢弃的 8 行 `n_hits` 全是 4–5。P3 就是这一条挂账。
+
+#### 1.2 选值依据（唯一合法依据）
+
+**gauge-fixed 参数计数 + 样本量保留。** 在定值阶段**不得查看** RMSE、NLL 或任何
+效果指标；违反此条则本次变更作废重来。
+
+#### 1.3 核对顺序（强制：先样本量，后效果）
+
+沿用 Iteration 17 §4.1、19 §4、20 §1.1：
+
+1. **插值组的 N 与 RMSE 逐位不变**——插值走 `min_fit_hits` / `min_fit_span`，
+   本次改动只作用于外推路径，变了即是泄漏，停止并查 bug。
+2. **未受影响的外推组 N 逐位不变**——本次判据只应剔除残差不足的行。
+3. 各必需组 N ≥ `MIN_GROUP_COMPONENTS = 200`，否则判决 `inconclusive`。
+4. `n_rank_deficient_rows` 全组为 **0**。
+5. 以上全部通过，才读 RMSE / NLL / damping 敏感度。
+
+#### 1.4 效果判据
+
+- `24:4|backward_extrapolation|LOC0` 的 damping 敏感度（|ΔNLL 变化| / CI 半宽，
+  跨 `DAMPING_STABILITY_SCAN = (0.0, 1e-12)`）**< 1** → P1' 关闭，该组 NLL 恢复可引用。
+- Gate 4 判定**预期仍是 failed**。插值组不受影响，而通过与否由
+  `INTERPOLATION_RMSE_IMPROVEMENT = 0.20` 主导，插值组改善只有 0.3–1.8%。
+  **本次变更不是为了让 Gate 4 通过**，判据一律不放宽。
+
+### 2. hits 阈值被实测证伪
+
+C2 在 Gate 4 的实际输入（`trackstates_kf_mat1.root`，20000 events）上只跑选择阶段、
+不跑拟合，统计各阈值下每组的 LOC0 分量数。`floor = 4` 一列与 Iteration 14 的分组表
+**逐位相同**，证明该测量确实复现了 Gate 4 的选择阶段。
+
+| 组 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|
+| 17:8 fwd | 5034 | 999 | **42** | **0** | **0** |
+| 17:8 bwd | 14190 | 14125 | 13527 | 12758 | 7843 |
+| 24:4 fwd | 14261 | 9539 | 2768 | 270 | **1** |
+| 24:4 bwd | 14324 | 13589 | 12869 | 6810 | 3405 |
+| 17:8 interp | 8346 | 8346 | 8346 | 8346 | 8346 |
+| 24:4 interp | 14197 | 14197 | 14197 | 14197 | 14197 |
+
+**`floor = 6` 让 `17:8|forward_extrapolation` 掉到 42 < 200，判决直接变
+`inconclusive`；7 与 8 让它归零。** 计划阶段的先验推荐 6 就此被否决。
+
+两条同时被推翻的先验：
+
+- 「健康行 `n_hits` 中位数是 7」不适用于外推窗口。`extrapolation_hits` 在
+  `build_track_batches` 里**既是门槛又是窗口大小**（`before_all[-N:]` 是截取），
+  所以外推行的 fit hits 恒等于 floor：实测 p50 = min = max = 4。
+- 抬高 hits 阈值**不是**对症的工具。见下。
+
+### 3. 真正的欠定条件是残差数，不是 hits 数
+
+strip 命中只贡献 LOC0，pixel 命中贡献 LOC0 与 LOC1，所以 hits 数只是残差数的代理量。
+在当前 `floor = 4` 下按 `sum(1 + loc1_valid)` 统计全部 47809 个外推行：
+
+| 窗口内残差分量数 | 行数 |
+|---|---|
+| **4（欠定）** | **3** |
+| 5（恰定，零冗余） | 299 |
+| 6 | 9232 |
+| 7 | 11766 |
+| 8 | 26509 |
+
+- 欠定行**只有 3 行，全部在 `24:4|backward_extrapolation`**——正是 Iteration 16 §6
+  记录的「single ×3，`n_hits` = 4，`μ_min` 为负」。
+- `17:8|forward_extrapolation` 的 5034 行**残差数最小值就是 8**，一个病态行都没有。
+  `floor = 6` 要砍掉其中 4992 行去换那 3 行，代价是整组消失。
+
+**结论：判据下错了维度。** 因此本轮不动 `min_extrapolation_fit_hits`，改为直接对
+残差数设下界。
+
+### 4. 本轮的预注册常量
+
+| 常量（`scripts/validate_helix_model.py`）| 值 |
+|---|---|
+| `DEFAULT_MIN_EXTRAPOLATION_FIT_RESIDUALS` | **6** |
+| `PREREGISTRATION_VERSION` | 2 → **3** |
+| `DEFAULT_MIN_EXTRAPOLATION_FIT_HITS` | **4（不变）** |
+
+6 = 5 个 gauge-fixed 参数 + 1 个自由度冗余。**不是看着输出挑的**：4 与 5 分别是欠定与
+恰定，7 以上没有理由停在任何特定值。
+
+按 §3 的分布，该判据只剔除 302 行（`24:4|bwd` 300、`17:8|bwd` 2），其余四组一行不动，
+所有必需组仍远超 200。
+
+`PREREGISTRATION_VERSION` 要 bump 的理由：该常量虽不在那个 block 内，但它决定 Gate 4
+的输入样本集合，v2 与 v3 的 summary 不可混读。

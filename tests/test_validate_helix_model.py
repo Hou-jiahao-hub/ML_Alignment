@@ -256,6 +256,109 @@ def _straight_inputs(m, holdout_shift=0.0, holdout_measurement_shift=0.0):
     )
 
 
+def _residual_floor_inputs(m, forward_loc1, backward_loc1):
+    """One track with a held-out hit at index 5 and a fit window on either side.
+
+    ``forward_loc1`` and ``backward_loc1`` set whether the hits that land in the
+    forward and backward extrapolation windows carry a valid LOC1, which is what
+    decides the residual count of each window.
+    """
+    x = torch.linspace(0.0, 450.0, 10, dtype=torch.float64)
+    points = torch.stack((x, torch.zeros_like(x), 0.1 * x), dim=1)
+    holdout = torch.zeros(10, dtype=torch.bool)
+    holdout[5] = True
+    loc1_valid = torch.ones(10, dtype=torch.bool)
+    loc1_valid[1:5] = forward_loc1
+    loc1_valid[6:10] = backward_loc1
+    return m.HelixInputs(
+        hit_sensor_ids=torch.arange(10),
+        measured_local=torch.zeros((10, 2), dtype=torch.float64),
+        measurement_variance=torch.ones((10, 2), dtype=torch.float64),
+        loc1_valid=loc1_valid,
+        smt_local=torch.zeros((10, 2), dtype=torch.float64),
+        hit_global_positions=points,
+        hit_directions=torch.tensor(
+            [[1.0, 0.0, 0.1]], dtype=torch.float64
+        ).expand(10, -1).clone(),
+        hit_volume_ids=torch.where(holdout, torch.tensor(17), torch.tensor(10)).long(),
+        hit_layer_ids=torch.where(holdout, torch.tensor(8), torch.arange(10)).long(),
+        hit_module_ids=torch.arange(1, 11),
+        hit_event_ids=torch.zeros(10, dtype=torch.long),
+        hit_track_ids=torch.ones(10, dtype=torch.long),
+    )
+
+
+def _modes_selected(m, inputs, residual_floor):
+    batches = m.build_track_batches(
+        inputs,
+        ((17, 8),),
+        min_fit_hits=8,
+        min_fit_span=300.0,
+        min_extrapolation_fit_hits=4,
+        min_extrapolation_fit_span=100.0,
+        min_extrapolation_fit_residuals=residual_floor,
+    )
+    return set(batches.prediction_mode)
+
+
+def test_extrapolation_residual_floor_drops_only_underdetermined_windows():
+    """The floor must be able to fail, so both directions are asserted.
+
+    A four-hit window of strip hits carries four residual components against five
+    gauge-fixed reference parameters; the same window of pixel hits carries eight.
+    Asserting only that the second survives would pass just as happily for a
+    criterion that never triggers at all.
+    """
+    m = load_module()
+    inputs = _residual_floor_inputs(m, forward_loc1=False, backward_loc1=True)
+
+    # 4 residuals forward, 8 backward: the floor of 6 removes the forward window.
+    assert _modes_selected(m, inputs, 6) == {
+        "interpolation",
+        "backward_extrapolation",
+    }
+    # Same input, criterion disabled: the forward window comes back, which is what
+    # separates "the floor rejected it" from "the floor never fires".
+    assert _modes_selected(m, inputs, 1) == {
+        "interpolation",
+        "forward_extrapolation",
+        "backward_extrapolation",
+    }
+    # Both windows determined: the floor removes nothing.
+    determined = _residual_floor_inputs(m, forward_loc1=True, backward_loc1=True)
+    assert _modes_selected(m, determined, 6) == {
+        "interpolation",
+        "forward_extrapolation",
+        "backward_extrapolation",
+    }
+
+
+def test_extrapolation_residual_floor_leaves_interpolation_untouched():
+    """Interpolation runs off min_fit_hits, so the floor must not reach it.
+
+    This is the check block of Iteration 22 turned into a regression test: if the
+    interpolation count ever moves with the extrapolation floor, the change has
+    leaked into a path it does not govern.
+    """
+    m = load_module()
+    inputs = _residual_floor_inputs(m, forward_loc1=False, backward_loc1=False)
+
+    counts = []
+    for floor in (1, 6, 9):
+        batches = m.build_track_batches(
+            inputs,
+            ((17, 8),),
+            min_fit_hits=8,
+            min_fit_span=300.0,
+            min_extrapolation_fit_hits=4,
+            min_extrapolation_fit_span=100.0,
+            min_extrapolation_fit_residuals=floor,
+        )
+        counts.append(sum(1 for mode in batches.prediction_mode if mode == "interpolation"))
+
+    assert counts == [1, 1, 1]
+
+
 def test_holdout_layers_do_not_influence_initialization_or_fit():
     m = load_module()
     original = m.build_track_batches(
@@ -1040,6 +1143,7 @@ def test_cli_defaults_follow_nominal_artifact_layout():
     assert config.min_fit_span == 300.0
     assert config.min_extrapolation_fit_hits == 4
     assert config.min_extrapolation_fit_span == 100.0
+    assert config.min_extrapolation_fit_residuals == 6
     assert config.output_dir.endswith("data/experiments/helix_validation/Vol17_Lay8__Vol24_Lay4")
 
 
@@ -1198,16 +1302,25 @@ def test_damping_grid_is_pre_registered_and_brackets_production():
         previous = trace
 
 
-def test_preregistration_v2_records_the_damping_decision():
-    """The damping constants and the version that owns them move together.
+def test_preregistration_version_records_the_decisions_it_owns():
+    """The pre-registered constants and the version that owns them move together.
 
     v1 damped every direction relative to the mean diagonal, which the padded
-    kink slots made meaningless.  Anything that changes these values must also
-    change the version, or a summary written under one rule set reads as if it
-    were written under another.
+    kink slots made meaningless.  v2 fixed that.  v3 added the extrapolation
+    residual floor, which lives outside the Gate 4 constant block but decides
+    which rows reach the gate at all.  Anything that changes these values must
+    also change the version, or a summary written under one rule set reads as if
+    it were written under another.
     """
     module = load_module()
-    assert module.PREREGISTRATION_VERSION == 2
+    assert module.PREREGISTRATION_VERSION == 3
+    # v3: five gauge-fixed reference parameters plus one degree of redundancy.
+    # Four residual components are underdetermined, five are exactly determined.
+    assert module.DEFAULT_MIN_EXTRAPOLATION_FIT_RESIDUALS == 6
+    # The hit floor is deliberately left where it was: Iteration 22 measured that
+    # raising it empties 17:8 forward extrapolation (5034 rows to 42 at a floor of
+    # 6) to remove three underdetermined rows the residual floor removes exactly.
+    assert module.DEFAULT_MIN_EXTRAPOLATION_FIT_HITS == 4
     # Zero is the whole point: the exact posterior, identical for both arms.
     assert module.PRODUCTION_DAMPING == 0.0
     assert module.PRODUCTION_DAMPING in module.DAMPING_SCAN
