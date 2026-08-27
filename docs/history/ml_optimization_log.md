@@ -479,7 +479,8 @@ merged_df["var_eLOC1"] = (merged_df["err_eLOC1_ubs"]**2).clip(lower=1e-8)
 ---
 
 ## Iteration 12 — trial-006 失效分析与 block-LM 改版
-**日期**: 2026-08-25 | **状态**: implementation complete，trial-007 待运行
+**日期**: 2026-08-25 | **状态**: implementation complete；trial-007 已于同日运行完毕并
+**未通过**，结果补记在 Iteration 23
 
 ### trial-006 的决定性证据
 - 两轮 surface 将四个目标分量 χ²大幅降低，但 joint 输出与 warm2 JSON 的 SHA256
@@ -2016,3 +2017,202 @@ Iteration 14/16 里 24:4 backward 是**唯一 broken 臂回退的组**。剔除�
 - **窗口大小仍等于 `min_extrapolation_fit_hits`。** 本轮只在门槛上加了残差判据，
   没有把窗口大小与门槛拆成两个参数；若将来要给外推臂更多冗余，那是另一次变更。
 - 结论仍只在 20000 events 上，未在 100000 events 上复现（P4b 未变）。
+
+---
+
+## Iteration 23 — trial-007 的实际结果补记（主线端到端首次运行，未通过）
+
+**日期**: 2026-08-27（补记 2026-08-25 的运行）
+**状态**: **补记，无新实验、无代码改动**
+**性质**: 文档修复。Iteration 12 记「trial-007 待运行」，实际它当日已跑完并 failed，
+此后项目转去做 broken-helix 支线，结果始终未回填。任何只读文档的人都会以为
+主线还没跑过端到端。
+
+### 1. 运行标识
+
+产物 `data/experiments/surface_helix/Vol17_Lay8__Vol24_Lay4/trial-007/`，
+manifest `status=completed`、`git_commit=191f1fa`、
+`2026-08-25T05:25:55Z → 07:08:56Z`（约 1h43m），
+command 为 `./run_surface_helix_experiment.sh --run-tag trial-007`
+（即全部默认：`EVENTS=100000`、`EVENT_SPLIT_SEED=6006`、active DOF `(tx,ty,rz)`）。
+
+### 2. 冻结阈值（`acceptance_baseline.json`）
+
+calibration 9893 事件 / validation 9884 事件，bootstrap seed 6006 × 2000。
+
+| 层:分量 | nominal_chi2 | predictive_upper_99 | threshold |
+|---|---|---|---|
+| 17:8 LOC0 | 0.6668 | 0.6931 | 1.0 |
+| 17:8 LOC1 | 1.2577 | 1.6106 | 1.6106 |
+| 24:4 LOC0 | 0.8208 | 0.8506 | 1.0 |
+| 24:4 LOC1 | 0.9919 | 1.0303 | 1.0303 |
+
+Iteration 12 提的「统一绝对阈值 1.0 不自洽」已由 bootstrap profile 解决：
+两个 LOC1 阈值被抬到 nominal 之上；两个 LOC0 因 `max(·, 1.0)` 仍取 1.0，
+比 nominal 基线宽 1.2–1.5 倍，属已知的保守选择。
+
+### 3. 逐阶段 normalized_chi2（calibration 分区）
+
+| 阶段 | 17:8 LOC0 | 17:8 LOC1 | 24:4 LOC0 | 24:4 LOC1 | acceptance_score |
+|---|---|---|---|---|---|
+| surface_warm2 | 15.54 | 20.13 | 3.23 | 1.042 | (4, 20.13, 35.94) |
+| **joint_free** | **42.74** | **335.97** | **19.20** | **3.01** | **(4, 335.97, 396.90)** |
+| surface_polish1 | 12.33 | 17.25 | 2.73 | 1.034 | (4, 17.25, 29.34) |
+| surface_polish2 | 9.82 | 14.83 | 2.33 | 1.027 | (4, 14.83, 24.01) |
+
+### 4. **joint 阶段是净损失，被守卫整段丢弃**
+
+joint 把 17:8 LOC1 从 warm2 的 20.13 推到 **335.97**（差 16 倍）。
+`run_surface_helix_experiment.sh:383-392` 的 `joint_improved` 守卫据此回退到 warm2
+几何作为 polish 起点，内部 `stop_reason` 置为 `joint_not_improved`。
+
+**最终几何 `aligned_transforms_trial-007_surface_polish2.json` 里没有任何 joint 贡献。**
+主线迄今为止的最好结果，实际上是纯 surface 校准的结果。
+
+根因是 measurement refit 未收敛：`chi2_per_component` 只从 10375 降到 **7595.64**，
+`best_iteration=199` 即撞满迭代上限，`improved=true` 是 Adam 分支专有字段。
+这与 Iteration 19 §7 的 Adam 臂 7595.34 同量级 —— **确认 trial-007 是 Adam 臂**。
+
+`joint_free` 的 `truth_metrics`（`diagnostic_only`，不参与控制流）：
+
+| 层 | tx corr/recovery | ty corr/recovery | rz corr/recovery |
+|---|---|---|---|
+| 17:8 | 0.514 / 0.897 | **−0.078 / −0.451** | 0.266 / 0.436 |
+| 24:4 | 0.405 / 0.813 | 0.030 / 0.057 | — |
+
+17:8 ty 是**负恢复**：joint 在这个自由度上比不做还糟。
+`best_total_loss = 2323.02`，`correction_max_abs = 1.5`（**精确等于
+`JOINT_CLAMP_T`，已饱和**），`best_iteration = 19`（**等于 `LM_MAX_ITERS - 1`，
+预算 binding**），`stopped_early = false`。
+
+### 5. blind validation（一次性，已用掉）
+
+| 层:分量 | chi2/component | threshold | normalized | 判定 |
+|---|---|---|---|---|
+| 17:8 LOC0 | 9.821 | 1.0 | 9.82 | fail |
+| 17:8 LOC1 | 24.852 | 1.611 | **15.43** | fail |
+| 24:4 LOC0 | 2.473 | 1.0 | 2.47 | fail |
+| 24:4 LOC1 | 1.028 | 1.030 | 0.998 | **pass** |
+
+`failed_components = ["17:8:LOC0","17:8:LOC1","24:4:LOC0"]`，
+`acceptance_score = [3, 15.43, 24.72]`。
+
+`experiment_summary.json`：`passed = false`，
+`stop_reason = "blind_validation_failed"`，`polish_attempts = 2`，
+`joint_effective = true`。
+
+### 6. 由此暴露的两个编排器缺陷（本轮只记录，修复见后续）
+
+- **`stop_reason` 被无声丢弃**。`run_surface_helix_experiment.sh:467-470` 把
+  `$stop_reason` 作为 `sys.argv[7]` 传入内联 Python，那段 Python **从不引用 argv[7]**，
+  直接硬写 `"blind_validation_passed" if passed else "blind_validation_failed"`。
+  于是 summary 写的是 `blind_validation_failed`，**看不出 joint 曾被回退**——
+  真实内部状态是 `joint_not_improved`。要复原只能自己比对 5 个
+  `acceptance_*.json` 的 score。这是主线唯一的成败记录文件。
+- **`joint_effective` 与实际选择脱节**。同一行的
+  `joint_effective = best_iteration>=0 and correction_max_abs>0` 只读 solver summary，
+  不管 joint 几何是否被采纳。trial-007 里 joint 已被丢弃，该字段仍是 `true`。
+  Iteration 12 §实现 定的通过条件「四个 validation 分量全部通过**且 joint 有非零
+  有效更新**」，按现在的实现**可以在 joint 被完全丢弃的情况下满足**。
+
+### 7. 结论
+
+- **主线端到端跑过一次，未通过。** 4 个 validation 分量只过 1 个，最差差 15 倍。
+- **joint 阶段在主线上迄今为零贡献**，且其失败可归因到一个已被修复的求解器缺陷。
+- **该运行早于 `9f6a951`（2026-08-26 13:47，GN 成为 joint refit 默认）22 小时。
+  主线从未用当前代码跑过。** 其 joint 结论不适用于当前代码。
+
+### 8. 尚未宣称
+
+- **没有任何证据说明换 GN 后主线 joint 会转正。** Iteration 19/20 的 GN 全量结果
+  跑在主线配置**之外**（起点是原始错位几何而非 warm2、无 `--event-partition`、
+  98958 条全用因而混入 calibration 与 validation 事件），
+  按 §9「surface、SMT seed、measurement refit 和 block-LM 只读 train」的口径
+  **不能充当主线业绩**。必须在编排器下重跑才算数。
+- **block-LM 的几何解从未被证明收敛。** 三次全量运行全部 `best_iteration = 19`
+  且 `stopped_early = false`，预算是 binding 约束。measurement refit 有预注册的
+  驻点 raise，几何 block 一个都没有。尚未测量。
+- **`correction_max_abs` 饱和的后果未评估。** trial-007 精确撞上
+  `JOINT_CLAMP_T = 1.5 mm`，summary 无任何告警。
+- 17:8 LOC1 的困难有一部分是物理的：nominal 自身 chi2/N 就有 1.2577，
+  ShortStrip `ty` 弱可观测是已知限制，不是算法 bug。
+
+---
+
+## Iteration 24 — 主线复位：用当前代码重跑（trial-008）
+
+**日期**: 2026-08-27
+**状态**: **预注册已冻结，运行待执行**
+**改动**: `scripts/run_surface_helix_experiment.sh`、`scripts/write_experiment_summary.py`（新增）、
+`tests/test_write_experiment_summary.py`（新增）、`tests/test_run_surface_helix_experiment.sh`
+**性质**: 编排层记录与守卫修复 + 一次单变量重跑。**不触碰任何求解器。**
+
+### 1. 相对 Iteration 12/23 改变的假设
+
+Iteration 23 确认：主线的 joint 阶段在 trial-007 里是净损失并被守卫整段丢弃，
+而其 measurement refit 撞满迭代上限从未收敛（`chi2/component` 7595.64）。
+Iteration 19 已把该求解器换成 Gauss--Newton（`9f6a951`，2026-08-26 13:47），
+同一量降到 0.7635、非驻点行 100% → 0%。**该提交晚于 trial-008 之前唯一一次
+主线运行 22 小时，主线从未在当前代码下跑过。**
+
+新假设：**trial-007 的 joint 失败是求解器未收敛所致，而非「固定轨迹只由目标层
+measurement 解几何」这个方法本身有问题。** 若成立，用当前代码重跑应使 joint
+阶段首次产生正贡献。
+
+### 2. 预注册（**写在跑之前，事后不得改**）
+
+**唯一变更**：measurement refit 由 Adam 换为 Gauss--Newton。实操上即「用当前代码
+重跑」——GN 已是 `ml_alignment_autograd.py:93` 的默认，编排器不传
+`--joint-refit-solver`，自动继承。其余全部沿用 trial-007 的默认：
+`EVENTS=100000`、`EVENT_SPLIT_SEED=6006`、active DOF `(tx,ty,rz)`、
+`SURFACE_EPOCHS=200`、`LM_MAX_ITERS=20`、`JOINT_SMT_SEED_ITERS=200`。
+
+**复用 trial-007 的 `acceptance_baseline.json`**，不重新标定
+（同 split seed 6006、同 nominal states `sha256=317257a2c753d46a...`），
+否则两次运行不可比。
+
+**主判据（可证伪）**：joint_free 阶段在 calibration 上的 `acceptance_score`
+必须**严格优于** warm2 的 `(4, 20.13, 35.94)`，即 joint 不再被
+`run_surface_helix_experiment.sh` 的 `joint_improved` 守卫回退
+（等价于 summary 的 `joint_adopted == true`）。
+
+**次判据**：`joint_free_summary.json` 的 `measurement_refit.chi2_per_component`
+应落在 1 附近（离线 GN 全量是 0.7635）而非 7596 量级；非驻点行占比为 0。
+
+**不预注册任何 validation 结论。** 本轮按决策**跑到 calibration 为止**
+（`--skip-blind-validation`），不产生 validation 数字，把 §9 那次一次性盲测留到
+配置真正定稿之后。
+
+### 3. 本轮的编排器改动（三处，都在 finalize 段）
+
+Iteration 23 §6 记录的两个缺陷会让本轮的主判据在 summary 里读不出来，故先修：
+
+- **`--skip-blind-validation` 开关**（新增，默认关闭，默认行为不变）。
+  置位时跳过 blind validation 阶段，`current_acceptance` 保持为 calibration 那份，
+  `workflow` 记为 `...calibration-only`，`passed` 写 `null`，
+  `stop_reason` 写 `stopped_before_blind_validation`，
+  且不把不存在的 validation 产物登记进 manifest。
+- **`stop_reason` 不再被丢弃**。原 finalize 把 `$stop_reason` 作为 `sys.argv[7]`
+  传入却从不引用。现拆为两个字段：`selection_stop_reason`（选择阶段的真实状态，
+  如 `joint_not_improved`）与 `stop_reason`（验证结论）。
+- **`joint_effective` 改为反映几何是否真被采纳**：
+  `joint_effective = joint_solver_effective and joint_adopted`。
+  solver 层的原语义保留为 `joint_solver_effective`，新增 `joint_adopted`。
+  这样 Iteration 12 的通过条件不再能在 joint 被完全丢弃时满足。
+
+实现上把那段一行流内联 Python 提成 `scripts/write_experiment_summary.py`，
+使其可被测试覆盖（原一行流无法测试）。
+
+**回归验证**：用新代码路径重建 trial-007 的 summary，与实际产物逐字段比对——
+无字段丢失、schema 2 保持，唯一的取值变化是 `joint_effective` 由 `true`
+纠正为 `false`（trial-007 的 joint 确实被丢弃了）。
+
+### 4. 尚未宣称
+
+- **本条不含任何 trial-008 的结果。** 运行完成前不得引用任何效果数字。
+- 主判据若不通过，下一个候选是 `seed_helices` 的 Adam
+  （`ml_alignment_autograd.py:548-579`，无 flag、无驻点检查，P4a 实测 99.98%
+  轨迹停在非驻点）。**不得用调大 `--joint-smt-seed-iters` 来糊弄**——
+  同一 lr=0.5 在约 1000 次迭代后发散（见 Iteration 21）。
+- block-LM 的几何解仍未被证明收敛（三次全量运行全部 `best_iteration = 19`
+  且 `stopped_early = false`）。本轮只记录读数，不改。
