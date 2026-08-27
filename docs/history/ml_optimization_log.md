@@ -2216,3 +2216,159 @@ Iteration 23 §6 记录的两个缺陷会让本轮的主判据在 summary 里读
   同一 lr=0.5 在约 1000 次迭代后发散（见 Iteration 21）。
 - block-LM 的几何解仍未被证明收敛（三次全量运行全部 `best_iteration = 19`
   且 `stopped_early = false`）。本轮只记录读数，不改。
+
+### 5. 核对块（按 §2 预注册顺序，全部通过）
+
+1. **输入哈希**：10 个输入（geometry / states / summary / nominal_states /
+   simulation_dataset / nominal_geometry / acts_setup / conda_setup /
+   odd_digi_config / odd_material_map）与 trial-007 **全部相同**。
+2. **event split**：seed 6006、80/10/10，两次一致。
+3. **阈值 profile**：四个阈值逐位相同，nominal states sha256 相同
+   （复用 trial-007 的 profile，未重新标定）。
+4. **样本量一行未动**：`n_tracks` 49222、`n_hits` 682915、`input_tracks` 79181、
+   `retained_tracks` 49222、`excluded_tracks` 29959、`fit_hits` 568283，
+   **全部逐位相同**。改善不是丢样本换来的。
+
+**附带发现：流水线不是逐位可复现的。** warm2 阶段的 chi2/component 在两次运行间
+有 **1e-7 ~ 1e-6 相对漂移**（`n_components` 7155/7170 逐位相同，四个分量判定不变）。
+warm1/warm2 的代码路径本轮未改，故这是运行间浮点非确定性（torch 归约顺序或
+ACTS 线程），不是真实变化。**对照 joint 阶段的 22×–424×，两者差六个数量级**，
+不影响结论。今后比较两次运行时应判「行集合不变 且 漂移不超过舍入量级」，
+而非要求逐位相同（沿用 Iteration 22 §4.2 的教训）。
+
+### 6. 效果
+
+#### 6.1 主判据：**通过，且是压倒性的**
+
+| 阶段 | acceptance_score（calibration） |
+|---|---|
+| trial-008 warm2 | (4, 20.131, 35.945) |
+| trial-007 joint_free | (4, 335.97, 396.90) |
+| **trial-008 joint_free** | **(0, 0.9843, 0.0)** |
+
+**四个分量全部通过**，joint 几何被直接采纳，`polish_attempts = 0`
+（polish 循环首轮即 break，因为已无失败分量）。
+
+逐分量 normalized_chi2（joint_free 阶段，calibration）：
+
+| 层:分量 | trial-007 | **trial-008** | 阈值 | 倍数 |
+|---|---|---|---|---|
+| 17:8 LOC0 | 42.74 | **0.7158** | 1.0 | 60× |
+| 17:8 LOC1 | 335.97 | **0.7919** | 1.6106 | **424×** |
+| 24:4 LOC0 | 19.20 | **0.8695** | 1.0 | 22× |
+| 24:4 LOC1 | 3.01 | **0.9843** | 1.0303 | 3× |
+
+summary 字段：`joint_adopted = true`、`joint_solver_effective = true`、
+`joint_effective = true`、`selection_stop_reason = "joint_acceptance_passed"`。
+**这是 joint 阶段第一次在主线上产生正贡献。**
+
+#### 6.2 次判据：通过
+
+`measurement_refit.chi2_per_component` **7595.638 → 0.763146**
+（初值两次均为 10373~10375），`invalid_fraction = 0.0`。
+与离线 GN 全量的 0.7635 一致。Adam 分支专有的
+`best_iteration = 199 / improved = true` 字段不再出现。
+
+#### 6.3 truth_metrics 全线转正（`diagnostic_only`，不参与控制流）
+
+| 层/DOF | trial-007 corr / recovery | **trial-008** |
+|---|---|---|
+| 17:8 tx | +0.5143 / +0.8967 | **+0.9988 / +1.0006** |
+| **17:8 ty** | **−0.0778 / −0.4511** | **+0.9996 / +0.9996** |
+| 17:8 rz | +0.2663 / +0.4362 | **+0.9981 / +0.9967** |
+| 24:4 tx | +0.4047 / +0.8131 | **+0.9961 / +0.9917** |
+| 24:4 ty | +0.0296 / +0.0573 | **+0.9214 / +0.8817** |
+| 24:4 rz | +0.3493 / +0.6970 | **+0.9892 / +0.9826** |
+
+六个 DOF 的 corr 全部 ≥ 0.92、recovery 全部 ≥ 0.88。
+17:8 ty 从**负恢复**（对齐比不对齐更糟）转为 +0.9996。
+
+#### 6.4 意外收获：Iteration 23 §8 记的两个隐患自行消失
+
+| 量 | trial-007 | trial-008 |
+|---|---|---|
+| `best_iteration` | 19（= `LM_MAX_ITERS − 1`） | **15** |
+| `stopped_early` | false | **true** |
+| `correction_max_abs` | **1.5**（精确等于 `JOINT_CLAMP_T`，饱和） | **1.3695**（未饱和）|
+| `best_total_loss` | 2323.018 | **2.2143** |
+
+**block-LM 首次在预算内收敛**——Iteration 23 §8 记的「几何解从未被证明收敛、
+预算是 binding 约束」在 GN 下自动解除；几何修正也不再撞硬夹逼。
+根因是同一个：refit 未收敛 ⇒ 轨迹参数错误 ⇒ 几何求解被迫做大修正、
+撞上 clamp 且永远收敛不了。**这两条不需要单独修。**
+
+### 7. 结论
+
+- **Iteration 24 的假设成立。** trial-007 的 joint 失败是 measurement refit
+  未收敛所致，不是「固定轨迹只由目标层 measurement 解几何」这个方法的问题。
+- **主线 joint 阶段首次产生正贡献**，且 calibration 上四分量全过、无需 polish。
+- **Iteration 23 §8 的两个待测隐患（block-LM 收敛性、clamp 饱和）同时消解**，
+  根因与 refit 未收敛同源。
+
+### 8. 尚未宣称
+
+- **未通过 blind validation，因此不得声称主线通过。** 本轮按决策
+  `--skip-blind-validation` 跑到 calibration 为止，`passed = null`、
+  `stop_reason = "stopped_before_blind_validation"`。
+  **calibration 是候选选择用的分区，joint 几何正是在其上评的，
+  不构成盲测证据。** §9 的一次性 validation 仍未动用。
+- **`24:4 ty` 是六个 DOF 里最弱的**（corr 0.9214 / recovery 0.8817）。
+  ShortStrip `ty` 弱可观测是已知物理限制，本轮未改善其相对地位。
+- **17:8 LOC1 的裕度最小之一**（0.7919 对阈值 1.6106 看似宽裕，
+  但该阈值本身已因 nominal chi2/N = 1.2577 被抬高）。
+- **流水线非逐位可复现**（§5），今后的两次运行比较需按舍入量级判定。
+- **`seed_helices` 仍是 Adam**，本轮未动。它没有成为瓶颈，但也未被证明无害。
+
+### 9. Blind validation（补跑，2026-08-27）
+
+§6 的 calibration 结果出来后，用户决定动用 §9 那次一次性盲测。
+**判据无需新预注册**：阈值 profile 已冻结且与 trial-007 共用，
+通过条件即 Iteration 12 定的「四个 validation 分量全部通过 且 joint 有非零有效更新」。
+
+评估对象是 trial-008 的最终几何 `aligned_transforms_trial-008_joint_free.json`
+（joint 输出，未经 polish），命令为
+`reconstruction_acceptance.py --event-partition validation --split-seed 6006`
+复用 `trial-008/acceptance_baseline.json`。
+
+| 层:分量 | chi2/component | threshold | normalized | 判定 |
+|---|---|---|---|---|
+| 17:8 LOC0 | 0.7042 | 1.0 | **0.7042** | pass |
+| 17:8 LOC1 | 1.3602 | 1.6106 | **0.8445** | pass |
+| 24:4 LOC0 | 0.8851 | 1.0 | **0.8851** | pass |
+| 24:4 LOC1 | 0.9890 | 1.0303 | **0.9600** | pass |
+
+`failed_components = []`，`acceptance_score` **[3, 15.43, 24.72] → [0, 0.9600, 0.0]**。
+`n_components` 7096 / 7239，与 trial-007 的 validation 分区逐位相同。
+
+`experiment_summary.json`：`passed = **true**`、
+`stop_reason = "blind_validation_passed"`、`joint_effective = true`、
+`polish_attempts = 0`。
+
+### 10. 最终结论
+
+**主线 free-helix 流程首次通过端到端盲验证。** 四个 validation 分量全部通过，
+joint 阶段有非零有效更新且几何被采纳，polish 一轮未用。
+
+从 trial-007 到 trial-008 的**唯一变更是 measurement refit 由 Adam 换为
+Gauss--Newton**（实操上即用当前代码重跑，GN 已是默认）。输入哈希、event split、
+阈值 profile、样本量（49222 轨迹 / 682915 hits / 568283 fit_hits）**全部逐位相同**。
+
+`data/alignment/Vol17_Lay8__Vol24_Lay4/aligned_transforms_trial-008_joint_free.json`
+是主线迄今第一份通过验收的几何。
+
+### 11. 尚未宣称（承 §8，按盲测结果更新）
+
+- **一次性盲测已用掉。** 后续任何配置变更若要再评 validation，
+  必须先按 §9 处理：或显式声明本次结果属于旧配方，或改 `--event-split-seed`。
+  **本轮结果不得用于继续调参。**
+- **`24:4 ty` 仍是六个 DOF 里最弱的**（corr 0.9214 / recovery 0.8817），
+  且 `24:4 LOC1` 的 normalized 0.9600 是四个分量里裕度最小的。
+  ShortStrip `ty` 弱可观测是已知物理限制。
+- **结论只在 `Vol17_Lay8__Vol24_Lay4` 这一组目标层上成立**，
+  未在 `Vol16_Lay6__Vol23_Lay4` 等其它组合上复现。
+- **`seed_helices` 仍是 Adam**（99.98% 轨迹停在非驻点）。它没有成为瓶颈，
+  但也未被证明无害；P4a' 仍是可选优化。
+- **block-LM 虽首次早停收敛（`best_iteration = 15`），仍无驻点门控。**
+  measurement refit 有预注册的驻点 raise，几何 block 没有。
+- **流水线非逐位可复现**（§5），两次运行比较需按舍入量级判定。
+- broken-helix 支线的 Gate 4 仍是 failed，P1' 仍开启。本轮与之无关。
