@@ -4,8 +4,9 @@
 **上一份交接**：`docs/handoff/2026-08-26-joint-downstream-evaluation.md`
 **详细记录**：`docs/history/ml_optimization_log.md` 的 Iteration 22
 **分支**：`feat/material-aware-broken-helix`（**未推送、未 merge**）
-**本轮提交**：`da425ed`（文档）、`9ef1b06`（脚本归档）、`afb20b7`（P3 代码 + 预注册）
-**工作树状态**：Iteration 22 的结果章节与本文件未 commit
+**本轮提交**：`da425ed`（文档）、`9ef1b06`（脚本归档）、`afb20b7`（P3 代码 + 预注册）、
+`8e96da5`（Iteration 22 结果章节 + 本文件）
+**工作树状态**：干净。唯一未跟踪的是 `surface_alignment_logic.pptx`（见 §5 P5）
 
 ---
 
@@ -146,9 +147,9 @@ NLL 结论**不得引用**。敏感度 2.223 → **2.545**。欠定行已被排�
 `feat/material-aware-broken-helix` 未推送、未 merge。**需用户明确批准。**
 另有未跟踪文件 `surface_alignment_logic.pptx`，历次提交均未纳入。
 
-### 文档提交
+### 文档提交 — 已完成
 
-Iteration 22 的 §5–§8 与本文件**尚未 commit**。
+Iteration 22 的 §1–§8 与本文件已由 `8e96da5` 入库。工作树干净。
 
 ---
 
