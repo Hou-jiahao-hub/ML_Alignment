@@ -1386,3 +1386,433 @@ Adam 臂逐位复现 Iteration 18 的数字（7992.76 / 5.36e5 → 4.17e5 / 100%
 - `24:4|backward_extrapolation|LOC0` 的 NLL 结论仍不可引用（P1'）。
 - `min_extrapolation_fit_hits = 4` 仍未动（P3）。
 - Gate 4 维持 failed，工作包 ④ 仍被 Gate 5 阻塞。
+
+### 7. 补充：全量复现（同日）
+
+Iteration 19 §4 的 A/B 只在 300 条轨迹上做过。用同一对命令在全量上重跑，
+两臂仍只差 `--joint-refit-solver` 一个 flag，`--joint-iters 1`：
+
+| 量 | Adam | **Gauss-Newton** |
+|---|---|---|
+| retained tracks | 61482 | 61482 |
+| `n_components` | 1154761 | **1154761** |
+| `invalid_fraction` | 0.0 | **0.0** |
+| `chi2_per_component` | 7595.34 | **0.763503** |
+| 非驻点行占比 | 100.00% | **0.00%** |
+| Newton decrement p90 | 4.1e5 | **2.61e-17** |
+| GN 收敛 | — | **True，5 次迭代** |
+
+98958 条输入轨迹选中 61482 条，1154761 个 component——是 300 轨迹小样本（5616）的
+**205 倍**。`n_components` 与 `invalid_fraction` 两臂逐位相同，样本量没有变化。
+
+预注册判据在全量上以极大裕度满足：非驻点行占比精确为 0.0（上限 1e-3），非有限行 0。
+
+**小样本对全量的代表性得到验证**，两个尺度的结论同向且量级一致：
+
+| 量 | 300 轨迹 | 全量 |
+|---|---|---|
+| Adam chi2/component | 7992.76 | 7595.34 |
+| Adam decrement p90 | 4.17e5 | 4.1e5 |
+| GN chi2/component | 0.741103 | 0.763503 |
+| GN 非驻点行 | 0.00% | 0.00% |
+
+GN 在 61482 行上只用 **5 次迭代**收敛（上限 60），说明这个目标对 Gauss-Newton 而言
+是容易的——Adam 用 200 次迭代走不到的地方，不是问题难，是优化器不对。
+
+至此 P2'' 关闭。**下游影响（P2'''）仍未评估**：本次两臂都用 `--joint-iters 1`，
+只验证了 refit 本身，`target_metrics` 等对齐结果的变化尚未系统比较。
+
+---
+
+## Iteration 20 — joint refit 换 GN 后的下游影响评估（P2'''）
+
+**性质**：**观测，不是变更**。不改产品代码，不设 raise 阈值，不动任何预注册常量
+（`PREREGISTRATION_VERSION` 保持 2，`JOINT_REFIT_PREREGISTRATION_VERSION` 保持 1）。
+
+Iteration 19 §7 的两臂都用 `--joint-iters 1`，只验证了初始化 refit 本身。GN 改变了
+`refitted_parameters`，它是 joint 主循环的起点，因此 `target_metrics` 与
+`truth_metrics` 都会随之改变，**幅度与方向尚未测量**。本轮就是这次测量。
+
+### 1. 预注册比较协议（写在跑任何一臂之前，事后只填数字）
+
+#### 1.1 核对顺序（强制：先样本量，后效果）
+
+沿用 Iteration 17 §4.1 与 19 §4 的教训——任何让结果变好的改动先查样本量：
+
+1. `n_tracks` / `n_hits` 两臂逐位相同。不同 → 停止比较，先查样本为什么变了。
+2. `initialization_stats` 的选择统计两臂逐位相同（轨迹选择在 refit 之前，理应与
+   solver 无关；不同即是 bug 信号）。
+3. `invalid_fraction` 两臂都落在既有守卫内。
+4. 以上全部通过，才读效果指标。
+
+#### 1.2 效果指标（第 4 步之后才看）
+
+| 层级 | 量 | summary JSON 键 |
+|---|---|---|
+| 主指标 | per-DOF correlation、recovery fraction，逐目标层 | `truth_metrics` |
+| 次指标 | `rms_after_loc0/loc1`、`mean_after_loc0/loc1`，逐目标层 | `target_metrics` |
+| 收敛 | `best_total_loss`、`last_total_loss`、`best_iteration`、`stopped_early` | 顶层 |
+| 分阶段 | `smt_seed` / `measurement_refit` / `joint` 三阶段 layer chi2 | `stage_layer_chi2` |
+| 验收留痕 | solver、stationarity、收敛迭代数 | `initialization_stats.measurement_refit` |
+
+`truth_metrics` 作主指标的理由：`validate_against_truth`
+（`scripts/ml_alignment_autograd.py:2260`）的 docstring 写明它才是「决定局域信号是否
+可恢复」的量；`target_metrics` 的残差 RMS 可以在几何错的情况下被轨迹自由度吸收而
+虚假变好。
+
+#### 1.3 判读规则
+
+- **不设 gate、不设 raise 阈值**：本轮是观测，不是验收。
+- 结论三选一，逐目标层分别陈述：GN 臂**优于** / **劣于** / **与 Adam 臂无实质差异**。
+- `24:4|backward_extrapolation|LOC0` 的任何数字**照旧不得引用**（P1'）。出现在结果里
+  只作记录，不进结论。
+- 两臂 `stopped_early` / `best_iteration` 不同属正常（起点不同），但必须显式报告：
+  在不同 iteration 停下的两条曲线，终点比较要附上这个事实。
+
+#### 1.4 两阶段执行
+
+- **阶段 A**：`--max-tracks 300` 两臂跑满 `--joint-iters`，做方向筛查并标定单次主循环
+  iteration 的墙钟（全量 1000 iters 的耗时目前无任何实测依据）。外推值只用于排期，
+  不进结论。
+- **阶段 B**：去掉 `--max-tracks`，全量两臂**串行**（本机可用约 7 GB，单臂峰值约 3 GB）。
+
+两臂只差 `--joint-refit-solver` 一个 flag；`--output-geom` 与 `--output-summary`
+分臂显式指定，避免第二臂覆盖第一臂并污染下游 reconstruction 的输入几何。
+
+### 2. 环境与基线（本轮实测，2026-08-26）
+
+```bash
+export LD_LIBRARY_PATH=$HOME/miniconda3/envs/pytorch/lib
+~/miniconda3/envs/pytorch/bin/python -m pytest tests -q
+```
+
+**337 passed / 3 skipped / 11 deselected**，与 Iteration 19 基线一致。3 项 skip 为
+AlignDerivLib pybind 未编译 ×1、ACTS bindings ×2——**要用 ACTS 时当场实测确认，勿凭
+这两条 skip 或凭 memory 下结论**。
+
+本机无 `/usr/bin/time`，墙钟改由驱动脚本用 `date +%s` 差值记录。可用内存 8 GB，
+两臂严格串行。GPU 存在（RTX 3050）但**两臂均不加 `--gpu`**：保持 CPU float64，与
+Iteration 19 §7 的全量结果同配置可比。
+
+默认输出几何 `data/alignment/Vol17_Lay8__Vol24_Lay4/aligned_transforms_v17l8_v24l4_ml.json`
+本轮前的 mtime 为 **2026-08-03 11:19:08**，用于事后确认它未被本轮污染。
+
+### 3. 更正：`--joint-iters` 在默认求解器下是死参数
+
+本轮实施时核实发现，交接文档给 P2''' 写的做法（「同一对命令改用完整 `--joint-iters`
+（默认 1000）」）**无法落地**：
+
+- 默认 `--joint-solver block-lm` 走 `run_block_lm_alignment`
+  （`scripts/ml_alignment_autograd.py:1075`），它的迭代上限是 **`--lm-max-iters`
+  （`LM_MAX_ITERS = 20`）**，**完全不消费 `config.joint_iters`**。
+- 消费 `joint_iters` 的那个主循环（`scripts/ml_alignment_autograd.py:1332`）属于
+  `--joint-solver adam` 分支。
+- block-LM 没有 per-iteration 的进度打印（诊断只进 `fisher_diagnostics`），所以日志里
+  不会出现 `Joint [iiii/1000]` 行——**日志安静不等于主循环没跑**。
+
+由此得到两个推论：
+
+1. 本轮两臂 `best_iteration = 19`、`stopped_early = False`，即 **20 次 LM 迭代全部跑满**，
+   下游求解本来就是完整的，不需要「改用完整 `--joint-iters`」。
+2. **Iteration 19 §7 的全量两臂同样如此**：那两次运行加的 `--joint-iters 1` 是死参数，
+   实际也跑满了 block-LM。§7 说「只验证了 refit 本身」并不准确——下游其实已经算了，
+   只是没有保存 summary、没有做比较。P2''' 缺的是**比较**，不是**运行**。
+
+这条同时解释了 §7 记的「全量单臂 `--joint-iters 1` 耗时超过 10 分钟」：那 10 分钟里
+本就包含完整的 block-LM 求解。
+
+### 4. 阶段 A 结果：300 轨迹两臂（可引用）
+
+两臂只差 `--joint-refit-solver`，其余全默认（`--target-layers 17:8,24:4`、
+`--active-dof 0,1,5`、`--rng-seed 42`、`--joint-solver block-lm`、CPU float64）。
+墙钟：adam 224 s，gauss-newton 217 s。
+
+#### 4.1 核对块（先于效果，全部逐位相同）
+
+| 量 | adam | gauss-newton | verdict |
+|---|---|---|---|
+| `n_tracks` | 300 | 300 | same |
+| `n_hits` | 4151 | 4151 | same |
+| `input_tracks` / `retained_tracks` / `excluded_tracks` | 1200 / 300 / 900 | 1200 / 300 / 900 | same |
+| `fit_hits` | 3450 | 3450 | same |
+| `invalid_fraction` | 0.0 | 0.0 | same |
+
+`stage_layer_chi2` 各层 `n_components` 也逐位相同（17:8 → 349，24:4 → 352）。
+**样本量没有变化，以下差异不是丢行换来的。**
+
+初始化数字逐位复现 Iteration 19 §4：adam 臂 `chi2/component = 7992.76`、非驻点行
+100%、decrement p90 4.17e5；GN 臂 0.741103、0.00%、1.87e-17。两臂
+`initial_chi2_per_component` 同为 10918，起点一致。
+
+#### 4.2 主指标 `truth_metrics`（GN 臂全面占优）
+
+只列有信号的 DOF（tz/rx/ry 的 `true_rms` 为 1e-14 量级，无信号，两臂均为 0）：
+
+| 层 | DOF | 量 | adam | gauss-newton |
+|---|---|---|---|---|
+| 17:8 | tx | corr / recovery | +0.346 / +0.212 | **+0.419 / +0.240** |
+| 17:8 | ty | corr / recovery | **−0.100 / −0.114** | **+0.525 / +0.281** |
+| 17:8 | rz | corr / recovery | +0.103 / +0.028 | **+0.316 / +0.056** |
+| 24:4 | tx | corr / recovery | +0.256 / +0.215 | **+0.336 / +0.208** |
+| 24:4 | ty | corr / recovery | +0.080 / +0.095 | **+0.237 / +0.224** |
+| 24:4 | rz | corr / recovery | +0.216 / +0.063 | **+0.297 / +0.067** |
+
+**最重要的一条**：`17:8` 的 `ty` 在 Adam 臂上 correlation 与 recovery **都是负的**——
+预测的错位方向与真值相反。GN 臂把它翻正到 +0.525 / +0.281。这不是「精度提高」，
+是**符号纠正**：Adam refit 的非驻点起点让下游把该自由度解到了反方向。
+
+唯一不占优的是 `24:4` 的 `tx.recovery`（+0.215 → +0.208，−0.007），同层 corr 仍从
++0.256 升到 +0.336，`pred_rms` 从 0.434 降到 0.320（`true_rms` 0.517）——GN 臂的过冲
+更小。这一项按预注册记为「无实质差异」。
+
+#### 4.3 次指标 `target_metrics` 与分阶段 chi2
+
+`joint` 阶段的 per-component chi2（两臂 `n_components` 相同）：
+
+| 层/分量 | adam | gauss-newton | 倍数 |
+|---|---|---|---|
+| 17:8 LOC0 | 169.72 | **27.16** | 6.2× |
+| 17:8 LOC1 | 7775.99 | **7.57** | **1027×** |
+| 24:4 LOC0 | 48.76 | 8.03 | 6.1×（P1' 不可引用）|
+| 24:4 LOC1 | 1.85 | **0.267** | 6.9× |
+
+残差 RMS（after）：17:8 LOC0 0.195 → 0.078 mm，17:8 LOC1 1.323 → 0.041 mm，
+24:4 LOC1 1.630 → 0.620 mm。
+
+`best_total_loss`：**1990.63 → 10.73（185×）**，两臂 `best_iteration` 同为 19、
+`stopped_early` 同为 False——**在同一迭代数下比较，不存在「一臂多跑了几步」的干扰**。
+
+#### 4.4 阶段 A 判读
+
+按预注册 §1.3，逐目标层：
+
+- **17:8**：GN 臂**优于** Adam 臂。三个有信号 DOF 的 corr 全面提升，`ty` 从反号纠正为
+  正相关，LOC1 的 joint chi2 降低三个数量级。
+- **24:4**：GN 臂**优于** Adam 臂（`ty`、`rz`、`tx.corr` 提升；`tx.recovery` 无实质
+  差异）。LOC0 的数字按 P1' 不进结论，判读只依据 LOC1 与 `truth_metrics`。
+
+### 5. 阶段 B 结果：全量两臂（可引用）
+
+命令与阶段 A 只差去掉 `--max-tracks 300`。墙钟：adam **5831 s**，gauss-newton
+约 **5640 s**（各约 1.6 小时）。**耗时不线性于轨迹数**——205 倍的 component 只带来
+约 26 倍的墙钟，因为 block-LM 按 sensor 分块，每个 sensor 只处理打到它的 hits。
+单臂 RSS 峰值约 6.6 GB（交接 §6 记的「约 3 GB」偏低，两臂并行必然 OOM，**必须串行**）。
+
+#### 5.1 核对块（全部逐位相同）
+
+| 量 | adam | gauss-newton | verdict |
+|---|---|---|---|
+| `n_tracks` | 61482 | 61482 | same |
+| `n_hits` | 852859 | 852859 | same |
+| `input_tracks` / `retained_tracks` / `excluded_tracks` | 98958 / 61482 / 37476 | 同左 | same |
+| `fit_hits` | 709672 | 709672 | same |
+| `invalid_fraction` | 0.0 | 0.0 | same |
+
+各层 `n_components` 也逐位相同（17:8 → 71345，24:4 → 71842）。初始化数字逐位复现
+Iteration 19 §7：adam 7595.34 / 100% / 4.1e5，GN 0.763503 / 0.00% / 2.61e-17，
+两臂 `initial_chi2_per_component` 同为 10349.3。
+
+#### 5.2 主指标 `truth_metrics`（决定性结果）
+
+| 层 | DOF | 量 | adam | gauss-newton |
+|---|---|---|---|---|
+| 17:8 | tx | corr / recovery | +0.967 / +0.874 | **+0.9998 / +0.9986** |
+| 17:8 | ty | corr / recovery | **−0.115 / −0.275** | **+0.99993 / +0.99973** |
+| 17:8 | rz | corr / recovery | +0.956 / +0.711 | **+0.987 / +0.832** |
+| 24:4 | tx | corr / recovery | +0.941 / +0.938 | **+0.9998 / +0.9997** |
+| 24:4 | ty | corr / recovery | +0.336 / +0.679 | **+0.954 / +1.017** |
+| 24:4 | rz | corr / recovery | +0.982 / +0.811 | **+0.989 / +0.843** |
+
+GN 臂在全量上把两个目标层的 **tx 与 ty 恢复到几乎完美**（corr ≥ 0.95，
+recovery ≈ 1.0）。`pred_rms` 同时从过冲收敛到真值尺度：17:8 ty 的 `pred_rms`
+1.2397 → **0.5214**（`true_rms` 0.5215），24:4 ty 1.0543 → 0.5538
+（`true_rms` 0.5197）。**Adam 臂不只是解得不准，而是把 ty 解成了 2 倍幅度的过冲，
+且 17:8 上符号还是反的。**
+
+`24:4` 的 `ty.recovery` = 1.017 是轻微过冲（1.0 为完美），corr 0.954，仍属大幅改善。
+
+#### 5.3 次指标与分阶段 chi2
+
+`joint` 阶段 per-component chi2（两臂 `n_components` 相同）：
+
+| 层/分量 | adam | gauss-newton | 倍数 |
+|---|---|---|---|
+| 17:8 LOC0 | 186.91 | **38.95** | 4.8× |
+| 17:8 LOC1 | 8755.62 | **6.73** | **1302×** |
+| 24:4 LOC0 | 231.50 | 10.10 | 22.9×（P1' 不可引用）|
+| 24:4 LOC1 | 2.394 | **0.959** | 2.5× |
+
+残差 RMS（after）：17:8 LOC0 0.205 → 0.094 mm，17:8 LOC1 1.404 → **0.039 mm**，
+24:4 LOC1 1.857 → 1.175 mm。
+
+`best_total_loss`：**2286.55 → 14.16（162×）**。两臂 `best_iteration` 同为 19、
+`stopped_early` 同为 False——**同一迭代数下比较，无「一臂多跑了几步」的干扰**。
+
+#### 5.4 小样本对全量的代表性（再次验证）
+
+| 量 | 300 轨迹 | 全量 |
+|---|---|---|
+| adam `best_total_loss` | 1990.63 | 2286.55 |
+| GN `best_total_loss` | 10.73 | 14.16 |
+| adam 17:8 ty corr | −0.100 | −0.115 |
+| GN 17:8 ty corr | +0.525 | +0.99993 |
+| adam joint 17:8 LOC1 chi2 | 7775.99 | 8755.62 |
+| GN joint 17:8 LOC1 chi2 | 7.57 | 6.73 |
+
+两个尺度**结论同向**，`--max-tracks 300` 的快速筛查再次被证明可用。但注意
+**改善幅度随样本量显著放大**（17:8 ty corr 从 +0.525 到 +0.99993）：小样本可以定
+方向，**不能定幅度**。
+
+### 6. 判读结论（按预注册 §1.3）
+
+逐目标层，全量结果：
+
+- **17:8**：GN 臂**优于** Adam 臂。tx/ty/rz 三个有信号 DOF 的 corr 与 recovery 全面
+  提升；`ty` 从**反号**（−0.115 / −0.275）纠正为近乎完美恢复（+0.99993 / +0.99973）；
+  LOC1 的 joint chi2 降低三个数量级。
+- **24:4**：GN 臂**优于** Adam 臂。tx 近乎完美（+0.9998 / +0.9997），ty 从 +0.336 /
+  +0.679 提升到 +0.954 / +1.017，rz 小幅提升。LOC0 的数字按 P1' 不进结论，判读只依据
+  LOC1 与 `truth_metrics`。
+
+**P2''' 关闭。** 下游影响已系统评估：GN 替换不仅修好了 refit 本身的驻点性，还使下游
+几何恢复从「tx 尚可、ty 失败」变为「tx/ty 双双近乎完美」。Iteration 19 的求解器替换
+**在下游得到确证，无需回退**。
+
+**这也回答了 Iteration 18 提出的归因问题**：Adam refit 停在非驻点（decrement p90
+4.1e5，阈值 1e-6）不是无害的收敛不足，它给 block-LM 提供了一个系统性偏斜的起点，
+使下游把 `17:8` 的 ty 解到了反方向。**归因正确时，一个求解器替换就够了。**
+
+### 7. 遗留
+
+- `24:4|backward_extrapolation|LOC0` 的 NLL 结论仍**不得引用**（P1'，未变）。本轮
+  该组的 LOC0 数字虽同向改善，但不进结论。
+- `seed_helices` 的 Adam 预拟合仍未检验（P4a）——**现在是唯一剩下的未检验 Adam 环节**。
+- Gate 4 维持 failed，工作包 ④ 仍被 Gate 5 阻塞（未变）。
+- 结论仍只在 20000 events 上，未在 100000 events 上复现（P4b，未变）。
+
+
+---
+
+## Iteration 21 — `seed_helices` 的 Adam 预拟合驻点性测量（P4a）
+
+**性质**：**纯测量，零行为变更**。不改产品代码，测量在
+`scratchpad/p4a/measure_seed.py` 中离线完成。沿用 Iteration 18 的做法：先只测量，
+确认有问题再谈替换。
+
+### 1. 测什么，为什么不能直接套 1e-6
+
+`initialization_stats.measurement_refit.stationarity` 里已有的 `seed` 项测的是
+**seed 输出在 measurement 目标上**的驻点性（即 refit 的起点），全量 100% 非驻点、
+decrement p90 5.38e5。那不是 seed 自己的目标。
+
+`seed_helices`（`scripts/ml_alignment_autograd.py:548`）的目标是**非目标 SMT 全局点的
+几何距离平方和**：`loss = Σ‖predicted − points‖² / count`，单位 mm²，**无协方差加权**。
+预注册的 `NEWTON_DECREMENT_STATIONARY = 1e-6` 是在 `F = 0.5·chi2` gauge 下定的，
+**gauge 不同，不能直接套用**。因此本轮采用两个无 gauge 争议的判据，外加一个绝对值仅
+供记录：
+
+1. **预算外延**：从 200 次迭代的 seed 继续跑 Adam，看 SMT loss 还能降多少。
+2. **相对 Newton decrement** `dec/F`：per-track 的 `gᵀH⁻¹g` 除以该 track 的 `F`，
+   无量纲，直接读作「目标函数还能降低百分之几」。
+3. 绝对 decrement（mm², SMT gauge）：只记录，**不与 1e-6 比较**。
+
+第三个判据是直接求解：用 per-track Levenberg-Marquardt 解同一个 SMT 目标，
+看真正的最小值在哪。
+
+### 2. 结果（300 轨迹）
+
+`seed_helices(n_iter=200)` 的 SMT loss = **1.7712071**，与 pipeline 打印的
+`SMT loss=1.77121` 一致——测量脚本确实复现了产品代码的行为。
+
+**`n_effective` 全程恒为 3450，逐项核对未变**（Iteration 17 §4.1 的教训：
+loss 是对 effective components 取平均的，helix 跑飞会让点变 invalid 从而缩小分母；
+本轮分母没有动，下面的改善不是分母缩小换来的）。
+
+| 判据 1：继续跑 Adam | SMT loss | n_effective | vs 200-iter |
+|---|---|---|---|
+| 基线（产品代码，200 iters）| 1.7712071 | 3450 | — |
+| +200 | 1.6254709 | 3450 | +8.2% |
+| +400 | 0.054073131 | 3450 | +96.9% |
+| **+800** | **0.0030914347** | 3450 | **+99.8%** |
+| +1800 | 38.230581 | 3450 | **−2058%（发散）** |
+| +2800 | 102.92118 | 3450 | **−5711%（发散）** |
+
+| 判据 2：相对 decrement `dec/F` | 值 |
+|---|---|
+| p50 | 0.2408 |
+| p90 | 0.6495 |
+| p99 | 1.064 |
+| `dec/F > 1%` 的轨迹占比 | **100.00%** |
+| `dec/F > 10%` 的轨迹占比 | **86.67%** |
+
+| 判据 3：LM 直接求解同一目标 | 值 |
+|---|---|
+| GN 求解后 SMT loss（30 次迭代）| **0.0040002676**（−99.774%）|
+| 求解后 `dec/F` p50 | **1.02e-08** |
+| 求解后 `dec/F` p90 | 0.0744 |
+
+绝对 decrement（mm²，仅记录，不与 1e-6 比较）：p50 1.93、p90 4.311、p99 9.50、
+max 18.28，非有限 0。
+
+### 3. 判读
+
+**`seed_helices` 的 Adam 预拟合确实停在非驻点，且离真正的最小值差约三个数量级**
+（1.771 vs 约 0.004）。中位轨迹上目标函数还有 24% 可降，**100% 的轨迹**相对
+decrement 超过 1%。这与 Iteration 18 对 measurement refit 的测量结论同构：
+**不是问题难，是优化器不对**——LM 用 30 次迭代就把 p50 的相对 decrement 压到 1e-8。
+
+**但有一条重要限定：「多跑几次 Adam」不是安全的修法。** 同一个 lr = 0.5 在约 1000 次
+迭代后**发散**（+1800 时 loss 涨到 38.2，+2800 涨到 102.9，而 `n_effective` 未变，
+说明是真发散不是样本变化）。所以 `JOINT_SMT_SEED_ITERS` 调大是错的方向；
+若要改，应换求解器而非加预算。
+
+### 4. 全量复现
+
+同一脚本 `--max-tracks 0`：61482 轨迹、709672 fit hits。基线 SMT loss =
+**1.6941403**，与 pipeline 打印的 `SMT loss=1.69414` **逐位一致**；
+`n_effective = 709672` 与 `fit_hits` 相同且**全程未变**。
+
+| 量 | 300 轨迹 | 全量 |
+|---|---|---|
+| 基线 SMT loss（200 iters）| 1.7712071 | 1.6941403 |
+| +400 Adam | 0.054073131（−96.9%）| 0.065015727（−96.2%）|
+| **+800 Adam** | **0.0030914347（−99.8%）** | **0.0029251182（−99.8%）** |
+| `dec/F` p50 | 0.2408 | 0.2384 |
+| `dec/F` p90 | 0.6495 | 0.7083 |
+| `dec/F > 1%` 占比 | 100.00% | **99.98%** |
+| `dec/F > 10%` 占比 | 86.67% | **87.50%** |
+
+绝对 decrement（mm²，仅记录）：p50 1.909、p90 4.567、p99 11.35、max 42.13。
+
+LM 求解在全量上只跑了 **15** 次迭代（为控制耗时），loss 降到 0.044719603（−97.36%），
+`dec/F` p50 = 0.0798。**这是迭代预算不足，不是全量更难**——300 轨迹用 30 次迭代时
+p50 已到 1.02e-08。此项不作为幅度结论，只作为方向佐证。
+
+**两个尺度结论同向且量级一致**，与 Iteration 20 §5.4 的观察一致：小样本可定方向。
+
+### 5. 判读与下一步
+
+**P4a 的测量结论：`seed_helices` 的 Adam 预拟合确实停在非驻点。** 全量上 99.98% 的
+轨迹相对 decrement 超过 1%、87.50% 超过 10%，中位轨迹目标函数还有 23.8% 可降；
+继续跑 800 次迭代即可把 SMT loss 降低约三个数量级（1.694 → 0.00293），
+`n_effective` 不变。这与 Iteration 18 对 measurement refit 的诊断同构。
+
+**但这一次「有问题」不等于「要改」，理由是下游已经被兜住了**：
+
+- Iteration 20 已实测，GN refit 从这个非驻点 seed 出发，在全量上达到
+  measurement 非驻点行 **0.00%**、5 次迭代收敛。
+- 同一次运行的下游几何恢复已经近乎完美：两个目标层的 tx/ty
+  corr ≥ 0.95、recovery ≈ 1.0，`17:8` 的 ty 达 +0.99993 / +0.99973。
+
+也就是说，seed 的非驻点性**已被 GN refit 吸收**，可提升的空间被 recovery ≈ 1.0
+的天花板限制。因此：
+
+- **P4a（测量）到此关闭**，结论是「确有非驻点，但当前不构成下游缺陷」。
+- **P4a'（替换 seed 求解器）降级为可选优化，不是修复。** 若要做，判据不应是
+  「SMT loss 是否更低」（那已确定会更低），而应是**下游 `truth_metrics` 是否还有可
+  测量的改善**——在 recovery 已 ≈ 1.0 的情况下，这需要先预注册「多大的变化才算真
+  改善」，否则只会测到噪声。
+- **不要调大 `JOINT_SMT_SEED_ITERS`**：同一 lr = 0.5 在约 1000 次迭代后发散
+  （300 轨迹上 +1800 → 38.2，+2800 → 102.9，`n_effective` 未变），加预算会把一个
+  「未收敛但稳定」的 seed 换成一个「可能发散」的 seed。
+
