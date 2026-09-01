@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Two surface warm starts -> joint free helix -> ACTS acceptance -> guarded polish.
+# Joint free helix -> ACTS acceptance -> guarded polish.
+# The two surface warm starts were removed on 2026-09-01: block-LM reaches the
+# same geometry from the raw misaligned input once LM_MAX_STEP_R spans the
+# injected rotation (see data/experiments/.../joint-only-20260901-c-step5e3).
 set -eo pipefail
 
 JOB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,7 +36,7 @@ SURFACE_EPOCHS=200
 JOINT_ITERS=1000
 JOINT_SMT_SEED_ITERS=200
 JOINT_MEASUREMENT_REFIT_ITERS=200
-LM_MAX_ITERS=20
+LM_MAX_ITERS=60
 MAX_TRACKS=0
 SKIP_BLIND_VALIDATION=0
 LAMBDA_L2=1e-5
@@ -62,12 +65,12 @@ Required:
 
 Options:
   --events N                 ACTS reconstruction events (default: 100000)
-  --surface-epochs N         Epochs in each warm-start/polish surface solve
+  --surface-epochs N         Epochs in each guarded polish surface solve
   --joint-iters N            Joint free-helix iterations (default: 1000)
   --joint-smt-seed-iters N   Non-target SMT seed iterations (default: 200)
   --joint-measurement-refit-iters N
                               Non-target measurement refit iterations (default: 200)
-  --lm-max-iters N            Block-LM geometry iterations (default: 20)
+  --lm-max-iters N            Block-LM geometry iterations (default: 60)
   --max-tracks N             Limit free-helix tracks; 0 keeps all (default: 0)
   --input-geom PATH          Initial misaligned geometry
   --states PATH              Initial misaligned trackstates
@@ -213,7 +216,6 @@ summary_path() { printf '%s/tracksummary_kf_%s.root\n' "$ALIGNED_RECON_DIR" "$1"
 acceptance_path() { printf '%s/acceptance_%s.json\n' "$RUN_DIR" "$1"; }
 BASELINE_PROFILE="$RUN_DIR/acceptance_baseline.json"
 
-echo "fixed surface warm starts : 2"
 echo "maximum surface polish    : 2"
 echo "joint target layers       : $TARGET_LAYERS"
 echo "active DOF                : $ACTIVE_DOF"
@@ -231,7 +233,6 @@ finalize_failed_manifest() {
             "$RUN_DIR/joint_free_summary.json" "${current_acceptance:-}" "$exit_code" "$CURRENT_STAGE" 2>/dev/null || \
             printf '{"exit_code":%s,"stop_reason":"unexpected_exit","stage":"%s"}' "$exit_code" "$CURRENT_STAGE")"
         for failed_label in \
-            "${RUN_TAG}_surface_warm1" "${RUN_TAG}_surface_warm2" \
             "${RUN_TAG}_joint_free" "${RUN_TAG}_surface_polish1" \
             "${RUN_TAG}_surface_polish2"; do
             [[ ! -f "$(geometry_path "$failed_label")" ]] || \
@@ -254,7 +255,6 @@ trap 'exit 130' INT TERM HUP
 if [[ "$DRY_RUN" -eq 0 ]]; then
     [[ ! -e "$RUN_DIR" ]] || die "run tag already exists: $RUN_DIR"
     for label in \
-        "${RUN_TAG}_surface_warm1" "${RUN_TAG}_surface_warm2" \
         "${RUN_TAG}_joint_free" "${RUN_TAG}_surface_polish1" \
         "${RUN_TAG}_surface_polish2"; do
         [[ ! -e "$(geometry_path "$label")" ]] || die "geometry already exists: $(geometry_path "$label")"
@@ -324,35 +324,17 @@ current_geom="$INPUT_GEOM"
 current_states="$INPUT_STATES"
 current_summary="$INPUT_SUMMARY"
 
-for warm_round in 1 2; do
-    label="${RUN_TAG}_surface_warm${warm_round}"
-    CURRENT_STAGE="surface_warm${warm_round}"
-    output_geom="$(geometry_path "$label")"
-    run_conda "$RUN_DIR/${label}.log" \
-        python ml_alignment_autograd.py "${CONFIG_ARGS[@]}" --track-mode surface \
-        --input-geom "$current_geom" --states "$current_states" --summary "$current_summary" \
-        --output-geom "$output_geom" --target-layers "$TARGET_LAYERS" \
-        --active-dof "$ACTIVE_DOF" --epochs "$SURFACE_EPOCHS" \
-        --event-partition train --event-split-seed "$EVENT_SPLIT_SEED" \
-        --lambda-l2 "$LAMBDA_L2" --iter "warm${warm_round}" --no-plot
-    reconstruct "$label" "$output_geom"
-    if [[ "$DRY_RUN" -eq 0 ]]; then
-        require_file "$output_geom"
-        require_file "$(states_path "$label")"
-        require_file "$(summary_path "$label")"
-    fi
-    current_geom="$output_geom"
-    current_states="$(states_path "$label")"
-    current_summary="$(summary_path "$label")"
-done
-
-warm2_label="${RUN_TAG}_surface_warm2"
-warm2_acceptance="$(acceptance_path "$warm2_label")"
-CURRENT_STAGE="warm2_calibration_acceptance"
-run_acceptance "$warm2_label" "$current_states" "$warm2_acceptance" calibration || true
-warm2_geom="$current_geom"
-warm2_states="$current_states"
-warm2_summary="$current_summary"
+# The joint solver runs straight on the supplied misaligned geometry.  Its
+# guard still needs an arm to improve on, so the input geometry is scored once
+# on the calibration split.  Its reconstruction already exists -- it is what
+# --states/--summary point at -- so this costs one acceptance call, not a run.
+baseline_label="${RUN_TAG}_baseline_input"
+baseline_acceptance="$(acceptance_path "$baseline_label")"
+CURRENT_STAGE="baseline_calibration_acceptance"
+run_acceptance "$baseline_label" "$current_states" "$baseline_acceptance" calibration || true
+baseline_geom="$current_geom"
+baseline_states="$current_states"
+baseline_summary="$current_summary"
 
 joint_label="${RUN_TAG}_joint_free"
 CURRENT_STAGE="joint_free"
@@ -386,13 +368,13 @@ polish_attempts=0
 joint_adopted=1
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
-    joint_improved="$(python3 -c 'import json,sys; from reconstruction_acceptance import acceptance_score,polish_improves; joint=json.load(open(sys.argv[1])); warm=json.load(open(sys.argv[2])); print("1" if polish_improves(acceptance_score(joint),acceptance_score(warm)) else "0")' "$joint_acceptance" "$warm2_acceptance")"
+    joint_improved="$(python3 -c 'import json,sys; from reconstruction_acceptance import acceptance_score,polish_improves; joint=json.load(open(sys.argv[1])); baseline=json.load(open(sys.argv[2])); print("1" if polish_improves(acceptance_score(joint),acceptance_score(baseline)) else "0")' "$joint_acceptance" "$baseline_acceptance")"
     joint_effective="$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); print("1" if value.get("best_iteration",-1)>=0 and value.get("correction_max_abs",0)>0 else "0")' "$joint_solver_summary")"
     if [[ "$joint_improved" == "0" || "$joint_effective" == "0" ]]; then
-        current_geom="$warm2_geom"
-        current_states="$warm2_states"
-        current_summary="$warm2_summary"
-        current_acceptance="$warm2_acceptance"
+        current_geom="$baseline_geom"
+        current_states="$baseline_states"
+        current_summary="$baseline_summary"
+        current_acceptance="$baseline_acceptance"
         stop_reason="joint_not_improved"
         joint_adopted=0
     fi
@@ -495,13 +477,7 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
     fi
     python3 write_experiment_summary.py "${summary_args[@]}"
     manifest_outputs=(
-        --output "surface_warm1_geometry=$(geometry_path "${RUN_TAG}_surface_warm1")"
-        --output "surface_warm1_states=$(states_path "${RUN_TAG}_surface_warm1")"
-        --output "surface_warm1_summary=$(summary_path "${RUN_TAG}_surface_warm1")"
-        --output "surface_warm2_geometry=$(geometry_path "${RUN_TAG}_surface_warm2")"
-        --output "surface_warm2_states=$(states_path "${RUN_TAG}_surface_warm2")"
-        --output "surface_warm2_summary=$(summary_path "${RUN_TAG}_surface_warm2")"
-        --output "surface_warm2_acceptance=$warm2_acceptance"
+        --output "baseline_input_acceptance=$baseline_acceptance"
         --output "joint_geometry=$joint_geom"
         --output "joint_states=$joint_states"
         --output "joint_summary=$joint_summary"

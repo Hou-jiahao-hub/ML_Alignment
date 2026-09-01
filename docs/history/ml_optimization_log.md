@@ -2372,3 +2372,44 @@ Gauss--Newton**（实操上即用当前代码重跑，GN 已是默认）。输�
   measurement refit 有预注册的驻点 raise，几何 block 没有。
 - **流水线非逐位可复现**（§5），两次运行比较需按舍入量级判定。
 - broken-helix 支线的 Gate 4 仍是 failed，P1' 仍开启。本轮与之无关。
+
+
+---
+
+## Iteration 25 — SMT helix seed：Adam 换成阻尼 Gauss--Newton/LM
+
+**日期**：2026-09-01
+**性质**：求解器修复；不改变 SMT 点集、mask、目标函数或 measurement refit。
+
+### 1. 根因与既有证据
+
+Iteration 21 已在 300 轨迹和全量 61482 轨迹上把问题复现为求解器欠收敛，而不是样本
+变化：200 步 Adam 的全量 SMT loss 为 1.6941403，99.98% 的轨迹相对 Newton decrement
+大于 1%，87.50% 大于 10%。继续到额外 800 步虽可把 loss 降至 0.002925，但相同
+`lr=0.5` 再继续会发散；因此增加 `JOINT_SMT_SEED_ITERS` 不是可靠修法。
+
+直接原因是旧路径只在固定 200 步预算处停止：位置、方向和缩放曲率使用固定 Adam 步长，
+没有驻点门槛、候选下降检查或信赖域。该非线性最小二乘还带 helix 原点沿轨迹滑动的一维
+gauge，固定步长一阶下降无法同时稳定处理各尺度。Iteration 21 的同目标 LM 在 30 步内
+把 300 轨迹 loss 降到约 0.004，并把相对 decrement p50 压到约 1e-8。
+
+### 2. 修改
+
+- `scripts/helix_model.py` 新增共享 SMT 点拟合器：固定五参数可观测 gauge、物理曲率缩放、
+  逐轨迹阻尼、只接受目标下降的候选步，并按 2048 行分块形成 Jacobian。
+- `scripts/ml_alignment_autograd.py` 与 `scripts/validate_helix_model.py` 的两份
+  `seed_helices` 均改调该共享求解器；非目标/非 holdout mask 和原函数默认返回值不变。
+- joint summary 的 `initialization_stats.smt` 与 helix validation summary 的 `smt_seed`
+  记录 solver、迭代、目标下降和相对 Newton decrement，避免以后只看到迭代预算。
+- measurement refit 仍走既有、已验证的 Gauss--Newton 实现；SMT seed 与它统一的是 solver
+  策略，不是目标函数。SMT 保持全局点欧氏距离，measurement 保持 half-χ²。
+
+### 3. 回归验证
+
+无噪声曲线测试中，旧 Adam 30 步 RMS 为 1.924 mm；新 LM 30 步低于 1e-3 mm。
+带不可约扰动的双轨迹测试中，目标下降超过四个数量级、相对 Newton decrement max
+低于 1e-6；1 行与整批求解在 3e-8 参数绝对误差内一致。相关 helix、joint、validation
+测试共 129 项通过。
+
+本轮未运行新的 ROOT/ACTS 全量算法实验，因此没有新增实验 manifest，也不宣称下游几何
+或 blind-validation 指标发生改善；全量非驻点归因沿用 Iteration 21 已归档的测量结果。

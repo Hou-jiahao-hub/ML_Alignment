@@ -51,6 +51,7 @@ try:
         broken_helix_track_parameters,
         assign_hit_segments,
         closest_helix_points,
+        fit_helix_points_gauss_newton,
         helix_point,
         helix_tangent,
         highland_kink_sigma,
@@ -66,6 +67,7 @@ except ImportError:  # Direct script execution.
         broken_helix_track_parameters,
         assign_hit_segments,
         closest_helix_points,
+        fit_helix_points_gauss_newton,
         helix_point,
         helix_tangent,
         highland_kink_sigma,
@@ -90,10 +92,9 @@ DEFAULT_MIN_EXTRAPOLATION_FIT_SPAN = 100.0
 DEFAULT_MIN_EXTRAPOLATION_FIT_RESIDUALS = 6
 DEFAULT_MAX_TRACKS = 1000
 DEFAULT_FIT_ITERS = 200
-#: ``fit_iters`` only bounds the Adam arm.  Gauss-Newton is the default because
-#: Iteration 14 measured Adam stopping on budget rather than at the optimum;
-#: ``adam`` stays reachable so that finding can be reproduced, not because it is
-#: a supported way to run the validation.
+#: ``fit_iters`` bounds the SMT Gauss-Newton seed and the reproducibility-only
+#: Adam measurement-refit arm.  The measurement Gauss-Newton budget is
+#: ``broken_fit_iters``.
 FIT_SOLVERS = ("gauss-newton", "adam")
 DEFAULT_GEOMETRY_TOLERANCE = 1e-3
 DEFAULT_MAX_INTERSECTION_FAILURE_RATE = 0.05
@@ -841,37 +842,16 @@ def seed_helices(
     n_iter: int = 200,
     device: str | torch.device = "cpu",
     dtype=torch.float64,
-) -> torch.Tensor:
-    """Fit helices only to non-holdout SMT points."""
+    return_diagnostics: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict]:
+    """Fit helices only to non-holdout SMT points with damped Gauss-Newton."""
     points = batches.g_smt.to(device=device, dtype=dtype)
     mask = batches.fit_mask.to(device=device)
-    n_tracks, n_hits, _ = points.shape
     initial = initialize_helices(batches, device=device, dtype=dtype)
-    linear = initial[:, :5].detach().clone().requires_grad_(True)
-    rho_scaled = (initial[:, 5:6] / 1e-4).detach().clone().requires_grad_(True)
-    optimizer = optim.Adam(
-        [
-            {"params": [linear], "lr": 0.5},
-            {"params": [rho_scaled], "lr": 0.5},
-        ]
+    fitted, diagnostics = fit_helix_points_gauss_newton(
+        initial, points, mask, max_iters=n_iter
     )
-    for _ in range(n_iter):
-        optimizer.zero_grad()
-        track_parameters = torch.cat((linear, rho_scaled * 1e-4), dim=1)
-        expanded = track_parameters[:, None, :].expand(-1, n_hits, -1)
-        with torch.no_grad():
-            _fit, path_length, valid = closest_helix_points(
-                expanded.detach(), points
-            )
-        predicted = helix_point(expanded, path_length)
-        effective = mask & valid
-        squared_distance = torch.sum((predicted - points) ** 2, dim=-1)
-        loss = torch.sum(
-            torch.where(effective, squared_distance, torch.zeros_like(squared_distance))
-        ) / effective.sum().clamp(min=1)
-        loss.backward()
-        optimizer.step()
-    return torch.cat((linear, rho_scaled * 1e-4), dim=1).detach()
+    return (fitted, diagnostics) if return_diagnostics else fitted
 
 
 def fit_helices_to_measurements(
@@ -1731,8 +1711,12 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
         min_extrapolation_fit_residuals=config.min_extrapolation_fit_residuals,
     )
     initial_parameters = initialize_helices(batches, device=device, dtype=dtype)
-    seeded_parameters = seed_helices(
-        batches, n_iter=config.fit_iters, device=device, dtype=dtype
+    seeded_parameters, seed_diagnostics = seed_helices(
+        batches,
+        n_iter=config.fit_iters,
+        device=device,
+        dtype=dtype,
+        return_diagnostics=True,
     )
     if config.fit_solver == "gauss-newton":
         fitted_parameters, fit_diagnostics = fit_helices_gauss_newton(
@@ -1876,6 +1860,7 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
             "fit_solver": config.fit_solver,
         },
         "measurement_fit": json_safe(fit_diagnostics),
+        "smt_seed": json_safe(seed_diagnostics),
         "geometry_consistency": geometry_report,
         "n_tracks": len(batches.event_track_ids),
         "n_fit_hits": int(batches.fit_mask.sum()),

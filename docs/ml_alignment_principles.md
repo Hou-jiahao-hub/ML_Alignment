@@ -795,11 +795,17 @@ python ml_alignment_autograd.py --track-mode free \
 ## 9. Surface warm-start + joint free-helix 固定流程
 
 生产编排器 `run_surface_helix_experiment.sh` 不再使用 nominal RMS 比值、候选层筛选或
-frozen-helix 控制流。固定阶段为：两轮 surface 校准及同事件重建；排除
+frozen-helix 控制流。**2026-09-01 起也不再做 surface 预校准**——两轮 warm start 已删除，
+joint 直接在输入的错位几何上求解，输入几何只在 calibration 上评一次验收作为守卫参照臂
+（其重建即 `--states/--summary`，无需额外重建）。依据见
+`data/experiments/surface_helix/Vol17_Lay8__Vol24_Lay4/joint-only-20260901-c-step5e3`：
+逐 sensor 几何差 2.4e-7 mm / 8.8e-9 rad，calibration 验收差 1e-7，且少用 2 次 ACTS 重建。
+固定阶段为：输入几何的 calibration 验收；排除
 `Vol17_Lay8`、`Vol24_Lay4` 后，以至少 8 个非目标 hit 和 300 mm 路径跨度选择轨迹；
-先对非目标 SMT 全局点拟合六参数 helix，再以当前工作几何上的非目标 local
-measurement χ²精拟合。refit 的位置、方向、缩放曲率使用独立学习率并保存初始/最佳
-checkpoint。随后固定轨迹，只由目标层 measurement 联合求解两个目标层的
+先对非目标 SMT 全局点用逐轨迹阻尼 Gauss--Newton/LM 拟合六参数 helix，再以当前工作几何
+上的非目标 local measurement χ² 精拟合；两步采用相同的下降步接受与自适应阻尼
+策略，但分别保持 SMT 欧氏距离与 measurement half-χ² 的目标定义。随后固定轨迹，
+只由目标层 measurement 联合求解两个目标层的
 `(tx,ty,rz)`；目标层 measurement 不再反向更新轨迹。
 
 公共数学位于 `helix_model.py`。两个调用脚本共享参数顺序
@@ -809,6 +815,11 @@ checkpoint。随后固定轨迹，只由目标层 measurement 联合求解两个
 
 几何 block 使用逐 sensor 阻尼 Gauss--Newton/LM。参数按
 `(1 mm,1 mm,0.01 rad)` 归一化，Fisher 最小特征值下限为最大特征值的 `1e-4`；
+逐轮步长上限 `LM_MAX_STEP_T = 0.1 mm`、`LM_MAX_STEP_R = 5e-3 rad`，预算
+`LM_MAX_ITERS = 60`。这三个常量共同决定某个错位是否可达（sensor 每轮最多走一个
+上限），必须容得下注入幅度：0.030 rad / 5e-3 = 6 步、0.77 mm / 0.1 = 8 步，均在 60 之内。
+旧值（20 轮、1e-3 rad）是按 warm start 之后的小残差标定的，对原始错位需至少 30 步，
+结构上不可达，实测使 14/2268 个 sensor 停在 1–6 个顶满步长的步上不再移动；
 候选步只在实际 measurement χ²下降且求交失败率不超过 5% 时接受。该 Fisher
 正则用于约束 ShortStrip `ty` 等弱可观测模，并在 solver summary 中记录条件数、
 正则强度与实际步长。

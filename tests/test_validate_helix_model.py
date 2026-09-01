@@ -833,7 +833,7 @@ def test_fitted_helix_improves_all_holdout_metrics_on_curved_track():
         inputs, ((17, 8),), min_fit_hits=8, min_fit_span=300.0
     )
     initial = m.initialize_helices(batches)
-    fitted = m.seed_helices(batches, n_iter=250, dtype=dtype)
+    fitted = m.seed_helices(batches, n_iter=30, dtype=dtype)
 
     initial_metrics = m.summarize_evaluation(
         m.evaluate_helix_on_surfaces(initial, batches, geometry),
@@ -845,6 +845,7 @@ def test_fitted_helix_improves_all_holdout_metrics_on_curved_track():
     )
 
     assert fitted_metrics["global_rmse_mm"] < initial_metrics["global_rmse_mm"]
+    assert fitted_metrics["global_rmse_mm"] < 1.0e-3
     assert fitted_metrics["local_rmse_mm"] < initial_metrics["local_rmse_mm"]
     assert fitted_metrics["direction_angle_rms_rad"] < initial_metrics["direction_angle_rms_rad"]
     assert fitted_metrics["intersection_failure_rate"] == 0.0
@@ -2383,9 +2384,10 @@ def test_gauss_newton_measurement_fit_beats_adam_on_the_same_rows():
     adam_objective = _measurement_objective(m, batches, geometry, adam)
     gn_objective = _measurement_objective(m, batches, geometry, gauss_newton)
     assert torch.all(gn_objective < adam_objective)
-    # The Iteration 14 finding was an order-of-magnitude gap, not a rounding
-    # difference; a test that only checks "<" would pass on a broken solver.
-    assert float(gn_objective.max()) < 0.01 * float(adam_objective.min())
+    # The old order-of-magnitude gap included Adam's badly truncated SMT seed.
+    # With the seed itself solved by LM, refit Adam starts much closer, but the
+    # stationary GN solution must still improve every row by a visible margin.
+    assert torch.all(gn_objective < 0.9 * adam_objective)
 
 
 def test_gauss_newton_measurement_fit_reaches_a_stationary_point():

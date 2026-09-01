@@ -31,6 +31,7 @@ try:
         accept_newton_candidate,
         assemble_track_parameters as assemble_joint_track_parameters,
         closest_helix_points,
+        fit_helix_points_gauss_newton,
         helix_point,
         helix_tangent,
         intersect_plane,
@@ -43,6 +44,7 @@ except ImportError:  # Direct script execution.
         accept_newton_candidate,
         assemble_track_parameters as assemble_joint_track_parameters,
         closest_helix_points,
+        fit_helix_points_gauss_newton,
         helix_point,
         helix_tangent,
         intersect_plane,
@@ -108,11 +110,21 @@ JOINT_REFIT_PREREGISTRATION_VERSION = 1
 #: invalidate a fit, above that the fit is not usable.  It was set from that
 #: precedent, not from looking at what the solver produced.
 JOINT_REFIT_MAX_NON_STATIONARY_ROW_FRACTION = 1.0e-3
-LM_MAX_ITERS = 20
+#: Block-LM budget and per-iteration step caps.  A sensor can only travel
+#: ``cap * accepted_steps``, so these three constants jointly decide whether a
+#: misalignment is reachable at all.  The former values (20 iterations,
+#: 1e-3 rad) were calibrated for a geometry that two surface warm starts had
+#: already pre-corrected: against the raw injected 0.030 rad they need at least
+#: 30 accepted steps, which 20 iterations cannot supply.  Measured on the
+#: 20260901 joint-only runs, that stranded 14 of 2268 sensors at 1-6 capped
+#: steps regardless of the iteration budget.  At 5e-3 rad the same run
+#: reproduced the warm-start pipeline's geometry and its ACTS acceptance to
+#: within 1e-7, and converged in 13 iterations.
+LM_MAX_ITERS = 60
 LM_INITIAL_DAMPING = 1e-3
 FISHER_EIGEN_FLOOR = 1e-4
 LM_MAX_STEP_T = 0.1
-LM_MAX_STEP_R = 1e-3
+LM_MAX_STEP_R = 5e-3
 MEASUREMENT_REFIT_LR_POSITION = 1e-3
 MEASUREMENT_REFIT_LR_DIRECTION = 1e-5
 MEASUREMENT_REFIT_LR_RHO_SCALED = 1e-3
@@ -545,11 +557,17 @@ def _non_target_fit_mask(batches):
     return batches.fit_mask
 
 
-def seed_helices(batches, n_iter=200, device="cpu", dtype=torch.float64):
-    """Fit per-track helix warm starts to ACTS smoothed global points."""
+def seed_helices(
+    batches,
+    n_iter=200,
+    device="cpu",
+    dtype=torch.float64,
+    return_diagnostics=False,
+):
+    """Fit per-track helix warm starts to ACTS smoothed points with LM."""
     points = batches.g_smt.to(device=device, dtype=dtype)
     mask = _non_target_fit_mask(batches).to(device=device)
-    n_tracks, n_hits, _ = points.shape
+    n_tracks, _n_hits, _ = points.shape
     first_index = mask.to(torch.int64).argmax(dim=1)
     rows = torch.arange(n_tracks, device=device)
     first = points[rows, first_index]
@@ -557,26 +575,19 @@ def seed_helices(batches, n_iter=200, device="cpu", dtype=torch.float64):
     transverse = torch.linalg.norm(direction[:, :2], dim=1).clamp(min=1e-6)
     psi = torch.atan2(direction[:, 1], direction[:, 0])
     tanl = direction[:, 2] / transverse
-    linear = torch.cat((first, psi[:, None], tanl[:, None]), dim=1).detach().clone().requires_grad_(True)
-    rho_scaled = torch.zeros((n_tracks, 1), device=device, dtype=dtype, requires_grad=True)
-    optimizer = optim.Adam([
-        {"params": [linear], "lr": 0.5},
-        {"params": [rho_scaled], "lr": 0.5},
-    ])
-    for _ in range(n_iter):
-        optimizer.zero_grad()
-        track_parameters = assemble_joint_track_parameters(linear, rho_scaled)
-        expanded = track_parameters[:, None, :].expand(-1, n_hits, -1)
-        with torch.no_grad():
-            _fit, path_length, valid = closest_helix_points(expanded.detach(), points)
-        predicted = helix_point(expanded, path_length)
-        effective = mask & valid
-        squared_distance = torch.sum((predicted - points) ** 2, dim=-1)
-        loss = torch.sum(torch.where(effective, squared_distance, torch.zeros_like(squared_distance)))
-        loss = loss / effective.sum().clamp(min=1)
-        loss.backward()
-        optimizer.step()
-    return assemble_joint_track_parameters(linear, rho_scaled).detach()
+    initial = torch.cat(
+        (
+            first,
+            psi[:, None],
+            tanl[:, None],
+            torch.zeros((n_tracks, 1), device=device, dtype=dtype),
+        ),
+        dim=1,
+    )
+    fitted, diagnostics = fit_helix_points_gauss_newton(
+        initial, points, mask, max_iters=n_iter
+    )
+    return (fitted, diagnostics) if return_diagnostics else fitted
 
 
 def smt_seed_statistics(batches, track_parameters):
@@ -2361,13 +2372,20 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
         f"Joint track selection: {len(batches.event_track_ids)} tracks, "
         f"{int(batches.hit_mask.sum())} hits, padded width {batches.hit_mask.shape[1]}."
     )
-    seeded_parameters = seed_helices(
+    seeded_parameters, seed_solver_stats = seed_helices(
         batches,
         n_iter=config.joint_smt_seed_iters,
         device="cuda" if config.gpu and torch.cuda.is_available() else "cpu",
         dtype=torch.float32 if config.gpu and torch.cuda.is_available() else torch.float64,
+        return_diagnostics=True,
     )
-    smt_stats = smt_seed_statistics(batches, seeded_parameters)
+    smt_stats = {
+        **smt_seed_statistics(batches, seeded_parameters),
+        "solver": seed_solver_stats["solver"],
+        "convergence": {
+            key: value for key, value in seed_solver_stats.items() if key != "solver"
+        },
+    }
     if smt_stats["invalid_fraction"] > config.joint_max_invalid_fraction:
         raise ValueError(
             "SMT helix seed intersection failure rate exceeds limit: "

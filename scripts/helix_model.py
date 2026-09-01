@@ -7,6 +7,8 @@ curvature in inverse millimetres.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 
 
@@ -15,6 +17,10 @@ S_MAX = 1200.0
 PLANE_PARALLEL_EPS = 1.0e-6
 PLANE_RESIDUAL_TOLERANCE = 1.0e-3
 CLOSEST_POINT_CURVATURE_EPS = 1.0e-9
+GAUSS_NEWTON_MAX_ITERS = 60
+GAUSS_NEWTON_TOLERANCE = 1.0e-10
+GAUSS_NEWTON_INITIAL_DAMPING = 1.0e-8
+GAUSS_NEWTON_MIN_DAMPING = 1.0e-12
 
 
 def _sinc(value: torch.Tensor) -> torch.Tensor:
@@ -179,6 +185,256 @@ def assemble_track_parameters(
 ) -> torch.Tensor:
     """Assemble physical helix parameters from optimizer representation."""
     return torch.cat((linear, rho_scaled * CURVATURE_SCALE), dim=-1)
+
+
+def reference_gauge_frame(
+    reference: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fix the redundant helix origin to a transverse reference plane."""
+    direction = helix_tangent(reference, torch.zeros_like(reference[:, 0]))
+    direction = direction / direction.norm(dim=-1, keepdim=True).clamp_min(1.0e-12)
+    helper = torch.zeros_like(direction)
+    helper[:, 2] = 1.0
+    degenerate = direction[:, 2].abs() > 1.0 - 1.0e-6
+    helper[degenerate] = torch.tensor(
+        [1.0, 0.0, 0.0], dtype=helper.dtype, device=helper.device
+    )
+    axis0 = torch.cross(helper, direction, dim=-1)
+    axis0 = axis0 / axis0.norm(dim=-1, keepdim=True).clamp_min(1.0e-12)
+    axis1 = torch.cross(direction, axis0, dim=-1)
+    return reference[:, :3].clone(), axis0, axis1
+
+
+def pack_gauge_fixed_track_parameters(reference: torch.Tensor) -> torch.Tensor:
+    """Pack a helix into the five observable parameters of a fixed gauge."""
+    _linear, rho_scaled = split_track_parameters(reference)
+    offsets = torch.zeros(
+        (reference.shape[0], 2), dtype=reference.dtype, device=reference.device
+    )
+    return torch.cat((offsets, reference[:, 3:5], rho_scaled), dim=1)
+
+
+def unpack_gauge_fixed_track_parameters(
+    theta: torch.Tensor,
+    frame: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """Recover physical helix parameters from a fixed-gauge representation."""
+    origin, axis0, axis1 = frame
+    position = origin + theta[:, 0:1] * axis0 + theta[:, 1:2] * axis1
+    return assemble_track_parameters(
+        torch.cat((position, theta[:, 2:4]), dim=1), theta[:, 4:5]
+    )
+
+
+def damped_gauss_newton(
+    theta: torch.Tensor,
+    residual_of: Callable[[torch.Tensor], torch.Tensor],
+    jacobian_of: Callable[[torch.Tensor], torch.Tensor],
+    max_iters: int = GAUSS_NEWTON_MAX_ITERS,
+    damping: float = GAUSS_NEWTON_INITIAL_DAMPING,
+    tolerance: float = GAUSS_NEWTON_TOLERANCE,
+) -> tuple[torch.Tensor, dict[str, float | int | bool]]:
+    """Minimise independent row residuals with the measurement-refit LM rule."""
+    if max_iters < 1:
+        raise ValueError("max_iters must be at least 1.")
+    current = 0.5 * residual_of(theta).square().sum(dim=1)
+    if not torch.isfinite(current).all():
+        raise FloatingPointError("Non-finite initial Gauss-Newton objective.")
+    initial = float(current.mean())
+    identity = torch.eye(theta.shape[1], dtype=theta.dtype, device=theta.device)
+    level = torch.full(
+        (theta.shape[0], 1, 1),
+        float(damping),
+        dtype=theta.dtype,
+        device=theta.device,
+    )
+    converged = False
+    iterations = 0
+    change = float("inf")
+    for iterations in range(1, max_iters + 1):
+        residual = residual_of(theta)
+        jacobian = jacobian_of(theta)
+        hessian = jacobian.transpose(1, 2) @ jacobian
+        gradient = (jacobian.transpose(1, 2) @ residual.unsqueeze(-1)).squeeze(-1)
+        scale = hessian.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1.0e-30)
+        regularized = hessian + level * scale[:, None, None] * identity
+        step = torch.linalg.solve(regularized, -gradient.unsqueeze(-1)).squeeze(-1)
+        candidate = theta + step
+        candidate_objective = 0.5 * residual_of(candidate).square().sum(dim=1)
+        improved = torch.isfinite(candidate_objective) & (
+            candidate_objective < current
+        )
+        theta = torch.where(improved.unsqueeze(-1), candidate, theta)
+        level = torch.where(
+            improved[:, None, None],
+            (level * 0.1).clamp_min(GAUSS_NEWTON_MIN_DAMPING),
+            level * 10.0,
+        )
+        decrease = (current - candidate_objective).clamp_min(
+            0.0
+        ) / current.abs().clamp_min(1.0)
+        current = torch.where(improved, candidate_objective, current)
+        change = float(decrease.max())
+        # A rejected step has zero decrease too, but is not convergence: its
+        # damping must grow and the row must get another candidate.
+        if bool(improved.all()) and change < tolerance:
+            converged = True
+            break
+
+    residual = residual_of(theta)
+    jacobian = jacobian_of(theta)
+    hessian = jacobian.transpose(1, 2) @ jacobian
+    gradient = (jacobian.transpose(1, 2) @ residual.unsqueeze(-1)).squeeze(-1)
+    scale = hessian.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1.0e-30)
+    stationary_hessian = (
+        hessian + GAUSS_NEWTON_MIN_DAMPING * scale[:, None, None] * identity
+    )
+    decrement = (
+        gradient.unsqueeze(1)
+        @ torch.linalg.solve(stationary_hessian, gradient.unsqueeze(-1))
+    ).flatten()
+    relative_decrement = decrement / current.clamp_min(1.0e-30)
+    return theta, {
+        "converged": bool(converged),
+        "iterations": int(iterations),
+        "initial_objective": initial,
+        "final_objective": float(current.mean()),
+        "max_relative_decrease": float(change),
+        "max_gradient_norm": float(gradient.norm(dim=1).max()),
+        "relative_newton_decrement_max": float(relative_decrement.max()),
+    }
+
+
+def _single_point_fit_residual(
+    theta: torch.Tensor,
+    origin: torch.Tensor,
+    axis0: torch.Tensor,
+    axis1: torch.Tensor,
+    points: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    reference = unpack_gauge_fixed_track_parameters(
+        theta.unsqueeze(0),
+        (origin.unsqueeze(0), axis0.unsqueeze(0), axis1.unsqueeze(0)),
+    ).squeeze(0)
+    expanded = reference.expand(points.shape[0], -1)
+    with torch.no_grad():
+        _fitted, path, _valid = closest_helix_points(expanded.detach(), points)
+    predicted = helix_point(expanded, path)
+    residual = torch.where(
+        mask.unsqueeze(-1), predicted - points, torch.zeros_like(points)
+    )
+    return residual.flatten()
+
+
+_BATCHED_POINT_FIT_JACOBIAN = torch.func.vmap(
+    torch.func.jacrev(_single_point_fit_residual, argnums=0)
+)
+
+
+def _fit_helix_points_gauss_newton_block(
+    initial: torch.Tensor,
+    points: torch.Tensor,
+    mask: torch.Tensor,
+    max_iters: int = GAUSS_NEWTON_MAX_ITERS,
+    damping: float = GAUSS_NEWTON_INITIAL_DAMPING,
+    tolerance: float = GAUSS_NEWTON_TOLERANCE,
+) -> tuple[torch.Tensor, dict[str, float | int | bool | str]]:
+    """Fit per-track helix seeds to global points by damped Gauss-Newton."""
+    if initial.ndim != 2 or initial.shape[1] != 6:
+        raise ValueError("initial must have shape [tracks, 6].")
+    if points.shape != (initial.shape[0], mask.shape[1], 3):
+        raise ValueError("points must have shape [tracks, hits, 3].")
+    if mask.shape != points.shape[:2]:
+        raise ValueError("mask must have shape [tracks, hits].")
+    if not bool(mask.any(dim=1).all()):
+        raise ValueError("Every helix seed needs at least one fitted point.")
+
+    frame = reference_gauge_frame(initial)
+    theta = pack_gauge_fixed_track_parameters(initial)
+
+    def residual_of(values: torch.Tensor) -> torch.Tensor:
+        return torch.func.vmap(_single_point_fit_residual)(values, *frame, points, mask)
+
+    def jacobian_of(values: torch.Tensor) -> torch.Tensor:
+        return _BATCHED_POINT_FIT_JACOBIAN(values, *frame, points, mask)
+
+    fitted_theta, stats = damped_gauss_newton(
+        theta,
+        residual_of,
+        jacobian_of,
+        max_iters=max_iters,
+        damping=damping,
+        tolerance=tolerance,
+    )
+    fitted = unpack_gauge_fixed_track_parameters(fitted_theta, frame).detach()
+    return fitted, {"solver": "gauss-newton", **stats}
+
+
+def fit_helix_points_gauss_newton(
+    initial: torch.Tensor,
+    points: torch.Tensor,
+    mask: torch.Tensor,
+    max_iters: int = GAUSS_NEWTON_MAX_ITERS,
+    damping: float = GAUSS_NEWTON_INITIAL_DAMPING,
+    tolerance: float = GAUSS_NEWTON_TOLERANCE,
+    chunk_rows: int = 2048,
+) -> tuple[torch.Tensor, dict[str, float | int | bool | str]]:
+    """Fit point seeds with the measurement-refit LM strategy in row chunks."""
+    if initial.ndim != 2 or initial.shape[1] != 6:
+        raise ValueError("initial must have shape [tracks, 6].")
+    if mask.ndim != 2:
+        raise ValueError("mask must have shape [tracks, hits].")
+    if mask.shape != points.shape[:2]:
+        raise ValueError("mask must have shape [tracks, hits].")
+    if points.ndim != 3 or points.shape != (initial.shape[0], mask.shape[1], 3):
+        raise ValueError("points must have shape [tracks, hits, 3].")
+    if initial.shape[0] == 0:
+        raise ValueError("At least one helix seed is required.")
+
+    step = initial.shape[0] if chunk_rows <= 0 else chunk_rows
+    fitted_blocks: list[torch.Tensor] = []
+    stats_blocks: list[dict[str, float | int | bool | str]] = []
+    weights: list[int] = []
+    for start in range(0, initial.shape[0], max(step, 1)):
+        stop = min(start + max(step, 1), initial.shape[0])
+        fitted, stats = _fit_helix_points_gauss_newton_block(
+            initial[start:stop],
+            points[start:stop],
+            mask[start:stop],
+            max_iters=max_iters,
+            damping=damping,
+            tolerance=tolerance,
+        )
+        fitted_blocks.append(fitted)
+        stats_blocks.append(stats)
+        weights.append(stop - start)
+
+    total = float(sum(weights))
+    diagnostics: dict[str, float | int | bool | str] = {
+        "solver": "gauss-newton",
+        "converged": all(bool(stats["converged"]) for stats in stats_blocks),
+        "iterations": max(int(stats["iterations"]) for stats in stats_blocks),
+        "initial_objective": sum(
+            float(stats["initial_objective"]) * weight
+            for stats, weight in zip(stats_blocks, weights)
+        ) / total,
+        "final_objective": sum(
+            float(stats["final_objective"]) * weight
+            for stats, weight in zip(stats_blocks, weights)
+        ) / total,
+        "max_relative_decrease": max(
+            float(stats["max_relative_decrease"]) for stats in stats_blocks
+        ),
+        "max_gradient_norm": max(
+            float(stats["max_gradient_norm"]) for stats in stats_blocks
+        ),
+        "relative_newton_decrement_max": max(
+            float(stats["relative_newton_decrement_max"]) for stats in stats_blocks
+        ),
+        "n_chunks": len(stats_blocks),
+    }
+    return torch.cat(fitted_blocks, dim=0), diagnostics
 
 
 # ---------------------------------------------------------------------------

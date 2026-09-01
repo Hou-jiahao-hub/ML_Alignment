@@ -55,6 +55,53 @@ def test_curvature_optimizer_scaling_round_trips_physical_parameters():
     assert torch.equal(model.assemble_track_parameters(linear, scaled), tracks)
 
 
+def test_point_seed_gauss_newton_reaches_the_noiseless_helix_stationary_point():
+    """Catch a seed solver that merely exhausts a first-order iteration budget."""
+    model = importlib.import_module("scripts.helix_model")
+    truth = torch.tensor(
+        [
+            [2.0, -1.0, 0.5, 0.4, 0.2, 2.0e-3],
+            [-3.0, 4.0, -1.5, -0.6, -0.1, -1.5e-3],
+        ],
+        dtype=torch.float64,
+    )
+    path = torch.linspace(-30.0, 80.0, 12, dtype=torch.float64)
+    points = model.helix_point(
+        truth[:, None, :].expand(-1, len(path), -1),
+        path.expand(len(truth), -1),
+    )
+    # Leave a small deterministic irreducible component so dec/F remains a
+    # meaningful stationarity ratio instead of becoming 0/0 at exact closure.
+    points[..., 2] += 0.01 * torch.sin(path / 7.0)
+    mask = torch.ones(points.shape[:2], dtype=torch.bool)
+    initial = truth + torch.tensor(
+        [
+            [0.8, -0.5, 0.3, 0.08, -0.05, 4.0e-4],
+            [-0.6, 0.7, -0.4, -0.06, 0.04, -3.0e-4],
+        ],
+        dtype=torch.float64,
+    )
+
+    fitted, diagnostics = model.fit_helix_points_gauss_newton(
+        initial, points, mask, max_iters=30
+    )
+    chunked, chunked_diagnostics = model.fit_helix_points_gauss_newton(
+        initial, points, mask, max_iters=30, chunk_rows=1
+    )
+    expanded = fitted[:, None, :].expand(-1, points.shape[1], -1)
+    closest, _path, valid = model.closest_helix_points(expanded, points)
+    rms = torch.sqrt((closest[mask & valid] - points[mask & valid]).square().mean())
+
+    assert diagnostics["solver"] == "gauss-newton"
+    assert diagnostics["final_objective"] < diagnostics["initial_objective"] * 1.0e-4
+    assert diagnostics["relative_newton_decrement_max"] < 1.0e-6
+    assert rms.item() < 0.01
+    torch.testing.assert_close(chunked, fitted, rtol=0.0, atol=3.0e-8)
+    assert chunked_diagnostics["final_objective"] == pytest.approx(
+        diagnostics["final_objective"], rel=0.0, abs=1.0e-12
+    )
+
+
 def test_both_consumers_reexport_the_shared_math_implementation():
     shared = importlib.import_module("scripts.helix_model")
     alignment = importlib.import_module("scripts.ml_alignment_autograd")

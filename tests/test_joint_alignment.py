@@ -401,8 +401,32 @@ def test_block_lm_is_the_default_free_geometry_solver():
     config = m.alignment_config_from_args(args)
 
     assert config.joint_solver == "block-lm"
-    assert config.lm_max_iters == 20
+    assert config.lm_max_iters == 60
     assert config.fisher_eigen_floor == pytest.approx(1e-4)
+
+
+def test_block_lm_step_caps_span_the_raw_misalignment_without_a_warm_start():
+    """The step caps must let block-LM traverse a raw injected misalignment.
+
+    ``alignment_odd.py`` injects up to 1.5x its nominal magnitude, i.e. about
+    0.77 mm and 0.030 rad.  A per-iteration cap only lets a sensor travel
+    ``cap * accepted_steps``, so a cap that needs more accepted steps than
+    ``lm_max_iters`` allows leaves sensors stranded at their injected value.
+    Measured on the full 20260901 joint-only run: at 1e-3 rad, 14 of 2268
+    sensors stalled after 1-6 capped steps and never moved again, even with
+    60 iterations available.
+    """
+    m = load_module()
+    args = m.build_argument_parser().parse_args(["--track-mode", "free"])
+    config = m.alignment_config_from_args(args)
+
+    max_injected_shift_mm = 2.0 * 1.5 * 0.256  # asymmetric_random upper bound
+    max_injected_rotation_rad = 0.02 * 1.5
+
+    assert config.lm_max_step_t == pytest.approx(0.1)
+    assert config.lm_max_step_r == pytest.approx(5e-3)
+    assert max_injected_shift_mm / config.lm_max_step_t <= config.lm_max_iters
+    assert max_injected_rotation_rad / config.lm_max_step_r <= config.lm_max_iters
 
 
 def test_fisher_regularization_floors_weak_normalized_mode():
@@ -716,11 +740,15 @@ def test_seed_helices_fits_smoothed_points():
         fit_mask=torch.ones((1, 10), dtype=torch.bool),
     )
 
-    seed = m.seed_helices(batches, n_iter=250, dtype=torch.float64)
+    seed, diagnostics = m.seed_helices(
+        batches, n_iter=30, dtype=torch.float64, return_diagnostics=True
+    )
     fitted, _points, valid = m.closest_helix_points(seed[:, None, :].expand(-1, 10, -1), points)
 
     assert valid.all()
-    assert torch.sqrt(torch.mean((fitted - points) ** 2)).item() < 0.25
+    assert diagnostics["solver"] == "gauss-newton"
+    assert diagnostics["final_objective"] < diagnostics["initial_objective"] * 1.0e-8
+    assert torch.sqrt(torch.mean((fitted - points) ** 2)).item() < 1.0e-3
 
 
 def test_joint_track_parameterization_scales_physical_curvature():

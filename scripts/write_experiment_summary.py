@@ -8,8 +8,8 @@ from typing import Any, Mapping, Sequence
 
 SCHEMA_VERSION = 2
 
-WORKFLOW_FULL = "surface-warm2_block-lm_surface-polish2_blind-validation"
-WORKFLOW_CALIBRATION_ONLY = "surface-warm2_block-lm_surface-polish2_calibration-only"
+WORKFLOW_FULL = "block-lm_surface-polish2_blind-validation"
+WORKFLOW_CALIBRATION_ONLY = "block-lm_surface-polish2_calibration-only"
 
 TARGET_LAYERS = ["17:8", "24:4"]
 ACTIVE_DOF = [0, 1, 5]

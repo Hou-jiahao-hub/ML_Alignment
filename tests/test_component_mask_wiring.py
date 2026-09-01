@@ -121,7 +121,24 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
     monkeypatch.setattr(m, "print_target_residual_stats", lambda *_a, **_k: None)
     monkeypatch.setattr(m, "build_track_batches", lambda *_a, **_k: batches)
     seeded = torch.zeros((n_tracks, 6), dtype=torch.float64)
-    monkeypatch.setattr(m, "seed_helices", lambda *_a, **_k: seeded)
+    monkeypatch.setattr(
+        m,
+        "seed_helices",
+        lambda *_a, **_k: (
+            seeded,
+            {
+                "solver": "gauss-newton",
+                "converged": True,
+                "iterations": 1,
+                "initial_objective": 0.0,
+                "final_objective": 0.0,
+                "max_relative_decrease": 0.0,
+                "max_gradient_norm": 0.0,
+                "relative_newton_decrement_max": 0.0,
+                "n_chunks": 1,
+            },
+        ),
+    )
     monkeypatch.setattr(
         m,
         "smt_seed_statistics",

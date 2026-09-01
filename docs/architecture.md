@@ -33,9 +33,18 @@ simulation -> ROOT/geometry JSON -> loaders -> solver -> aligned geometry
 | `path_inventory.py` | Effective absolute input/output path contract | None |
 
 The production surface/helix experiment uses a deterministic event split
-(80% train, 10% calibration, 10% blind validation). It runs two surface warm
-starts, a non-target helix refit, a fixed-track block-LM target-geometry solve,
-and at most two gain-0.2 surface polish candidates. Candidate selection reads
+(80% train, 10% calibration, 10% blind validation). It scores the supplied
+misaligned geometry once on calibration to give the guard an arm to improve on,
+then runs a non-target helix refit, a fixed-track block-LM target-geometry
+solve, and at most two gain-0.2 surface polish candidates.
+
+The two surface warm starts it used to run first were removed on 2026-09-01.
+Block-LM reaches the same geometry from the raw misaligned input once
+`LM_MAX_STEP_R` spans the injected rotation: the joint-only run reproduced the
+warm-start pipeline's per-sensor geometry to 2.4e-7 mm / 8.8e-9 rad and its
+calibration acceptance to 1e-7, in 13 LM iterations instead of 15 and without
+the two extra ACTS reconstructions. See
+`data/experiments/surface_helix/Vol17_Lay8__Vol24_Lay4/joint-only-20260901-*`. Candidate selection reads
 only the calibration partition; the selected geometry is evaluated once on the
 validation partition. Nominal states are used once to create a versioned frozen
 acceptance profile, while nominal geometry/truth comparisons remain diagnostic.
@@ -116,8 +125,11 @@ non-stationary row fraction exceeds `MAX_NON_STATIONARY_ROW_FRACTION` -- the sam
 threshold that gates the Gate 4 arms, so a refit that never reached its optimum
 cannot be reported as a statement about the model.
 
-`seed_helices` is a separate geometric prefit to the SMT points and still uses
-Adam; it only supplies the Gauss-Newton starting point.
+`seed_helices` is a separate geometric prefit to the SMT points. It now uses
+the same per-track damped Gauss--Newton/LM strategy as the measurement refit:
+gauge-fixed parameters, scaled curvature, descent-only step acceptance and
+adaptive damping. The point objective remains unweighted Euclidean distance,
+so only the solver strategy is shared with the measurement refit.
 
 ## Paired holdout contract (Gate 4)
 

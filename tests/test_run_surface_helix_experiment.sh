@@ -32,16 +32,22 @@ grep -Fq -- "deprecated: --helix-candidates no longer selects layers" "$output"
 grep -Fq -- "[conda:pytorch]" "$output"
 grep -Fq -- "[acts]" "$output"
 
-[[ "$(grep -Fc -- "--track-mode surface" "$output")" -eq 4 ]]
+# Only the two guarded polish candidates use the surface solver now; the two
+# surface warm starts were removed once joint-only was shown to reproduce their
+# geometry and acceptance end to end.
+[[ "$(grep -Fc -- "--track-mode surface" "$output")" -eq 2 ]]
 [[ "$(grep -Fc -- "--track-mode free" "$output")" -eq 1 ]]
 [[ "$(grep -Fc -- "python calibrate_acceptance.py" "$output")" -eq 1 ]]
 [[ "$(grep -Fc -- "python reconstruction_acceptance.py" "$output")" -eq 5 ]]
-[[ "$(grep -Fc -- "--event-partition train" "$output")" -eq 5 ]]
+[[ "$(grep -Fc -- "--event-partition train" "$output")" -eq 3 ]]
 [[ "$(grep -Fc -- "--event-partition calibration" "$output")" -eq 4 ]]
 [[ "$(grep -Fc -- "--event-partition validation" "$output")" -eq 1 ]]
 [[ "$(grep -Fc -- "--threshold-profile" "$output")" -eq 5 ]]
-grep -Fq -- "tdd_fresh_surface_warm1" "$output"
-grep -Fq -- "tdd_fresh_surface_warm2" "$output"
+if grep -Fq -- "tdd_fresh_surface_warm" "$output"; then
+    echo "workflow still runs a surface warm start" >&2
+    exit 1
+fi
+grep -Fq -- "acceptance_tdd_fresh_baseline_input.json" "$output"
 grep -Fq -- "tdd_fresh_joint_free" "$output"
 grep -Fq -- "tdd_fresh_surface_polish1" "$output"
 grep -Fq -- "tdd_fresh_surface_polish2" "$output"
@@ -49,7 +55,7 @@ grep -Fq -- "--target-layers 17:8\,24:4" "$output"
 grep -Fq -- "--active-dof 0\,1\,5" "$output"
 grep -Fq -- "--joint-seed-mode non-target-measurement" "$output"
 grep -Fq -- "--joint-solver block-lm" "$output"
-grep -Fq -- "--lm-max-iters 20" "$output"
+grep -Fq -- "--lm-max-iters 60" "$output"
 grep -Fq -- "--alignment-gain 0.2" "$output"
 grep -Fq -- 'EXPECTED_TARGET_LAYERS="17:8,24:4"' "$SCRIPT"
 grep -Fq -- '[[ "$TARGET_LAYERS_SPEC" == "$EXPECTED_TARGET_LAYERS" ]]' "$SCRIPT"
@@ -62,14 +68,12 @@ if grep -Fq -- "ml_alignment_helix.py" "$output"; then
     exit 1
 fi
 
-warm1="$(grep -n -m1 -- "tdd_fresh_surface_warm1" "$output" | cut -d: -f1)"
-warm2="$(grep -n -m1 -- "tdd_fresh_surface_warm2" "$output" | cut -d: -f1)"
-warm2_accept="$(grep -n -m1 -- "acceptance_tdd_fresh_surface_warm2.json" "$output" | cut -d: -f1)"
+baseline_accept="$(grep -n -m1 -- "acceptance_tdd_fresh_baseline_input.json" "$output" | cut -d: -f1)"
 joint="$(grep -n -m1 -- "tdd_fresh_joint_free" "$output" | cut -d: -f1)"
 accept="$(grep -n -m1 -- "acceptance_tdd_fresh_joint_free.json" "$output" | cut -d: -f1)"
 polish="$(grep -n -m1 -- "tdd_fresh_surface_polish1" "$output" | cut -d: -f1)"
 validation="$(grep -n -m1 -- "acceptance_tdd_fresh_validation.json" "$output" | cut -d: -f1)"
-(( warm1 < warm2 && warm2 < warm2_accept && warm2_accept < joint && joint < accept && accept < polish && polish < validation ))
+(( baseline_accept < joint && joint < accept && accept < polish && polish < validation ))
 
 if grep -Fq -- "--threshold 1.0" "$output"; then
     echo "new workflow still uses the uncalibrated absolute acceptance threshold" >&2
