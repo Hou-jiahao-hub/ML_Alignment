@@ -2,7 +2,9 @@
 
 **Date:** 2026-09-01
 
-**Status:** Approved in chat; awaiting written-spec review
+**Status:** Superseded after theoretical review
+
+**Replacement:** `2026-09-01-broken-joint-geometry-identifiability-v2-design.md`
 
 **Scope:** ACTS-independent truth-known closure for local `tx`, `ty`, and `rz`
 
