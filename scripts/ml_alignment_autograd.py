@@ -35,6 +35,7 @@ try:
         helix_point,
         helix_tangent,
         intersect_plane,
+        require_stationary_helix_point_fit,
         split_track_parameters as split_joint_track_parameters,
     )
 except ImportError:  # Direct script execution.
@@ -48,6 +49,7 @@ except ImportError:  # Direct script execution.
         helix_point,
         helix_tangent,
         intersect_plane,
+        require_stationary_helix_point_fit,
         split_track_parameters as split_joint_track_parameters,
     )
 
@@ -2386,6 +2388,7 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
             key: value for key, value in seed_solver_stats.items() if key != "solver"
         },
     }
+    require_stationary_helix_point_fit(seed_solver_stats)
     if smt_stats["invalid_fraction"] > config.joint_max_invalid_fraction:
         raise ValueError(
             "SMT helix seed intersection failure rate exceeds limit: "

@@ -135,6 +135,8 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
                 "max_relative_decrease": 0.0,
                 "max_gradient_norm": 0.0,
                 "relative_newton_decrement_max": 0.0,
+                "non_stationary_row_fraction": 0.0,
+                "n_non_finite": 0,
                 "n_chunks": 1,
             },
         ),

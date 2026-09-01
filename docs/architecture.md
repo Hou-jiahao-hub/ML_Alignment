@@ -129,7 +129,10 @@ cannot be reported as a statement about the model.
 the same per-track damped Gauss--Newton/LM strategy as the measurement refit:
 gauge-fixed parameters, scaled curvature, descent-only step acceptance and
 adaptive damping. The point objective remains unweighted Euclidean distance,
-so only the solver strategy is shared with the measurement refit.
+so only the solver strategy is shared with the measurement refit. Closest-point
+invalid entries remain excluded, accepted candidates may not invalidate an
+initially valid point, and a non-stationary row fraction above 0.1% fails closed.
+Any non-finite Newton decrement fails immediately regardless of that allowance.
 
 ## Paired holdout contract (Gate 4)
 

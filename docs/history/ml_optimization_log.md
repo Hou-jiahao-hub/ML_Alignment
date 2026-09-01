@@ -2396,11 +2396,14 @@ gauge，固定步长一阶下降无法同时稳定处理各尺度。Iteration 21
 ### 2. 修改
 
 - `scripts/helix_model.py` 新增共享 SMT 点拟合器：固定五参数可观测 gauge、物理曲率缩放、
-  逐轨迹阻尼、只接受目标下降的候选步，并按 2048 行分块形成 Jacobian。
+  逐轨迹阻尼、只接受目标下降且不丢失既有有效点的候选步，并按 2048 行分块形成 Jacobian。
 - `scripts/ml_alignment_autograd.py` 与 `scripts/validate_helix_model.py` 的两份
   `seed_helices` 均改调该共享求解器；非目标/非 holdout mask 和原函数默认返回值不变。
 - joint summary 的 `initialization_stats.smt` 与 helix validation summary 的 `smt_seed`
   记录 solver、迭代、目标下降和相对 Newton decrement，避免以后只看到迭代预算。
+- 驻点按 row 判断；已驻点 row 冻结，拒绝但未驻点的 row 继续提高 damping。非驻点比例超过
+  0.1% 时 joint 与 validation 均 fail closed，不能把另一个预算截断结果交给 measurement refit。
+  任一 non-finite decrement 直接失败，不计入 0.1% 容许量。
 - measurement refit 仍走既有、已验证的 Gauss--Newton 实现；SMT seed 与它统一的是 solver
   策略，不是目标函数。SMT 保持全局点欧氏距离，measurement 保持 half-χ²。
 
@@ -2408,8 +2411,8 @@ gauge，固定步长一阶下降无法同时稳定处理各尺度。Iteration 21
 
 无噪声曲线测试中，旧 Adam 30 步 RMS 为 1.924 mm；新 LM 30 步低于 1e-3 mm。
 带不可约扰动的双轨迹测试中，目标下降超过四个数量级、相对 Newton decrement max
-低于 1e-6；1 行与整批求解在 3e-8 参数绝对误差内一致。相关 helix、joint、validation
-测试共 129 项通过。
+低于 1e-6；1 行与整批求解在 3e-8 参数绝对误差内一致。另有 invalid-point、单步预算
+耗尽、float32 下已驻点/未驻点混合 row 的回归覆盖。
 
 本轮未运行新的 ROOT/ACTS 全量算法实验，因此没有新增实验 manifest，也不宣称下游几何
 或 blind-validation 指标发生改善；全量非驻点归因沿用 Iteration 21 已归档的测量结果。

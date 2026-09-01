@@ -18,9 +18,11 @@ PLANE_PARALLEL_EPS = 1.0e-6
 PLANE_RESIDUAL_TOLERANCE = 1.0e-3
 CLOSEST_POINT_CURVATURE_EPS = 1.0e-9
 GAUSS_NEWTON_MAX_ITERS = 60
-GAUSS_NEWTON_TOLERANCE = 1.0e-10
+GAUSS_NEWTON_TOLERANCE = 1.0e-6
 GAUSS_NEWTON_INITIAL_DAMPING = 1.0e-8
 GAUSS_NEWTON_MIN_DAMPING = 1.0e-12
+GAUSS_NEWTON_ABSOLUTE_DECREMENT_TOLERANCE = 1.0e-12
+POINT_FIT_MAX_NON_STATIONARY_ROW_FRACTION = 1.0e-3
 
 
 def _sinc(value: torch.Tensor) -> torch.Tensor:
@@ -230,6 +232,7 @@ def damped_gauss_newton(
     theta: torch.Tensor,
     residual_of: Callable[[torch.Tensor], torch.Tensor],
     jacobian_of: Callable[[torch.Tensor], torch.Tensor],
+    candidate_ok_of: Callable[[torch.Tensor], torch.Tensor] | None = None,
     max_iters: int = GAUSS_NEWTON_MAX_ITERS,
     damping: float = GAUSS_NEWTON_INITIAL_DAMPING,
     tolerance: float = GAUSS_NEWTON_TOLERANCE,
@@ -248,38 +251,59 @@ def damped_gauss_newton(
         dtype=theta.dtype,
         device=theta.device,
     )
-    converged = False
     iterations = 0
-    change = float("inf")
+    change = 0.0
     for iterations in range(1, max_iters + 1):
         residual = residual_of(theta)
         jacobian = jacobian_of(theta)
         hessian = jacobian.transpose(1, 2) @ jacobian
         gradient = (jacobian.transpose(1, 2) @ residual.unsqueeze(-1)).squeeze(-1)
         scale = hessian.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1.0e-30)
+        stationary_hessian = (
+            hessian + GAUSS_NEWTON_MIN_DAMPING * scale[:, None, None] * identity
+        )
+        decrement = (
+            gradient.unsqueeze(1)
+            @ torch.linalg.solve(stationary_hessian, gradient.unsqueeze(-1))
+        ).flatten()
+        relative_decrement = decrement / current.clamp_min(
+            GAUSS_NEWTON_ABSOLUTE_DECREMENT_TOLERANCE
+        )
+        stationary = torch.isfinite(decrement) & (
+            (decrement <= GAUSS_NEWTON_ABSOLUTE_DECREMENT_TOLERANCE)
+            | (relative_decrement <= tolerance)
+        )
+        if bool(stationary.all()):
+            break
+
         regularized = hessian + level * scale[:, None, None] * identity
         step = torch.linalg.solve(regularized, -gradient.unsqueeze(-1)).squeeze(-1)
         candidate = theta + step
         candidate_objective = 0.5 * residual_of(candidate).square().sum(dim=1)
-        improved = torch.isfinite(candidate_objective) & (
+        candidate_ok = (
+            torch.ones_like(stationary)
+            if candidate_ok_of is None
+            else candidate_ok_of(candidate)
+        )
+        active = ~stationary
+        improved = active & candidate_ok & torch.isfinite(candidate_objective) & (
             candidate_objective < current
         )
         theta = torch.where(improved.unsqueeze(-1), candidate, theta)
-        level = torch.where(
+        next_level = torch.where(
             improved[:, None, None],
             (level * 0.1).clamp_min(GAUSS_NEWTON_MIN_DAMPING),
             level * 10.0,
         )
-        decrease = (current - candidate_objective).clamp_min(
+        level = torch.where(active[:, None, None], next_level, level)
+        proposed_decrease = (current - candidate_objective).clamp_min(
             0.0
         ) / current.abs().clamp_min(1.0)
+        decrease = torch.where(
+            improved, proposed_decrease, torch.zeros_like(proposed_decrease)
+        )
         current = torch.where(improved, candidate_objective, current)
         change = float(decrease.max())
-        # A rejected step has zero decrease too, but is not convergence: its
-        # damping must grow and the row must get another candidate.
-        if bool(improved.all()) and change < tolerance:
-            converged = True
-            break
 
     residual = residual_of(theta)
     jacobian = jacobian_of(theta)
@@ -293,15 +317,26 @@ def damped_gauss_newton(
         gradient.unsqueeze(1)
         @ torch.linalg.solve(stationary_hessian, gradient.unsqueeze(-1))
     ).flatten()
-    relative_decrement = decrement / current.clamp_min(1.0e-30)
+    relative_decrement = decrement / current.clamp_min(
+        GAUSS_NEWTON_ABSOLUTE_DECREMENT_TOLERANCE
+    )
+    finite = torch.isfinite(decrement) & torch.isfinite(relative_decrement)
+    stationary = finite & (
+        (decrement <= GAUSS_NEWTON_ABSOLUTE_DECREMENT_TOLERANCE)
+        | (relative_decrement <= tolerance)
+    )
     return theta, {
-        "converged": bool(converged),
+        "converged": bool(stationary.all()),
         "iterations": int(iterations),
         "initial_objective": initial,
         "final_objective": float(current.mean()),
         "max_relative_decrease": float(change),
         "max_gradient_norm": float(gradient.norm(dim=1).max()),
-        "relative_newton_decrement_max": float(relative_decrement.max()),
+        "relative_newton_decrement_max": float(
+            relative_decrement[finite].max() if finite.any() else float("nan")
+        ),
+        "non_stationary_row_fraction": float((~stationary).double().mean()),
+        "n_non_finite": int((~finite).sum()),
     }
 
 
@@ -319,12 +354,32 @@ def _single_point_fit_residual(
     ).squeeze(0)
     expanded = reference.expand(points.shape[0], -1)
     with torch.no_grad():
-        _fitted, path, _valid = closest_helix_points(expanded.detach(), points)
+        _fitted, path, valid = closest_helix_points(expanded.detach(), points)
     predicted = helix_point(expanded, path)
+    effective = mask & valid
     residual = torch.where(
-        mask.unsqueeze(-1), predicted - points, torch.zeros_like(points)
+        effective.unsqueeze(-1), predicted - points, torch.zeros_like(points)
     )
     return residual.flatten()
+
+
+def _single_point_fit_effective_mask(
+    theta: torch.Tensor,
+    origin: torch.Tensor,
+    axis0: torch.Tensor,
+    axis1: torch.Tensor,
+    points: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    reference = unpack_gauge_fixed_track_parameters(
+        theta.unsqueeze(0),
+        (origin.unsqueeze(0), axis0.unsqueeze(0), axis1.unsqueeze(0)),
+    ).squeeze(0)
+    with torch.no_grad():
+        _fitted, _path, valid = closest_helix_points(
+            reference.expand(points.shape[0], -1), points
+        )
+    return mask & valid
 
 
 _BATCHED_POINT_FIT_JACOBIAN = torch.func.vmap(
@@ -359,10 +414,21 @@ def _fit_helix_points_gauss_newton_block(
     def jacobian_of(values: torch.Tensor) -> torch.Tensor:
         return _BATCHED_POINT_FIT_JACOBIAN(values, *frame, points, mask)
 
+    initial_effective = torch.func.vmap(_single_point_fit_effective_mask)(
+        theta, *frame, points, mask
+    )
+
+    def candidate_ok_of(values: torch.Tensor) -> torch.Tensor:
+        candidate_effective = torch.func.vmap(_single_point_fit_effective_mask)(
+            values, *frame, points, mask
+        )
+        return ((~initial_effective) | candidate_effective).all(dim=1)
+
     fitted_theta, stats = damped_gauss_newton(
         theta,
         residual_of,
         jacobian_of,
+        candidate_ok_of=candidate_ok_of,
         max_iters=max_iters,
         damping=damping,
         tolerance=tolerance,
@@ -432,9 +498,36 @@ def fit_helix_points_gauss_newton(
         "relative_newton_decrement_max": max(
             float(stats["relative_newton_decrement_max"]) for stats in stats_blocks
         ),
+        "non_stationary_row_fraction": sum(
+            float(stats["non_stationary_row_fraction"]) * weight
+            for stats, weight in zip(stats_blocks, weights)
+        ) / total,
+        "n_non_finite": sum(int(stats["n_non_finite"]) for stats in stats_blocks),
         "n_chunks": len(stats_blocks),
     }
     return torch.cat(fitted_blocks, dim=0), diagnostics
+
+
+def require_stationary_helix_point_fit(
+    diagnostics: dict,
+    max_non_stationary_row_fraction: float = (
+        POINT_FIT_MAX_NON_STATIONARY_ROW_FRACTION
+    ),
+) -> None:
+    """Fail closed when a point seed solver returns budget-truncated rows."""
+    n_non_finite = int(diagnostics["n_non_finite"])
+    if n_non_finite:
+        raise ValueError(
+            "SMT helix seed has non-finite Newton decrements: "
+            f"{n_non_finite} rows."
+        )
+    fraction = float(diagnostics["non_stationary_row_fraction"])
+    if fraction > max_non_stationary_row_fraction:
+        raise ValueError(
+            "SMT helix seed is non-stationary: "
+            f"{fraction:.4%} of rows exceed the Newton-decrement criterion "
+            f"(allowed {max_non_stationary_row_fraction:.4%})."
+        )
 
 
 # ---------------------------------------------------------------------------

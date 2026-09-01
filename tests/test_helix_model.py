@@ -102,6 +102,85 @@ def test_point_seed_gauss_newton_reaches_the_noiseless_helix_stationary_point():
     )
 
 
+def test_point_seed_ignores_closest_point_invalid_inputs():
+    """An out-of-range closest path is not an SMT residual and cannot bias the fit."""
+    model = importlib.import_module("scripts.helix_model")
+    path = torch.linspace(0.0, 90.0, 10, dtype=torch.float64)
+    points = torch.stack((path, torch.zeros_like(path), torch.zeros_like(path)), dim=1)
+    points = torch.cat(
+        (points, torch.tensor([[2000.0, 100.0, 0.0]], dtype=torch.float64)), dim=0
+    ).unsqueeze(0)
+    initial = torch.zeros((1, 6), dtype=torch.float64)
+    mask = torch.ones((1, len(points[0])), dtype=torch.bool)
+
+    fitted, diagnostics = model.fit_helix_points_gauss_newton(
+        initial, points, mask, max_iters=10
+    )
+
+    torch.testing.assert_close(fitted, initial, rtol=0.0, atol=0.0)
+    assert diagnostics["converged"] is True
+    assert diagnostics["non_stationary_row_fraction"] == 0.0
+
+
+def test_point_seed_reports_budget_exhaustion_per_row():
+    model = importlib.import_module("scripts.helix_model")
+    truth = torch.tensor([[2.0, -1.0, 0.5, 0.4, 0.2, 2.0e-3]], dtype=torch.float64)
+    path = torch.linspace(-30.0, 80.0, 12, dtype=torch.float64)
+    points = model.helix_point(truth[:, None, :].expand(-1, len(path), -1), path[None])
+    initial = truth + torch.tensor(
+        [[0.8, -0.5, 0.3, 0.08, -0.05, 4.0e-4]], dtype=torch.float64
+    )
+
+    _fitted, diagnostics = model.fit_helix_points_gauss_newton(
+        initial, points, torch.ones(points.shape[:2], dtype=torch.bool), max_iters=1
+    )
+
+    assert diagnostics["converged"] is False
+    assert diagnostics["non_stationary_row_fraction"] == 1.0
+    assert diagnostics["relative_newton_decrement_max"] > 1.0e-6
+    with pytest.raises(ValueError, match="non-stationary"):
+        model.require_stationary_helix_point_fit(diagnostics)
+    non_finite = {
+        **diagnostics,
+        "n_non_finite": 1,
+        "non_stationary_row_fraction": 1.0 / 2048.0,
+    }
+    with pytest.raises(ValueError, match="non-finite"):
+        model.require_stationary_helix_point_fit(non_finite)
+
+
+def test_point_seed_converges_mixed_exact_and_non_exact_rows_in_float32():
+    """Already-stationary rows must not block other rows in a shared GPU-like chunk."""
+    model = importlib.import_module("scripts.helix_model")
+    dtype = torch.float32
+    path = torch.linspace(-30.0, 80.0, 12, dtype=dtype)
+    truth = torch.tensor(
+        [[0.0, 0.0, 0.0, 0.0, 0.1, 0.0], [2.0, -1.0, 0.5, 0.4, 0.2, 2e-3]],
+        dtype=dtype,
+    )
+    points = model.helix_point(
+        truth[:, None, :].expand(-1, len(path), -1), path.expand(2, -1)
+    )
+    points[1, :, 2] += 0.01 * torch.sin(path / 7.0)
+    initial = truth.clone()
+    initial[1] += torch.tensor(
+        [0.8, -0.5, 0.3, 0.08, -0.05, 4e-4], dtype=dtype
+    )
+
+    fitted, diagnostics = model.fit_helix_points_gauss_newton(
+        initial,
+        points,
+        torch.ones(points.shape[:2], dtype=torch.bool),
+        max_iters=30,
+        chunk_rows=0,
+    )
+
+    torch.testing.assert_close(fitted[0], truth[0], rtol=0.0, atol=0.0)
+    assert diagnostics["converged"] is True
+    assert diagnostics["iterations"] < 30
+    assert diagnostics["non_stationary_row_fraction"] == 0.0
+
+
 def test_both_consumers_reexport_the_shared_math_implementation():
     shared = importlib.import_module("scripts.helix_model")
     alignment = importlib.import_module("scripts.ml_alignment_autograd")

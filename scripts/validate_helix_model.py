@@ -57,6 +57,7 @@ try:
         highland_kink_sigma,
         intersect_plane,
         node_arc_lengths,
+        require_stationary_helix_point_fit,
         split_track_parameters,
     )
 except ImportError:  # Direct script execution.
@@ -73,6 +74,7 @@ except ImportError:  # Direct script execution.
         highland_kink_sigma,
         intersect_plane,
         node_arc_lengths,
+        require_stationary_helix_point_fit,
         split_track_parameters,
     )
 
@@ -1718,6 +1720,7 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
         dtype=dtype,
         return_diagnostics=True,
     )
+    require_stationary_helix_point_fit(seed_diagnostics)
     if config.fit_solver == "gauss-newton":
         fitted_parameters, fit_diagnostics = fit_helices_gauss_newton(
             batches,

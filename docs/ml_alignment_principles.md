@@ -807,6 +807,8 @@ joint 直接在输入的错位几何上求解，输入几何只在 calibration �
 策略，但分别保持 SMT 欧氏距离与 measurement half-χ² 的目标定义。随后固定轨迹，
 只由目标层 measurement 联合求解两个目标层的
 `(tx,ty,rz)`；目标层 measurement 不再反向更新轨迹。
+SMT seed 与 measurement refit 都按逐轨迹 Newton decrement 检查驻点；任一路径的
+非驻点比例超过 0.1% 都必须停止，预算耗尽不能当作收敛。
 
 公共数学位于 `helix_model.py`。两个调用脚本共享参数顺序
 `(x0,y0,z0,psi0,tan_lambda,rho)`、`rho/1e-4` 优化缩放、Newton 最近点/平面求交、
