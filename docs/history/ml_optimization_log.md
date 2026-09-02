@@ -2553,4 +2553,7 @@ block-LM：`best_iteration=13`，`stopped_early=true`，total loss 915.744 -> 2.
 
 **已知记录缺口**：`manifest.json` 记 `git_commit=28b04edfa`，但运行时工作树含未提交
 改动（本条的编排器默认值、`--no-event-split` 支持、本日志），manifest schema 无 dirty
-标记。该 commit 不足以复现本次运行；复现需同时取本条记录的改动。
+标记。该 commit 不足以复现本次运行；复现需在 `28b04edfa` 之上叠加 `c52f8de`
+（`feat: run the mainline on every event and unblock the truncated helix seed`），
+即本条 §5 所列的编排器与 summary 改动。**未回改 `manifest.json`** —— 事后修改运行
+记录等于伪造，缺口以本条说明的方式记录。
