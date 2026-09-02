@@ -34,11 +34,12 @@ TARGET_LAYERS="$EXPECTED_TARGET_LAYERS"
 ACTIVE_DOF="$ACTIVE_DOF_SPEC"
 SURFACE_EPOCHS=200
 JOINT_ITERS=1000
-JOINT_SMT_SEED_ITERS=200
+JOINT_SMT_SEED_ITERS=2000
 JOINT_MEASUREMENT_REFIT_ITERS=200
 LM_MAX_ITERS=60
 MAX_TRACKS=0
 SKIP_BLIND_VALIDATION=0
+NO_EVENT_SPLIT=0
 LAMBDA_L2=1e-5
 ALIGNMENT_DIR="$ALIGNMENT_ROOT"
 SIMULATION_DIR="$SIMULATION_ROOT"
@@ -67,7 +68,11 @@ Options:
   --events N                 ACTS reconstruction events (default: 100000)
   --surface-epochs N         Epochs in each guarded polish surface solve
   --joint-iters N            Joint free-helix iterations (default: 1000)
-  --joint-smt-seed-iters N   Non-target SMT seed iterations (default: 200)
+  --joint-smt-seed-iters N   Non-target SMT seed iterations (default: 2000).
+                             A cap, not a cost: the damped Gauss-Newton seed
+                             converges at ~367 iterations and breaks out, so
+                             200 only truncated it below the 0.1% stationarity
+                             gate.  See ml_optimization_log.md Iteration 26.
   --joint-measurement-refit-iters N
                               Non-target measurement refit iterations (default: 200)
   --lm-max-iters N            Block-LM geometry iterations (default: 60)
@@ -88,6 +93,13 @@ Options:
   --helix-candidates SPEC    Deprecated; ignored
   --skip-blind-validation    Stop after calibration; leave the one-shot blind
                              validation split untouched
+  --no-event-split           Fit and score on every event instead of the hash
+                             80/10/10 partitions.  Requires
+                             --skip-blind-validation: with no split the
+                             validation acceptance would re-score the very
+                             events that selected the geometry.  Acceptance
+                             thresholds stay hash-calibrated on nominal states,
+                             which no stage of this run fits.
   --dry-run                  Print both conditional polish candidates
 EOF
 }
@@ -121,6 +133,7 @@ while [[ $# -gt 0 ]]; do
         --conda-env) CONDA_ENV="$2"; shift 2 ;;
         --event-split-seed) EVENT_SPLIT_SEED="$2"; shift 2 ;;
         --skip-blind-validation) SKIP_BLIND_VALIDATION=1; shift ;;
+        --no-event-split) NO_EVENT_SPLIT=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1" ;;
@@ -140,6 +153,9 @@ done
 [[ "$TARGET_LAYERS_SPEC" == "$EXPECTED_TARGET_LAYERS" ]] || \
     die "configured target layers must remain $EXPECTED_TARGET_LAYERS"
 [[ "$ACTIVE_DOF" == "0,1,5" ]] || die "this workflow requires active DOF 0,1,5"
+if [[ "$NO_EVENT_SPLIT" -eq 1 && "$SKIP_BLIND_VALIDATION" -eq 0 ]]; then
+    die "--no-event-split requires --skip-blind-validation: without a split the validation acceptance re-scores the events that selected the geometry"
+fi
 
 [[ -z "$NOMINAL_STATES" ]] || echo "note: --nominal-states supplies only the frozen acceptance baseline" >&2
 [[ -z "$BASELINE_RATIO" ]] || echo "deprecated: --baseline-ratio no longer controls the workflow" >&2
@@ -178,6 +194,11 @@ RUN_DIR="$(with_target_dir "$LOG_DIR")/$RUN_TAG"
 [[ -n "$NOMINAL_STATES" ]] || NOMINAL_STATES="$(with_target_dir "$RECONSTRUCTION_DIR/nominal")/trackstates_kf_${TARGET_LAYER_SUFFIX}.root"
 
 print_command() { printf '  '; printf '%q ' "$@"; printf '\n'; }
+
+# Empty under --no-event-split: both solvers then see every event, because
+# ml_alignment_autograd.py only filters when --event-partition is supplied.
+SOLVER_PARTITION_ARGS=(--event-partition train --event-split-seed "$EVENT_SPLIT_SEED")
+[[ "$NO_EVENT_SPLIT" -eq 0 ]] || SOLVER_PARTITION_ARGS=()
 
 run_conda() {
     local log_file="$1"; shift
@@ -302,18 +323,20 @@ reconstruct() {
 
 run_acceptance() {
     local label="$1" states="$2" output="$3" partition="$4"
+    local partition_args=(--event-partition "$partition" --split-seed "$EVENT_SPLIT_SEED")
+    [[ "$NO_EVENT_SPLIT" -eq 0 ]] || partition_args=()
     if [[ "$DRY_RUN" -eq 1 ]]; then
         run_conda "$RUN_DIR/acceptance_${label}.log" \
             python reconstruction_acceptance.py "${CONFIG_ARGS[@]}" --states "$states" --output "$output" \
             --target-layers "$TARGET_LAYERS" --threshold-profile "$BASELINE_PROFILE" \
-            --event-partition "$partition" --split-seed "$EVENT_SPLIT_SEED"
+            "${partition_args[@]}"
         return 0
     fi
     set +e
     run_conda "$RUN_DIR/acceptance_${label}.log" \
         python reconstruction_acceptance.py "${CONFIG_ARGS[@]}" --states "$states" --output "$output" \
         --target-layers "$TARGET_LAYERS" --threshold-profile "$BASELINE_PROFILE" \
-        --event-partition "$partition" --split-seed "$EVENT_SPLIT_SEED"
+        "${partition_args[@]}"
     local status="$?"
     set -e
     require_file "$output"
@@ -348,7 +371,7 @@ run_conda "$RUN_DIR/${joint_label}.log" \
     --joint-seed-min-span 300 --joint-smt-seed-iters "$JOINT_SMT_SEED_ITERS" \
     --joint-measurement-refit-iters "$JOINT_MEASUREMENT_REFIT_ITERS" \
     --joint-solver block-lm --lm-max-iters "$LM_MAX_ITERS" \
-    --event-partition train --event-split-seed "$EVENT_SPLIT_SEED" \
+    "${SOLVER_PARTITION_ARGS[@]}" \
     --joint-iters "$JOINT_ITERS" --max-tracks "$MAX_TRACKS" \
     --lambda-l2 "$LAMBDA_L2" --nominal-full-geom "$GEOMETRY_ROOT/odd_transforms.json" \
     --output-summary "$joint_solver_summary" --no-plot
@@ -397,7 +420,7 @@ for polish_round in 1 2; do
         --input-geom "$current_geom" --states "$current_states" --summary "$current_summary" \
         --output-geom "$candidate_geom" --target-layers "$failed_layers" \
         --active-dof "$ACTIVE_DOF" --alignment-gain 0.2 --epochs "$SURFACE_EPOCHS" \
-        --event-partition train --event-split-seed "$EVENT_SPLIT_SEED" \
+        "${SOLVER_PARTITION_ARGS[@]}" \
         --lambda-l2 "$LAMBDA_L2" --iter "polish${polish_round}" --no-plot
     reconstruct "$label" "$candidate_geom"
     candidate_states="$(states_path "$label")"
@@ -470,6 +493,9 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
         --event-split-seed "$EVENT_SPLIT_SEED"
         --output "$RUN_DIR/experiment_summary.json"
     )
+    if [[ "$NO_EVENT_SPLIT" -eq 1 ]]; then
+        summary_args+=(--no-event-split)
+    fi
     if [[ "$SKIP_BLIND_VALIDATION" -eq 1 ]]; then
         summary_args+=(--skip-blind-validation)
     else

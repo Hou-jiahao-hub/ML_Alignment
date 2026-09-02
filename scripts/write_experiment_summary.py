@@ -10,6 +10,7 @@ SCHEMA_VERSION = 2
 
 WORKFLOW_FULL = "block-lm_surface-polish2_blind-validation"
 WORKFLOW_CALIBRATION_ONLY = "block-lm_surface-polish2_calibration-only"
+WORKFLOW_FULL_EVENTS = "block-lm_surface-polish2_full-events"
 
 TARGET_LAYERS = ["17:8", "24:4"]
 ACTIVE_DOF = [0, 1, 5]
@@ -40,7 +41,12 @@ def build_summary(
     selection_stop_reason: str,
     event_split_seed: int,
     blind_validation_skipped: bool,
+    event_split_used: bool = True,
 ) -> dict[str, Any]:
+    if not event_split_used and not blind_validation_skipped:
+        raise ValueError(
+            "a run without an event split has no held-out partition to validate on"
+        )
     solver_effective = joint_solver_effective(joint)
     # The Iteration 12 pass condition reads "joint has a non-zero effective
     # update".  A joint stage the guard reverted contributes nothing to the
@@ -49,8 +55,14 @@ def build_summary(
 
     if blind_validation_skipped:
         passed: bool | None = None
-        stop_reason = "stopped_before_blind_validation"
-        workflow = WORKFLOW_CALIBRATION_ONLY
+        if event_split_used:
+            stop_reason = "stopped_before_blind_validation"
+            workflow = WORKFLOW_CALIBRATION_ONLY
+        else:
+            # Naming this "calibration-only" would imply a held-out remainder
+            # that a full-event run does not have.
+            stop_reason = "no_event_split_no_blind_validation"
+            workflow = WORKFLOW_FULL_EVENTS
         acceptance: Mapping[str, Any] | None = None
     else:
         if final_acceptance is None:
@@ -66,12 +78,17 @@ def build_summary(
         "workflow": workflow,
         "target_layers": list(TARGET_LAYERS),
         "active_dof": list(ACTIVE_DOF),
-        "event_split": {
-            "seed": event_split_seed,
-            "train": 80,
-            "calibration": 10,
-            "validation": 10,
-        },
+        "event_split": (
+            {
+                "mode": "hash_80_10_10",
+                "seed": event_split_seed,
+                "train": 80,
+                "calibration": 10,
+                "validation": 10,
+            }
+            if event_split_used
+            else {"mode": "none", "seed": None}
+        ),
         "acceptance_baseline": acceptance_baseline,
         "final_geometry": final_geometry,
         "final_trackstates": final_trackstates,
@@ -110,6 +127,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selection-stop-reason", required=True)
     parser.add_argument("--event-split-seed", type=int, required=True)
     parser.add_argument("--skip-blind-validation", action="store_true")
+    parser.add_argument("--no-event-split", action="store_true")
     parser.add_argument("--output", required=True)
     return parser
 
@@ -138,6 +156,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         selection_stop_reason=args.selection_stop_reason,
         event_split_seed=args.event_split_seed,
         blind_validation_skipped=args.skip_blind_validation,
+        event_split_used=not args.no_event_split,
     )
     Path(args.output).write_text(json.dumps(summary, indent=2))
     return 0

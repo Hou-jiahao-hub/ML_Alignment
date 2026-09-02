@@ -56,6 +56,9 @@ grep -Fq -- "--active-dof 0\,1\,5" "$output"
 grep -Fq -- "--joint-seed-mode non-target-measurement" "$output"
 grep -Fq -- "--joint-solver block-lm" "$output"
 grep -Fq -- "--lm-max-iters 60" "$output"
+# 200 truncated the damped Gauss-Newton seed below the 0.1% stationarity gate
+# on real data; it converges at ~367 and breaks out (Iteration 26).
+grep -Fq -- "--joint-smt-seed-iters 2000" "$output"
 grep -Fq -- "--alignment-gain 0.2" "$output"
 grep -Fq -- 'EXPECTED_TARGET_LAYERS="17:8,24:4"' "$SCRIPT"
 grep -Fq -- '[[ "$TARGET_LAYERS_SPEC" == "$EXPECTED_TARGET_LAYERS" ]]' "$SCRIPT"
@@ -105,3 +108,41 @@ grep -Fq -- "the validation split stays untouched" "$skip_output"
 # every calibration-side acceptance still runs
 [[ "$(grep -Fc -- "--event-partition calibration" "$skip_output")" -eq 4 ]]
 [[ "$(grep -Fc -- "python reconstruction_acceptance.py" "$skip_output")" -eq 4 ]]
+
+# --no-event-split fits and scores every event; no stage may filter by hash.
+full_output="$(mktemp)"
+trap 'rm -f "$output" "$skip_output" "$full_output"' EXIT
+
+bash "$SCRIPT" \
+    --run-tag tdd_full \
+    --dry-run \
+    --no-event-split \
+    --skip-blind-validation \
+    --input-geom inputs/current.json \
+    --states inputs/states.root \
+    --summary inputs/summary.root \
+    --nominal-states inputs/nominal.root \
+    > "$full_output" 2>&1
+
+[[ "$(grep -Fc -- "--event-partition" "$full_output")" -eq 0 ]]
+[[ "$(grep -Fc -- "--event-split-seed" "$full_output")" -eq 0 ]]
+[[ "$(grep -Fc -- "python reconstruction_acceptance.py" "$full_output")" -eq 4 ]]
+[[ "$(grep -Fc -- "--threshold-profile" "$full_output")" -eq 4 ]]
+# thresholds stay hash-calibrated, but only on nominal states that no stage fits
+[[ "$(grep -Fc -- "python calibrate_acceptance.py" "$full_output")" -eq 1 ]]
+[[ "$(grep -Fc -- "--split-seed" "$full_output")" -eq 1 ]]
+
+# Without a split there is no held-out remainder, so a blind validation would
+# re-score the events that selected the geometry.  Refuse it outright.
+if bash "$SCRIPT" \
+    --run-tag tdd_full_bad \
+    --dry-run \
+    --no-event-split \
+    --input-geom inputs/current.json \
+    --states inputs/states.root \
+    --summary inputs/summary.root \
+    --nominal-states inputs/nominal.root \
+    > /dev/null 2>&1; then
+    echo "driver accepted --no-event-split without --skip-blind-validation" >&2
+    exit 1
+fi

@@ -89,3 +89,27 @@ def test_a_full_run_keeps_the_blind_validation_workflow_name():
 def test_final_acceptance_is_required_unless_validation_is_skipped():
     with pytest.raises(ValueError):
         _summary(final_acceptance=None)
+
+
+def test_a_full_event_run_does_not_claim_a_hash_split():
+    """The summary must not report partitions the run never used."""
+    summary = _summary(
+        event_split_used=False,
+        blind_validation_skipped=True,
+        final_acceptance=None,
+    )
+    assert summary["event_split"] == {"mode": "none", "seed": None}
+    assert summary["workflow"] == "block-lm_surface-polish2_full-events"
+    assert summary["stop_reason"] == "no_event_split_no_blind_validation"
+    assert summary["passed"] is None
+
+
+def test_a_split_run_still_labels_its_partitions():
+    summary = _summary()
+    assert summary["event_split"]["mode"] == "hash_80_10_10"
+    assert summary["event_split"]["seed"] == 6006
+
+
+def test_a_full_event_run_cannot_report_a_blind_validation():
+    with pytest.raises(ValueError):
+        _summary(event_split_used=False, blind_validation_skipped=False)

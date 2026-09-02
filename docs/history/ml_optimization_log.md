@@ -2416,3 +2416,141 @@ gauge，固定步长一阶下降无法同时稳定处理各尺度。Iteration 21
 
 本轮未运行新的 ROOT/ACTS 全量算法实验，因此没有新增实验 manifest，也不宣称下游几何
 或 blind-validation 指标发生改善；全量非驻点归因沿用 Iteration 21 已归档的测量结果。
+
+## Iteration 26 — SMT seed 迭代预算 200 → 2000（预注册）
+
+**日期**：2026-09-02
+**性质**：预算修正；不改目标函数、mask、点集，**不改任何预注册阈值**。
+**状态**：预注册，运行前写入。结果回填于本条 §5。
+
+### 1. 触发事件
+
+`trial-009-fullevents`（全量事件、`--no-event-split`）在 joint_free 阶段失败：
+
+```
+ValueError: SMT helix seed is non-stationary:
+  4.6355% of rows exceed the Newton-decrement criterion (allowed 0.1000%)
+```
+
+这是 Iteration 25 加入的 `require_stationary_helix_point_fit` **第一次在真实数据上执行**。
+`2af0d4f` 提交于 2026-09-01 17:23，而此前所有运行的 `git_commit`（trial-008 为
+`8194ff0`，9-01 的三次 joint-only 为 `f8cd8cc`）均早于它。Iteration 25 §3 亦自述
+「本轮未运行新的 ROOT/ACTS 全量算法实验」。
+
+### 2. 归因（探针，不触发门控、不跑下游）
+
+**2.1 与「全量事件」无关。** 同一次 ROOT 加载，分别在全量与 train 分区上跑 seed：
+
+| 分区 | 轨迹数 | `non_stationary_row_fraction` | 门控 |
+|---|---:|---:|---|
+| 全量 | 61482 | 4.6355% | FAIL |
+| train | 49222 | **4.6524%** | FAIL |
+
+train 比全量还高。取消哈希分段不是原因；它只是让一个从未执行过的门控开始执行。
+
+**2.2 是预算截断，不是发散。** 两组均报 `converged=false, iterations=200`（撞满
+`--joint-smt-seed-iters 200`），`n_non_finite=0`，最差行相对 Newton decrement 仅
+7.4e-3 / 5.2e-3。与门控 docstring 的 "budget-truncated rows" 一致。
+
+**2.3 seed 求解器换代的收益已经兑现。** train 分区 `seed_n_points = 568283` 与
+trial-008 逐位相同，可直接比较：smt loss **1.6488 → 0.0028561 mm²**（577×）。
+门控拒绝的是一个远好于 trial-008 的 seed。
+
+**2.4 预算扫描（10000 轨迹子样本，同一批轨迹，只变 `max_iters`）**：
+
+| `max_iters` | 实际用 | 非驻点比例 | 门控 | `decrement_max` | `final_objective` |
+|---:|---:|---:|---|---:|---:|
+| 200 | 200 | 4.8500% | FAIL | 2.634e-03 | 0.0157037 |
+| 600 | **367** | **0.0000%** | PASS | 2.064e-05 | 0.0157036 |
+| 2000 | 367 | 0.0000% | PASS | 2.064e-05 | 0.0157036 |
+| 6000 | 367 | 0.0000% | PASS | 2.064e-05 | 0.0157036 |
+
+求解器在第 367 步自然收敛；600/2000/6000 逐位相同。目标函数无回升。
+
+### 3. 为何这不违反 Iteration 25 的禁令
+
+Iteration 25 §1 的原话是「相同 `lr=0.5` 再继续会发散；因此增加 `JOINT_SMT_SEED_ITERS`
+不是可靠修法」。**该判断的主语是 Adam。** `f85aaf0` 已把 `seed_helices` 换成阻尼
+Gauss--Newton/LM，无学习率、逐行 damping、只接受下降候选。§2.4 在四个预算上实测
+无发散。禁令自身写明的例外「要动就换求解器」已由 `f85aaf0` 满足。
+
+**本条不放宽 `POINT_FIT_MAX_NON_STATIONARY_ROW_FRACTION = 1e-3`。** 阈值不动，
+改的是让求解器有机会达到它的预算。
+
+### 4. 预注册判据（运行前固定）
+
+**主判据（通过/失败）**：全量 61482 轨迹的 seed 报 `non_stationary_row_fraction`
+≤ 1e-3 且 `n_non_finite = 0`，joint_free 阶段不再因驻点门控中止。
+
+**次判据（不得劣化）**：seed loss 相对 200 步基线（train 0.00285611、全量
+0.00282184 mm²）上升不得超过 1%。若上升，判定为发散，回滚本改动。
+
+**证伪条件**：若全量运行报 `iterations ≥ 2000`，说明存在真正不收敛的行，
+**须停下重新归因，不得再调大预算**。
+
+**明确不主张的事**：
+- seed loss 若有改善，**不作为算法改善的证据**。§2.4 显示 200→367 步只让目标函数
+  动了 6.4e-6 相对量。
+- 本次运行的 acceptance 与 truth_metrics **与 trial-007/008 不可比较**：样本集不同
+  （全量 vs train 分区），且验收未分段、阈值仍按 validation 规模标定因而偏松。
+  本次运行的唯一目的是让全量流水线跑通并产出 smt_seed / measurement_refit / joint
+  三阶段的 chi2 记录。
+
+### 5. 修改与结果
+
+- `scripts/run_surface_helix_experiment.sh`：`JOINT_SMT_SEED_ITERS` 默认 200 → 2000。
+- **有意未改** `ml_alignment_autograd.py:83` 的 `JOINT_SMT_SEED_ITERS = 200`：该常量
+  同时被 `validate_helix_model.py` 消费，那条路径有自己的预注册数字，改它需要独立论证。
+  本条只修生产编排器的配方。
+- 结果：`trial-010-fullevents`，2026-09-02 13:04--15:47，`status=completed`。
+
+**预注册判据逐条核对**：
+
+| 判据 | 门槛 | 实测 | 结论 |
+|---|---|---|---|
+| 主判据 | `non_stationary_row_fraction ≤ 1e-3` | **0.0** | 通过 |
+| 主判据 | `n_non_finite = 0` | 0 | 通过 |
+| 主判据 | joint_free 不因驻点门控中止 | 未中止，全流程走完 | 通过 |
+| 次判据 | seed loss 相对 0.00282184 上升 ≤ 1% | **0.00282182**（-8e-6 相对） | 通过 |
+| 证伪条件 | `iterations ≥ 2000` 须停下重新归因 | **390** | 未触发 |
+
+seed 在全量 61482 轨迹上用 390 步收敛（10000 轨迹子样本为 367 步），`converged=true`，
+`relative_newton_decrement_max = 2.06e-05`。600 的预算本可通过但裕度仅 1.5×，2000 为
+封顶值且实测不增加耗时。
+
+**三阶段 chi2 / 有效计数**（`stage_layer_chi2`；被拟合量与目标层诊断量分母不同）：
+
+| 阶段 | 范围 | 层:分量 | chi2/component | 有效计数 |
+|---|---|---|---:|---:|
+| smt_seed | 被拟合（非目标 SMT 点） | — | 0.00282182 mm² | 709672 |
+| measurement_refit | 被拟合（非目标 measurement） | — | **0.7635026** | 1154761 |
+| smt_seed | 诊断（目标层） | 17:8 LOC0 | 1233.729 | 71345 |
+| smt_seed | 诊断（目标层） | 17:8 LOC1 | 322.850 | 71345 |
+| smt_seed | 诊断（目标层） | 24:4 LOC0 | 324.465 | 71842 |
+| smt_seed | 诊断（目标层） | 24:4 LOC1 | 1.858 | 71842 |
+| measurement_refit | 诊断（目标层） | 17:8 LOC0 | 2041.547 | 71345 |
+| measurement_refit | 诊断（目标层） | 17:8 LOC1 | 1263.078 | 71345 |
+| measurement_refit | 诊断（目标层） | 24:4 LOC0 | 367.324 | 71842 |
+| measurement_refit | 诊断（目标层） | 24:4 LOC1 | 1.219 | 71842 |
+| joint | 诊断（目标层） | 17:8 LOC0 | **2.032** | 71345 |
+| joint | 诊断（目标层） | 17:8 LOC1 | **4.631** | 71345 |
+| joint | 诊断（目标层） | 24:4 LOC0 | **1.246** | 71842 |
+| joint | 诊断（目标层） | 24:4 LOC1 | **0.958** | 71842 |
+
+refit GN：`converged=true`，5 步，objective 299.223 -> 7.17009，驻点行占比
+100.00% -> 0.00%，decrement p90 1.16e+03 -> 5.67e-14。
+block-LM：`best_iteration=13`，`stopped_early=true`，total loss 915.744 -> 2.2126，
+`correction_max_abs=1.3079`（未撞 `JOINT_CLAMP_T=1.5`）。
+`joint_adopted=true`，`polish_attempts=0`，`selection_stop_reason=joint_acceptance_passed`。
+
+**§4 的「不主张」条款依然有效**：本次 acceptance（四分量 normalized 0.6675 / 0.8307
+/ 0.8237 / 0.9410，全部 pass）**不得与 trial-007/008 比较** —— 样本集不同（全量
+61482 vs train 分区 49222），验收未分段（n≈71600 vs trial-008 validation 的 7096），
+且阈值仍按 validation 规模标定因而相对偏松。truth_metrics 同理，仅作 `diagnostic_only`。
+中间阶段的目标层诊断 chi2 与 trial-008 亦不可比：seed 求解器已由 Adam 换成 GN，
+两者落点不同；唯一同口径可比的是 refit 自身目标函数 0.763503 vs trial-008 的
+0.763146。
+
+**已知记录缺口**：`manifest.json` 记 `git_commit=28b04edfa`，但运行时工作树含未提交
+改动（本条的编排器默认值、`--no-event-split` 支持、本日志），manifest schema 无 dirty
+标记。该 commit 不足以复现本次运行；复现需同时取本条记录的改动。
