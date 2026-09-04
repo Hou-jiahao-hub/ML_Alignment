@@ -4,6 +4,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -230,3 +231,186 @@ def test_misaligned_refit_uses_its_own_sensor_lookup_then_evaluates_nominal_surf
 
     arm = report.arms[("misaligned", "protected")]
     assert arm.gauss_newton.intersection_valid.all()
+
+
+def _four_arm_statistics_fixture(
+    module,
+    *,
+    n_rows=201,
+    invalidate_seed_row=False,
+    modes=("interpolation", "forward_extrapolation", "backward_extrapolation"),
+):
+    """Hand-checked paired predictions: Q=.25, practical ratio=1.05, bias=.05."""
+    n_rows *= len(modes)
+    identities = tuple(
+        module.HitIdentity(row // 3, row, 17, 8, row + 1, 0)
+        for row in range(n_rows)
+    )
+    inputs = module.RecoveryHitInputs(
+        identities=identities,
+        measured_local=torch.zeros((n_rows, 2), dtype=torch.float64),
+        measurement_variance=torch.ones((n_rows, 2), dtype=torch.float64),
+        component_mask=torch.ones((n_rows, 2), dtype=torch.bool),
+        smt_local=torch.zeros((n_rows, 2), dtype=torch.float64),
+        global_positions=torch.zeros((n_rows, 3), dtype=torch.float64),
+        directions=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float64).expand(n_rows, -1).clone(),
+        sensor_idx=torch.arange(n_rows),
+        target_mask=torch.ones(n_rows, dtype=torch.bool),
+        path_length=torch.arange(n_rows, dtype=torch.float64),
+    )
+    cohort = module.PairedRecoveryCohort(
+        nominal=inputs,
+        misaligned=inputs,
+        row_indices=torch.arange(n_rows, dtype=torch.long).reshape(n_rows, 1),
+        hit_mask=torch.ones((n_rows, 1), dtype=torch.bool),
+        probe_mask=torch.ones((n_rows, 1), dtype=torch.bool),
+        protected_fit_mask=torch.zeros((n_rows, 1), dtype=torch.bool),
+        exposed_fit_mask=torch.ones((n_rows, 1), dtype=torch.bool),
+        non_target_span_mm=torch.full((n_rows,), 300.0, dtype=torch.float64),
+        probe_mode=tuple(mode for mode in modes for _ in range(n_rows // len(modes))),
+    )
+
+    def stage(value, *, valid=True, rho=0.0, angle=0.0, diagnostics=None):
+        local = torch.full((n_rows, 1, 2), value, dtype=torch.float64)
+        intersection = torch.full((n_rows, 1), valid, dtype=torch.bool)
+        return module.FittedStage(
+            parameters=torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, rho], dtype=torch.float64).repeat(n_rows, 1),
+            evaluation=module.HelixEvaluation(
+                path_length=torch.zeros((n_rows, 1), dtype=torch.float64),
+                global_position=torch.zeros((n_rows, 1, 3), dtype=torch.float64),
+                local_position=local,
+                global_difference=torch.zeros((n_rows, 1, 3), dtype=torch.float64),
+                local_difference=torch.zeros((n_rows, 1, 2), dtype=torch.float64),
+                tangent_angle=torch.full((n_rows, 1), angle, dtype=torch.float64),
+                intersection_valid=intersection,
+            ),
+            diagnostics=diagnostics
+            or {
+                "non_stationary_row_fraction": 0.0,
+                "n_non_finite": 0,
+                "stationarity": {
+                    "non_stationary_row_fraction": 0.0,
+                    "n_non_finite": 0,
+                },
+            },
+        )
+
+    nominal_seed = stage(1.0)
+    if invalidate_seed_row:
+        invalid = nominal_seed.evaluation.intersection_valid.clone()
+        invalid[0, 0] = False
+        nominal_seed = module.replace(
+            nominal_seed,
+            evaluation=module.replace(nominal_seed.evaluation, intersection_valid=invalid),
+        )
+    arms = {}
+    for exposure in ("protected", "exposed"):
+        arms[("nominal", exposure)] = module.RecoveryArm(
+            fit_mask=cohort.protected_fit_mask,
+            acts_smt=module.ACTSSMTStage(inputs.smt_local[:, None], inputs.component_mask[:, None], cohort.hit_mask),
+            lm_seed=nominal_seed,
+            gauss_newton=stage(1.0, rho=0.001, angle=0.01),
+        )
+        arms[("misaligned", exposure)] = module.RecoveryArm(
+            fit_mask=cohort.protected_fit_mask,
+            acts_smt=module.ACTSSMTStage(inputs.smt_local[:, None], inputs.component_mask[:, None], cohort.hit_mask),
+            lm_seed=stage(3.0),
+            gauss_newton=stage(1.05, rho=0.002, angle=0.02),
+        )
+    return module.FourArmRecovery(cohort=cohort, arms=arms)
+
+
+def test_recovery_statistics_use_one_shared_mask_and_clustered_bootstrap_without_global_rng_mutation():
+    m = load_module()
+    report = _four_arm_statistics_fixture(m, invalidate_seed_row=True)
+    before = np.random.get_state()
+
+    result = m.summarize_four_arm_recovery(report)
+
+    after = np.random.get_state()
+    assert before[0] == after[0]
+    assert np.array_equal(before[1], after[1])
+    group = result["exposures"]["protected"]["groups"]["17:8|interpolation|LOC0"]
+    assert group["requested_count"] == 201
+    assert group["valid_count"] == 200
+    assert group["seed_branch_difference_rmse_mm"] == pytest.approx(2.0)
+    assert group["refit_branch_difference_rmse_mm"] == pytest.approx(0.05)
+    assert group["recovery_ratio_q"] == pytest.approx(0.025)
+    assert group["recovery_ratio_q_ci95"] == pytest.approx({"low": 0.025, "high": 0.025})
+    assert group["practical_equivalence_ratio"] == pytest.approx(1.05)
+    assert group["practical_equivalence_ratio_ci95"] == pytest.approx({"low": 1.05, "high": 1.05})
+    assert group["refit_branch_difference_bias_mm_ci95"] == pytest.approx({"low": 0.05, "high": 0.05})
+    assert group["direction_angle_branch_difference_rms_rad"] == pytest.approx(0.01)
+    assert group["rho_branch_difference_rms_per_mm"] == pytest.approx(0.001)
+    assert group["intersection_failures"]["nominal_seed"]["count"] == 1
+    assert group["verdict"] == "passed"
+    assert result["exposures"]["protected"]["verdict"] == "passed"
+    assert len(result["per_row"]) == 603
+    assert result["per_row"][0]["shared_valid_LOC0"] is False
+
+
+def test_recovery_statistics_are_inconclusive_when_a_group_has_fewer_than_200_shared_components():
+    m = load_module()
+
+    result = m.summarize_four_arm_recovery(_four_arm_statistics_fixture(m, n_rows=199))
+
+    group = result["exposures"]["exposed"]["groups"]["17:8|interpolation|LOC1"]
+    assert group["valid_count"] == 199
+    assert group["verdict"] == "inconclusive"
+    assert result["exposures"]["exposed"]["verdict"] == "inconclusive"
+
+
+def test_recovery_statistics_fail_closed_when_nested_refit_stationarity_is_missing():
+    m = load_module()
+    report = _four_arm_statistics_fixture(m)
+    arm = report.arms[("nominal", "protected")]
+    report.arms[("nominal", "protected")] = m.replace(
+        arm,
+        gauss_newton=m.replace(arm.gauss_newton, diagnostics={}),
+    )
+
+    result = m.summarize_four_arm_recovery(report)
+
+    numerical = result["numerical_validity"]["nominal|protected|refit"]
+    assert numerical["valid"] is False
+    assert numerical["reason"] == "missing stationarity observability"
+    assert result["exposures"]["protected"]["verdict"] == "failed"
+
+
+def test_recovery_statistics_report_an_absent_prediction_mode_as_an_underpowered_group():
+    m = load_module()
+
+    result = m.summarize_four_arm_recovery(
+        _four_arm_statistics_fixture(m, modes=("interpolation",))
+    )
+
+    group = result["exposures"]["protected"]["groups"]["17:8|forward_extrapolation|LOC0"]
+    assert group["requested_count"] == 0
+    assert group["valid_count"] == 0
+    assert group["verdict"] == "inconclusive"
+    assert result["exposures"]["protected"]["verdict"] == "inconclusive"
+
+
+def test_recovery_statistics_leave_zero_denominator_ratios_undefined():
+    m = load_module()
+    report = _four_arm_statistics_fixture(m)
+    for exposure in ("protected", "exposed"):
+        arm = report.arms[("misaligned", exposure)]
+        report.arms[("misaligned", exposure)] = m.replace(
+            arm,
+            lm_seed=m.replace(
+                arm.lm_seed,
+                evaluation=m.replace(
+                    arm.lm_seed.evaluation,
+                    local_position=torch.ones_like(arm.lm_seed.evaluation.local_position),
+                ),
+            ),
+        )
+
+    result = m.summarize_four_arm_recovery(report)
+
+    group = result["exposures"]["protected"]["groups"]["17:8|interpolation|LOC0"]
+    assert group["seed_branch_difference_rmse_mm"] == 0.0
+    assert group["recovery_ratio_q"] is None
+    assert group["recovery_ratio_q_ci95"] == {"low": None, "high": None}
+    assert group["verdict"] == "failed"

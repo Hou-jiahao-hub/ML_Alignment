@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+import numpy as np
 import torch
 
 try:
@@ -119,6 +120,28 @@ class RecoveryArm:
 class FourArmRecovery:
     cohort: PairedRecoveryCohort
     arms: dict[tuple[str, str], RecoveryArm]
+
+
+# These statistics are deliberately local to the recovery comparison rather
+# than reusing the material-model Gate 4 constants.  They describe a different
+# paired question and are consumed by Task 3's presentation layer.
+BOOTSTRAP_REPLICATES = 2000
+BOOTSTRAP_SEED = 6006
+MIN_VALID_COMPONENTS = 200
+MAX_NON_STATIONARY_ROW_FRACTION = 0.001
+PRACTICAL_EQUIVALENCE_RATIO_LIMIT = 1.10
+BIAS_REFERENCE_FRACTION = 0.10
+ABSOLUTE_DETECTOR_THRESHOLDS = {
+    "pixel_local_mm": 0.05,
+    "strip_LOC0_mm": 0.10,
+    "strip_LOC1_mm": 1.50,
+    "direction_rad": 0.005,
+}
+RECOVERY_PREDICTION_MODES = (
+    "interpolation",
+    "forward_extrapolation",
+    "backward_extrapolation",
+)
 
 
 def build_hit_identities(
@@ -476,3 +499,400 @@ def run_four_arm_recovery(
                 gauss_newton=FittedStage(fitted, fitted_evaluation, refit_diagnostics),
             )
     return FourArmRecovery(cohort=cohort, arms=arms)
+
+
+def _json_number(value: float | int | np.number | None) -> float | int | None:
+    """Return a strict-JSON scalar, preserving undefined values as ``None``."""
+    if value is None:
+        return None
+    number = float(value)
+    return number if np.isfinite(number) else None
+
+
+def _rmse(values: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(np.square(values)))) if values.size else float("nan")
+
+
+def _ratio(numerator: float | np.ndarray, denominator: float | np.ndarray):
+    """Divide only by finite positive denominators (scalar or vectorized)."""
+    numerator_array, denominator_array = np.broadcast_arrays(numerator, denominator)
+    result = np.full(numerator_array.shape, np.nan, dtype=np.float64)
+    valid = (
+        np.isfinite(numerator_array)
+        & np.isfinite(denominator_array)
+        & (denominator_array > 0.0)
+    )
+    np.divide(numerator_array, denominator_array, out=result, where=valid)
+    return float(result) if result.ndim == 0 else result
+
+
+def _cluster_bootstrap_ci(
+    first: np.ndarray,
+    second: np.ndarray,
+    event_ids: np.ndarray,
+    statistic,
+    rng: np.random.Generator,
+) -> dict[str, float | None]:
+    """Percentile CI from whole-event resampling, never global NumPy state.
+
+    ``first`` and ``second`` are aggregated per event before each draw.  This
+    is algebraically identical to repeating every selected probe row from a
+    sampled event, while avoiding a large object array for real cohorts.
+    """
+    if not (first.ndim == second.ndim == event_ids.ndim == 1):
+        raise ValueError("Bootstrap inputs must be one-dimensional.")
+    if not (len(first) == len(second) == len(event_ids)):
+        raise ValueError("Bootstrap inputs must have matching lengths.")
+    if not len(first):
+        return {"low": None, "high": None}
+    _events, inverse = np.unique(event_ids, return_inverse=True)
+    n_events = int(_events.size)
+    count = np.bincount(inverse, minlength=n_events).astype(np.float64)
+    first_by_event = np.bincount(inverse, weights=first, minlength=n_events)
+    second_by_event = np.bincount(inverse, weights=second, minlength=n_events)
+    samples = np.empty(BOOTSTRAP_REPLICATES, dtype=np.float64)
+    # Chunking bounds temporary allocation when a group spans many events.
+    for start in range(0, BOOTSTRAP_REPLICATES, 64):
+        stop = min(start + 64, BOOTSTRAP_REPLICATES)
+        draws = rng.integers(0, n_events, size=(stop - start, n_events))
+        samples[start:stop] = statistic(
+            first_by_event[draws].sum(axis=1),
+            second_by_event[draws].sum(axis=1),
+            count[draws].sum(axis=1),
+        )
+    finite = samples[np.isfinite(samples)]
+    return {
+        "low": _json_number(np.percentile(finite, 2.5)) if finite.size else None,
+        "high": _json_number(np.percentile(finite, 97.5)) if finite.size else None,
+    }
+
+
+def _stationarity_valid(diagnostics: dict, *, stage: str) -> dict[str, object]:
+    """Read the seed/refit diagnostic shapes emitted by the shared solvers."""
+    if not isinstance(diagnostics, dict):
+        return {"valid": False, "reason": "missing stationarity observability"}
+    report = diagnostics if stage == "seed" else diagnostics.get("stationarity")
+    # Accept the direct shape too: it is useful for a stage adapter but not an
+    # excuse to accept missing fields from Task 1's actual nested refit report.
+    if stage == "refit" and report is None:
+        report = diagnostics if "non_stationary_row_fraction" in diagnostics else None
+    if not isinstance(report, dict):
+        return {"valid": False, "reason": "missing stationarity observability"}
+    fraction = report.get("non_stationary_row_fraction")
+    non_finite = report.get("n_non_finite")
+    if not isinstance(fraction, (float, int)) or not isinstance(non_finite, (float, int)):
+        return {"valid": False, "reason": "missing stationarity observability"}
+    if not np.isfinite(fraction) or not np.isfinite(non_finite):
+        return {"valid": False, "reason": "non-finite stationarity observability"}
+    valid = fraction <= MAX_NON_STATIONARY_ROW_FRACTION and non_finite == 0
+    return {
+        "valid": bool(valid),
+        "reason": None if valid else "stationarity gate failed",
+        "non_stationary_row_fraction": float(fraction),
+        "n_non_finite": int(non_finite),
+    }
+
+
+def _probe_columns(cohort: PairedRecoveryCohort) -> torch.Tensor:
+    if cohort.probe_mask.shape != cohort.hit_mask.shape or not torch.all(
+        cohort.probe_mask.sum(dim=1) == 1
+    ):
+        raise ValueError("Every recovery row must contain exactly one frozen probe.")
+    return cohort.probe_mask.to(torch.int64).argmax(dim=1)
+
+
+def _probe_observables(
+    report: FourArmRecovery, exposure: str) -> dict[str, np.ndarray]:
+    """Extract every value needed by every metric before a shared mask is made."""
+    cohort = report.cohort
+    columns = _probe_columns(cohort)
+    rows = torch.arange(cohort.n_rows, device=columns.device)
+    values: dict[str, np.ndarray] = {}
+    for branch in ("nominal", "misaligned"):
+        arm = report.arms.get((branch, exposure))
+        if arm is None:
+            raise ValueError(f"Missing {branch}|{exposure} recovery arm.")
+        for stage_name, stage in (("seed", arm.lm_seed), ("refit", arm.gauss_newton)):
+            evaluation = stage.evaluation
+            if tuple(evaluation.local_position.shape[:2]) != tuple(cohort.probe_mask.shape):
+                raise ValueError("Fitted-stage evaluation shape does not match frozen cohort rows.")
+            if tuple(evaluation.intersection_valid.shape) != tuple(cohort.probe_mask.shape):
+                raise ValueError("Fitted-stage intersection mask does not match frozen cohort rows.")
+            if stage.parameters.ndim != 2 or stage.parameters.shape != (cohort.n_rows, 6):
+                raise ValueError("Fitted-stage parameters must have shape [rows, 6].")
+            values[f"{branch}_{stage_name}_local"] = (
+                evaluation.local_position[rows, columns].detach().cpu().numpy()
+            )
+            values[f"{branch}_{stage_name}_valid"] = (
+                evaluation.intersection_valid[rows, columns].detach().cpu().numpy()
+            )
+            values[f"{branch}_{stage_name}_angle"] = (
+                evaluation.tangent_angle[rows, columns].detach().cpu().numpy()
+            )
+            values[f"{branch}_{stage_name}_rho"] = (
+                stage.parameters[:, 5].detach().cpu().numpy()
+            )
+        smt = arm.acts_smt
+        if tuple(smt.local_position.shape[:2]) != tuple(cohort.probe_mask.shape):
+            raise ValueError("ACTS-SMT stage shape does not match frozen cohort rows.")
+        values[f"{branch}_acts_local"] = smt.local_position[rows, columns].detach().cpu().numpy()
+    return values
+
+
+def _shared_component_mask(
+    component_available: np.ndarray, values: dict[str, np.ndarray], component: int
+) -> np.ndarray:
+    """The one mask shared by every seed/refit statistic in one component group."""
+    mask = component_available.copy()
+    for branch in ("nominal", "misaligned"):
+        for stage in ("seed", "refit"):
+            mask &= values[f"{branch}_{stage}_valid"].astype(bool)
+            mask &= np.isfinite(values[f"{branch}_{stage}_local"][:, component])
+            mask &= np.isfinite(values[f"{branch}_{stage}_angle"])
+            mask &= np.isfinite(values[f"{branch}_{stage}_rho"])
+        mask &= np.isfinite(values[f"{branch}_acts_local"][:, component])
+    return mask
+
+
+def _intersection_failures(
+    requested: np.ndarray, values: dict[str, np.ndarray]) -> dict[str, dict[str, float | int]]:
+    result = {}
+    count = int(requested.sum())
+    for branch in ("nominal", "misaligned"):
+        for stage in ("seed", "refit"):
+            valid = values[f"{branch}_{stage}_valid"].astype(bool)
+            failures = int((requested & ~valid).sum())
+            result[f"{branch}_{stage}"] = {
+                "count": failures,
+                "rate": float(failures / count) if count else 1.0,
+            }
+    return result
+
+
+def _group_statistics(
+    requested: np.ndarray,
+    shared: np.ndarray,
+    values: dict[str, np.ndarray],
+    component: int,
+    event_ids: np.ndarray,
+    rng: np.random.Generator,
+) -> dict[str, object]:
+    selection = np.flatnonzero(shared)
+    entry: dict[str, object] = {
+        "requested_count": int(requested.sum()),
+        "valid_count": int(selection.size),
+        "intersection_failures": _intersection_failures(requested, values),
+    }
+    if not selection.size:
+        entry.update(
+            {
+                "seed_branch_difference_rmse_mm": None,
+                "refit_branch_difference_rmse_mm": None,
+                "recovery_ratio_q": None,
+                "recovery_fraction": None,
+                "refit_branch_difference_bias_mm": None,
+                "nominal_refit_to_nominal_ACTS_rmse_mm": None,
+                "misaligned_refit_to_nominal_ACTS_rmse_mm": None,
+                "practical_equivalence_ratio": None,
+                "direction_angle_branch_difference_rms_rad": None,
+                "direction_angle_branch_difference_bias_rad": None,
+                "rho_branch_difference_rms_per_mm": None,
+                "rho_branch_difference_bias_per_mm": None,
+                "recovery_ratio_q_ci95": {"low": None, "high": None},
+                "practical_equivalence_ratio_ci95": {"low": None, "high": None},
+                "refit_branch_difference_bias_mm_ci95": {"low": None, "high": None},
+                "verdict": "inconclusive",
+                "gates": {"restoration": False, "practical_equivalence": False, "bias": False},
+            }
+        )
+        return entry
+    nominal_seed = values["nominal_seed_local"][selection, component]
+    misaligned_seed = values["misaligned_seed_local"][selection, component]
+    nominal_refit = values["nominal_refit_local"][selection, component]
+    misaligned_refit = values["misaligned_refit_local"][selection, component]
+    acts = values["nominal_acts_local"][selection, component]
+    seed_difference = misaligned_seed - nominal_seed
+    refit_difference = misaligned_refit - nominal_refit
+    nominal_reference = nominal_refit - acts
+    misaligned_reference = misaligned_refit - acts
+    seed_rmse = _rmse(seed_difference)
+    refit_rmse = _rmse(refit_difference)
+    nominal_reference_rmse = _rmse(nominal_reference)
+    misaligned_reference_rmse = _rmse(misaligned_reference)
+    q = _ratio(refit_rmse, seed_rmse)
+    practical = _ratio(misaligned_reference_rmse, nominal_reference_rmse)
+    selected_events = event_ids[selection]
+
+    def ratio_stat(first_sum, second_sum, count):
+        first_rmse = np.sqrt(first_sum / count)
+        second_rmse = np.sqrt(second_sum / count)
+        return _ratio(second_rmse, first_rmse)
+
+    q_ci = _cluster_bootstrap_ci(
+        np.square(seed_difference), np.square(refit_difference), selected_events, ratio_stat, rng
+    )
+    practical_ci = _cluster_bootstrap_ci(
+        np.square(nominal_reference), np.square(misaligned_reference), selected_events, ratio_stat, rng
+    )
+    bias_ci = _cluster_bootstrap_ci(
+        refit_difference, np.zeros_like(refit_difference), selected_events,
+        lambda total, _unused, count: np.divide(
+            total,
+            count,
+            out=np.full(np.broadcast(total, count).shape, np.nan, dtype=np.float64),
+            where=np.asarray(count) > 0,
+        ),
+        rng,
+    )
+    entry.update(
+        {
+            "seed_branch_difference_rmse_mm": _json_number(seed_rmse),
+            "refit_branch_difference_rmse_mm": _json_number(refit_rmse),
+            "recovery_ratio_q": _json_number(q),
+            "recovery_fraction": _json_number(1.0 - q) if np.isfinite(q) else None,
+            "refit_branch_difference_bias_mm": _json_number(np.mean(refit_difference)),
+            "nominal_refit_to_nominal_ACTS_rmse_mm": _json_number(nominal_reference_rmse),
+            "misaligned_refit_to_nominal_ACTS_rmse_mm": _json_number(misaligned_reference_rmse),
+            "practical_equivalence_ratio": _json_number(practical),
+            "direction_angle_branch_difference_rms_rad": _json_number(
+                _rmse(values["misaligned_refit_angle"][selection] - values["nominal_refit_angle"][selection])
+            ),
+            "direction_angle_branch_difference_bias_rad": _json_number(
+                np.mean(values["misaligned_refit_angle"][selection] - values["nominal_refit_angle"][selection])
+            ),
+            "rho_branch_difference_rms_per_mm": _json_number(
+                _rmse(values["misaligned_refit_rho"][selection] - values["nominal_refit_rho"][selection])
+            ),
+            "rho_branch_difference_bias_per_mm": _json_number(
+                np.mean(values["misaligned_refit_rho"][selection] - values["nominal_refit_rho"][selection])
+            ),
+            "recovery_ratio_q_ci95": q_ci,
+            "practical_equivalence_ratio_ci95": practical_ci,
+            "refit_branch_difference_bias_mm_ci95": bias_ci,
+        }
+    )
+    restoration = q_ci["high"] is not None and q_ci["high"] < 1.0
+    equivalence = practical_ci["high"] is not None and practical_ci["high"] <= PRACTICAL_EQUIVALENCE_RATIO_LIMIT
+    bias_limit = BIAS_REFERENCE_FRACTION * nominal_reference_rmse
+    bias = (
+        np.isfinite(bias_limit)
+        and bias_ci["low"] is not None
+        and bias_ci["high"] is not None
+        and bias_ci["low"] >= -bias_limit
+        and bias_ci["high"] <= bias_limit
+    )
+    gates = {
+        "restoration": bool(restoration),
+        "practical_equivalence": bool(equivalence),
+        "bias": bool(bias),
+    }
+    entry["gates"] = gates
+    entry["verdict"] = (
+        "inconclusive" if selection.size < MIN_VALID_COMPONENTS else "passed" if all(gates.values()) else "failed"
+    )
+    return entry
+
+
+def _per_row_table(report: FourArmRecovery, values_by_exposure: dict[str, dict[str, np.ndarray]]) -> list[dict]:
+    cohort = report.cohort
+    columns = _probe_columns(cohort).detach().cpu().tolist()
+    rows: list[dict] = []
+    for row, column in enumerate(columns):
+        identity = cohort.nominal.identities[int(cohort.row_indices[row, column])]
+        record: dict[str, object] = {
+            "event_nr": identity.event_nr,
+            "track_nr": identity.track_nr,
+            "volume_id": identity.volume_id,
+            "layer_id": identity.layer_id,
+            "module_id": identity.module_id,
+            "occurrence": identity.occurrence,
+            "prediction_mode": cohort.probe_mode[row],
+        }
+        for component, name in enumerate(("LOC0", "LOC1")):
+            available = bool(cohort.nominal.component_mask[cohort.row_indices[row, column], component])
+            record[f"requested_{name}"] = available
+            for exposure, values in values_by_exposure.items():
+                shared = _shared_component_mask(
+                    np.array([available]),
+                    {key: value[row : row + 1] for key, value in values.items()},
+                    component,
+                )[0]
+                record[f"shared_valid_{exposure}_{name}"] = bool(shared)
+                if exposure == "protected":
+                    record[f"shared_valid_{name}"] = bool(shared)
+                # Protected is the canonical per-row view; exposed is retained
+                # separately because its fit mask legitimately changes estimates.
+                for branch in ("nominal", "misaligned"):
+                    for stage in ("seed", "refit"):
+                        record[f"{exposure}_{branch}_{stage}_{name}_mm"] = _json_number(
+                            values[f"{branch}_{stage}_local"][row, component]
+                        )
+        rows.append(record)
+    return rows
+
+
+def summarize_four_arm_recovery(report: FourArmRecovery) -> dict[str, object]:
+    """Compute paired recovery metrics, event-cluster CIs, verdicts, and rows.
+
+    This function intentionally has no filesystem side effects.  Task 3 owns
+    JSON/CSV/plot emission and manifest lifecycle; keeping this boundary pure
+    lets the statistical contract be exercised without ACTS or ROOT.
+    """
+    cohort = report.cohort
+    columns = _probe_columns(cohort)
+    row_indices = cohort.row_indices[torch.arange(cohort.n_rows), columns]
+    identities = [cohort.nominal.identities[int(index)] for index in row_indices.tolist()]
+    event_ids = np.asarray([identity.event_nr for identity in identities], dtype=np.int64)
+    layer_ids = np.asarray([(identity.volume_id, identity.layer_id) for identity in identities])
+    modes = np.asarray(cohort.probe_mode, dtype=object)
+    availability = cohort.nominal.component_mask[row_indices].detach().cpu().numpy()
+    numerical: dict[str, dict[str, object]] = {}
+    for exposure in ("protected", "exposed"):
+        for branch in ("nominal", "misaligned"):
+            arm = report.arms.get((branch, exposure))
+            if arm is None:
+                raise ValueError(f"Missing {branch}|{exposure} recovery arm.")
+            numerical[f"{branch}|{exposure}|seed"] = _stationarity_valid(
+                arm.lm_seed.diagnostics, stage="seed"
+            )
+            numerical[f"{branch}|{exposure}|refit"] = _stationarity_valid(
+                arm.gauss_newton.diagnostics, stage="refit"
+            )
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    exposure_values = {exposure: _probe_observables(report, exposure) for exposure in ("protected", "exposed")}
+    exposure_report: dict[str, dict[str, object]] = {}
+    unique_layers = sorted(set(map(tuple, layer_ids.tolist())))
+    for exposure in ("protected", "exposed"):
+        values = exposure_values[exposure]
+        groups: dict[str, dict[str, object]] = {}
+        for volume, layer in unique_layers:
+            for mode in RECOVERY_PREDICTION_MODES:
+                in_group = (layer_ids[:, 0] == volume) & (layer_ids[:, 1] == layer) & (modes == mode)
+                for component, name in enumerate(("LOC0", "LOC1")):
+                    requested = in_group & availability[:, component]
+                    shared = in_group & _shared_component_mask(availability[:, component], values, component)
+                    groups[f"{volume}:{layer}|{mode}|{name}"] = _group_statistics(
+                        requested, shared, values, component, event_ids, rng
+                    )
+        numerical_ok = all(
+            bool(numerical[f"{branch}|{exposure}|{stage}"]["valid"])
+            for branch in ("nominal", "misaligned")
+            for stage in ("seed", "refit")
+        )
+        group_verdicts = [entry["verdict"] for entry in groups.values()]
+        verdict = (
+            "failed"
+            if not numerical_ok or "failed" in group_verdicts
+            else "inconclusive"
+            if "inconclusive" in group_verdicts or not group_verdicts
+            else "passed"
+        )
+        exposure_report[exposure] = {"verdict": verdict, "groups": groups}
+    return {
+        "bootstrap": {"replicates": BOOTSTRAP_REPLICATES, "seed": BOOTSTRAP_SEED},
+        "minimum_valid_components": MIN_VALID_COMPONENTS,
+        "absolute_detector_thresholds_diagnostic_only": ABSOLUTE_DETECTOR_THRESHOLDS,
+        "numerical_validity": numerical,
+        "exposures": exposure_report,
+        "per_row": _per_row_table(report, exposure_values),
+    }
