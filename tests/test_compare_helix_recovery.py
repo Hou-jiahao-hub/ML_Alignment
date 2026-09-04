@@ -100,6 +100,53 @@ def test_probe_classification_uses_the_protected_non_target_window(target_at, mo
     assert cohort.probe_mode == (mode,)
 
 
+def test_build_hit_identities_refuses_duplicate_surfaces_without_shared_occurrences():
+    m = load_module()
+    event = torch.tensor([7, 7])
+    track = torch.tensor([11, 11])
+    volume = torch.tensor([10, 10])
+    layer = torch.tensor([2, 2])
+    module = torch.tensor([4, 4])
+
+    with pytest.raises(ValueError, match="stable occurrence"):
+        m.build_hit_identities(event, track, volume, layer, module)
+
+    # Reversing the same two states must not create a second, independently
+    # ordered occurrence assignment that the paired cohort could accept.
+    with pytest.raises(ValueError, match="stable occurrence"):
+        m.build_hit_identities(
+            event.flip(0), track.flip(0), volume.flip(0), layer.flip(0), module.flip(0)
+        )
+
+
+def test_build_hit_identities_accepts_explicit_shared_duplicate_occurrences():
+    m = load_module()
+    event = torch.tensor([7, 7])
+    track = torch.tensor([11, 11])
+    volume = torch.tensor([10, 10])
+    layer = torch.tensor([2, 2])
+    module = torch.tensor([4, 4])
+
+    nominal = m.build_hit_identities(event, track, volume, layer, module, torch.tensor([4, 9]))
+    misaligned = m.build_hit_identities(
+        event.flip(0), track.flip(0), volume.flip(0), layer.flip(0), module.flip(0), torch.tensor([9, 4])
+    )
+
+    assert sorted(nominal) == sorted(misaligned)
+
+
+@pytest.mark.parametrize("field", ("measured_local", "measurement_variance"))
+def test_freeze_paired_cohort_rejects_nonfinite_available_components(field):
+    m = load_module()
+    nominal = _inputs(m)
+    values = getattr(nominal, field).clone()
+    values[0, 0] = torch.nan if field == "measured_local" else torch.inf
+    nominal = m.replace(nominal, **{field: values})
+
+    with pytest.raises(ValueError, match="finite available"):
+        m.freeze_paired_cohort(nominal, _inputs(m))
+
+
 @pytest.mark.parametrize("kind", ("identity", "target_mask", "component_mask"))
 def test_freeze_paired_cohort_fails_closed_on_unpaired_contract(kind):
     m = load_module()

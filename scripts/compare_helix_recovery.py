@@ -127,21 +127,40 @@ def build_hit_identities(
     volume_id: torch.Tensor,
     layer_id: torch.Tensor,
     module_id: torch.Tensor,
+    occurrence: torch.Tensor | None = None,
 ) -> tuple[HitIdentity, ...]:
-    """Assign occurrences in source order for repeated physical hit identities."""
+    """Build identities without inventing a branch-local duplicate ordering.
+
+    A repeated ``(event, track, volume, layer, module)`` requires an explicit
+    occurrence from a shared state ordering established before the two branches
+    are split.  Source order is not such an ordering: ROOT branches may present
+    repeated states in a different order, which would silently swap a pair.
+    """
     values = (event_nr, track_nr, volume_id, layer_id, module_id)
     if any(value.ndim != 1 for value in values):
         raise ValueError("Hit identity inputs must be one-dimensional tensors.")
     if len({value.shape[0] for value in values}) != 1:
         raise ValueError("Hit identity inputs must have the same length.")
-    occurrences: dict[tuple[int, int, int, int, int], int] = {}
-    identities = []
-    for fields in zip(*(value.detach().cpu().tolist() for value in values)):
-        key = tuple(int(value) for value in fields)
-        occurrence = occurrences.get(key, 0)
-        occurrences[key] = occurrence + 1
-        identities.append(HitIdentity(*key, occurrence))
-    return tuple(identities)
+    keys = [
+        tuple(int(value) for value in fields)
+        for fields in zip(*(value.detach().cpu().tolist() for value in values))
+    ]
+    if occurrence is None:
+        if len(set(keys)) != len(keys):
+            raise ValueError(
+                "Duplicate physical states require a shared stable occurrence; "
+                "source-order occurrence assignment is forbidden."
+            )
+        return tuple(HitIdentity(*key, 0) for key in keys)
+    if occurrence.ndim != 1 or occurrence.shape[0] != len(keys):
+        raise ValueError("occurrence must be one-dimensional and match hit count.")
+    if occurrence.dtype.is_floating_point or occurrence.dtype.is_complex:
+        raise ValueError("occurrence must use an integral tensor dtype.")
+    values = occurrence.detach().cpu().tolist()
+    identities = tuple(HitIdentity(*key, int(value)) for key, value in zip(keys, values))
+    if len(set(identities)) != len(identities):
+        raise ValueError("Shared stable occurrences must make hit identities unique.")
+    return identities
 
 
 def _validate_inputs(inputs: RecoveryHitInputs) -> None:
@@ -171,7 +190,13 @@ def _validate_inputs(inputs: RecoveryHitInputs) -> None:
         raise ValueError("Global positions and directions must be finite.")
     if not torch.isfinite(inputs.path_length).all():
         raise ValueError("path_length must be finite for cohort freezing.")
-    if (inputs.measurement_variance[inputs.component_mask] <= 0).any():
+    available = inputs.component_mask
+    if (
+        not torch.isfinite(inputs.measured_local[available]).all()
+        or not torch.isfinite(inputs.measurement_variance[available]).all()
+    ):
+        raise ValueError("Non-finite available measurement value or variance.")
+    if (inputs.measurement_variance[available] <= 0).any():
         raise ValueError("Available measurement components need positive variance.")
     if (inputs.target_mask & ~inputs.component_mask[:, 0]).any():
         raise ValueError("Every target probe requires an available LOC0 component.")
