@@ -239,6 +239,7 @@ def _four_arm_statistics_fixture(
     n_rows=201,
     invalidate_seed_row=False,
     modes=("interpolation", "forward_extrapolation", "backward_extrapolation"),
+    unretained_target_layer=None,
 ):
     """Hand-checked paired predictions: Q=.25, practical ratio=1.05, bias=.05."""
     n_rows *= len(modes)
@@ -258,9 +259,26 @@ def _four_arm_statistics_fixture(
         target_mask=torch.ones(n_rows, dtype=torch.bool),
         path_length=torch.arange(n_rows, dtype=torch.float64),
     )
+    source_inputs = inputs
+    if unretained_target_layer is not None:
+        volume, layer = unretained_target_layer
+        source_inputs = module.replace(
+            inputs,
+            identities=inputs.identities
+            + (module.HitIdentity(999, 999, volume, layer, 999, 0),),
+            measured_local=torch.cat((inputs.measured_local, torch.zeros((1, 2), dtype=torch.float64))),
+            measurement_variance=torch.cat((inputs.measurement_variance, torch.ones((1, 2), dtype=torch.float64))),
+            component_mask=torch.cat((inputs.component_mask, torch.ones((1, 2), dtype=torch.bool))),
+            smt_local=torch.cat((inputs.smt_local, torch.zeros((1, 2), dtype=torch.float64))),
+            global_positions=torch.cat((inputs.global_positions, torch.zeros((1, 3), dtype=torch.float64))),
+            directions=torch.cat((inputs.directions, torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float64))),
+            sensor_idx=torch.cat((inputs.sensor_idx, torch.tensor([999], dtype=torch.long))),
+            target_mask=torch.cat((inputs.target_mask, torch.tensor([True]))),
+            path_length=torch.cat((inputs.path_length, torch.tensor([999.0], dtype=torch.float64))),
+        )
     cohort = module.PairedRecoveryCohort(
-        nominal=inputs,
-        misaligned=inputs,
+        nominal=source_inputs,
+        misaligned=source_inputs,
         row_indices=torch.arange(n_rows, dtype=torch.long).reshape(n_rows, 1),
         hit_mask=torch.ones((n_rows, 1), dtype=torch.bool),
         probe_mask=torch.ones((n_rows, 1), dtype=torch.bool),
@@ -307,13 +325,17 @@ def _four_arm_statistics_fixture(
     for exposure in ("protected", "exposed"):
         arms[("nominal", exposure)] = module.RecoveryArm(
             fit_mask=cohort.protected_fit_mask,
-            acts_smt=module.ACTSSMTStage(inputs.smt_local[:, None], inputs.component_mask[:, None], cohort.hit_mask),
+            acts_smt=module.ACTSSMTStage(
+                inputs.smt_local[:, None], inputs.component_mask[:, None], cohort.hit_mask
+            ),
             lm_seed=nominal_seed,
             gauss_newton=stage(1.0, rho=0.001, angle=0.01),
         )
         arms[("misaligned", exposure)] = module.RecoveryArm(
             fit_mask=cohort.protected_fit_mask,
-            acts_smt=module.ACTSSMTStage(inputs.smt_local[:, None], inputs.component_mask[:, None], cohort.hit_mask),
+            acts_smt=module.ACTSSMTStage(
+                inputs.smt_local[:, None], inputs.component_mask[:, None], cohort.hit_mask
+            ),
             lm_seed=stage(3.0),
             gauss_newton=stage(1.05, rho=0.002, angle=0.02),
         )
@@ -336,11 +358,15 @@ def test_recovery_statistics_use_one_shared_mask_and_clustered_bootstrap_without
     assert group["seed_branch_difference_rmse_mm"] == pytest.approx(2.0)
     assert group["refit_branch_difference_rmse_mm"] == pytest.approx(0.05)
     assert group["recovery_ratio_q"] == pytest.approx(0.025)
-    assert group["recovery_ratio_q_ci95"] == pytest.approx({"low": 0.025, "high": 0.025})
+    assert group["recovery_ratio_q_ci95"]["low"] == pytest.approx(0.025)
+    assert group["recovery_ratio_q_ci95"]["high"] == pytest.approx(0.025)
+    assert group["recovery_ratio_q_ci95"]["valid"] is True
     assert group["practical_equivalence_ratio"] == pytest.approx(1.05)
-    assert group["practical_equivalence_ratio_ci95"] == pytest.approx({"low": 1.05, "high": 1.05})
-    assert group["refit_branch_difference_bias_mm_ci95"] == pytest.approx({"low": 0.05, "high": 0.05})
-    assert group["direction_angle_branch_difference_rms_rad"] == pytest.approx(0.01)
+    assert group["practical_equivalence_ratio_ci95"]["low"] == pytest.approx(1.05)
+    assert group["practical_equivalence_ratio_ci95"]["high"] == pytest.approx(1.05)
+    assert group["refit_branch_difference_bias_mm_ci95"]["low"] == pytest.approx(0.05)
+    assert group["refit_branch_difference_bias_mm_ci95"]["high"] == pytest.approx(0.05)
+    assert group["direction_angle_branch_difference_rms_rad"] == pytest.approx(0.0)
     assert group["rho_branch_difference_rms_per_mm"] == pytest.approx(0.001)
     assert group["intersection_failures"]["nominal_seed"]["count"] == 1
     assert group["verdict"] == "passed"
@@ -412,5 +438,117 @@ def test_recovery_statistics_leave_zero_denominator_ratios_undefined():
     group = result["exposures"]["protected"]["groups"]["17:8|interpolation|LOC0"]
     assert group["seed_branch_difference_rmse_mm"] == 0.0
     assert group["recovery_ratio_q"] is None
-    assert group["recovery_ratio_q_ci95"] == {"low": None, "high": None}
+    assert group["recovery_ratio_q_ci95"]["low"] is None
+    assert group["recovery_ratio_q_ci95"]["high"] is None
+    assert group["recovery_ratio_q_ci95"]["valid"] is False
     assert group["verdict"] == "failed"
+
+
+def test_recovery_statistics_keep_a_target_layer_with_no_retained_probe_inconclusive():
+    m = load_module()
+
+    result = m.summarize_four_arm_recovery(
+        _four_arm_statistics_fixture(m, unretained_target_layer=(24, 4))
+    )
+
+    group = result["exposures"]["protected"]["groups"]["24:4|interpolation|LOC0"]
+    assert group["requested_count"] == 0
+    assert group["valid_count"] == 0
+    assert group["intersection_failures"]["nominal_seed"]["rate"] is None
+    assert group["verdict"] == "inconclusive"
+    assert result["exposures"]["protected"]["verdict"] == "inconclusive"
+
+
+def test_direction_difference_uses_fitted_tangents_not_subtracted_smt_error_angles():
+    m = load_module()
+    report = _four_arm_statistics_fixture(m)
+    for exposure in ("protected", "exposed"):
+        nominal = report.arms[("nominal", exposure)]
+        misaligned = report.arms[("misaligned", exposure)]
+        nominal_parameters = nominal.gauss_newton.parameters.clone()
+        misaligned_parameters = misaligned.gauss_newton.parameters.clone()
+        nominal_parameters[:, 3] = 0.0
+        misaligned_parameters[:, 3] = torch.pi
+        report.arms[("nominal", exposure)] = m.replace(
+            nominal, gauss_newton=m.replace(nominal.gauss_newton, parameters=nominal_parameters)
+        )
+        report.arms[("misaligned", exposure)] = m.replace(
+            misaligned, gauss_newton=m.replace(misaligned.gauss_newton, parameters=misaligned_parameters)
+        )
+
+    result = m.summarize_four_arm_recovery(report)
+
+    group = result["exposures"]["protected"]["groups"]["17:8|interpolation|LOC0"]
+    assert group["direction_angle_branch_difference_rms_rad"] == pytest.approx(float(torch.pi))
+
+
+def test_cluster_bootstrap_resamples_whole_nonconstant_multirow_events_not_individual_rows():
+    m = load_module()
+    values = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    events = np.array([10, 10, 10, 10, 10, 11])
+
+    cluster = m._cluster_bootstrap_ci(
+        values,
+        np.zeros_like(values),
+        events,
+        lambda total, _unused, count: total / count,
+        np.random.default_rng(6006),
+    )
+    row_rng = np.random.default_rng(6006)
+    draws = row_rng.integers(0, len(values), size=(m.BOOTSTRAP_REPLICATES, len(values)))
+    row_high = float(np.percentile(values[draws].mean(axis=1), 97.5))
+
+    assert cluster["valid"] is True
+    assert cluster["high"] == pytest.approx(1.0)
+    assert cluster["high"] > row_high
+
+
+def test_bootstrap_refuses_a_gate_when_some_event_resamples_have_zero_denominator():
+    m = load_module()
+    values = np.array([0.0, 0.0, 2.0])
+    events = np.array([10, 10, 11])
+
+    ci = m._cluster_bootstrap_ci(
+        np.square(values),
+        np.square(values),
+        events,
+        lambda first, second, count: np.sqrt(second / count) / np.sqrt(first / count),
+        np.random.default_rng(6006),
+    )
+
+    assert ci["valid"] is False
+    assert ci["n_requested_resamples"] == 2000
+    assert 0 < ci["n_finite_resamples"] < 2000
+    assert ci["low"] is None
+    assert ci["high"] is None
+
+
+@pytest.mark.parametrize(
+    ("misaligned_refit", "expected_practical", "expected_bias"),
+    ((1.10, True, True), (1.1001, False, False)),
+)
+def test_recovery_statistics_enforce_practical_and_bias_gate_boundaries(
+    misaligned_refit, expected_practical, expected_bias
+):
+    m = load_module()
+    report = _four_arm_statistics_fixture(m)
+    for exposure in ("protected", "exposed"):
+        arm = report.arms[("misaligned", exposure)]
+        report.arms[("misaligned", exposure)] = m.replace(
+            arm,
+            gauss_newton=m.replace(
+                arm.gauss_newton,
+                evaluation=m.replace(
+                    arm.gauss_newton.evaluation,
+                    local_position=torch.full_like(
+                        arm.gauss_newton.evaluation.local_position, misaligned_refit
+                    ),
+                ),
+            ),
+        )
+
+    result = m.summarize_four_arm_recovery(report)
+
+    group = result["exposures"]["protected"]["groups"]["17:8|interpolation|LOC0"]
+    assert group["gates"]["practical_equivalence"] is expected_practical
+    assert group["gates"]["bias"] is expected_bias

@@ -19,6 +19,7 @@ try:
         TrackBatches,
         evaluate_helix_on_surfaces,
         fit_helices_gauss_newton,
+        helix_tangent,
         seed_helices,
     )
 except ImportError:  # Direct script execution and importlib-based tests.
@@ -28,6 +29,7 @@ except ImportError:  # Direct script execution and importlib-based tests.
         TrackBatches,
         evaluate_helix_on_surfaces,
         fit_helices_gauss_newton,
+        helix_tangent,
         seed_helices,
     )
 
@@ -131,6 +133,7 @@ MIN_VALID_COMPONENTS = 200
 MAX_NON_STATIONARY_ROW_FRACTION = 0.001
 PRACTICAL_EQUIVALENCE_RATIO_LIMIT = 1.10
 BIAS_REFERENCE_FRACTION = 0.10
+GATE_FLOAT_TOLERANCE = 32.0 * np.finfo(np.float64).eps
 ABSOLUTE_DETECTOR_THRESHOLDS = {
     "pixel_local_mm": 0.05,
     "strip_LOC0_mm": 0.10,
@@ -544,7 +547,13 @@ def _cluster_bootstrap_ci(
     if not (len(first) == len(second) == len(event_ids)):
         raise ValueError("Bootstrap inputs must have matching lengths.")
     if not len(first):
-        return {"low": None, "high": None}
+        return {
+            "low": None,
+            "high": None,
+            "valid": False,
+            "n_requested_resamples": BOOTSTRAP_REPLICATES,
+            "n_finite_resamples": 0,
+        }
     _events, inverse = np.unique(event_ids, return_inverse=True)
     n_events = int(_events.size)
     count = np.bincount(inverse, minlength=n_events).astype(np.float64)
@@ -555,15 +564,20 @@ def _cluster_bootstrap_ci(
     for start in range(0, BOOTSTRAP_REPLICATES, 64):
         stop = min(start + 64, BOOTSTRAP_REPLICATES)
         draws = rng.integers(0, n_events, size=(stop - start, n_events))
-        samples[start:stop] = statistic(
-            first_by_event[draws].sum(axis=1),
-            second_by_event[draws].sum(axis=1),
-            count[draws].sum(axis=1),
-        )
+        with np.errstate(all="ignore"):
+            samples[start:stop] = statistic(
+                first_by_event[draws].sum(axis=1),
+                second_by_event[draws].sum(axis=1),
+                count[draws].sum(axis=1),
+            )
     finite = samples[np.isfinite(samples)]
+    valid = finite.size == BOOTSTRAP_REPLICATES
     return {
-        "low": _json_number(np.percentile(finite, 2.5)) if finite.size else None,
-        "high": _json_number(np.percentile(finite, 97.5)) if finite.size else None,
+        "low": _json_number(np.percentile(finite, 2.5)) if valid else None,
+        "high": _json_number(np.percentile(finite, 97.5)) if valid else None,
+        "valid": bool(valid),
+        "n_requested_resamples": BOOTSTRAP_REPLICATES,
+        "n_finite_resamples": int(finite.size),
     }
 
 
@@ -629,6 +643,13 @@ def _probe_observables(
             values[f"{branch}_{stage_name}_angle"] = (
                 evaluation.tangent_angle[rows, columns].detach().cpu().numpy()
             )
+            tracks = stage.parameters[:, None, :].expand(
+                -1, evaluation.path_length.shape[1], -1
+            )
+            tangent = helix_tangent(tracks, evaluation.path_length)
+            values[f"{branch}_{stage_name}_tangent"] = (
+                tangent[rows, columns].detach().cpu().numpy()
+            )
             values[f"{branch}_{stage_name}_rho"] = (
                 stage.parameters[:, 5].detach().cpu().numpy()
             )
@@ -649,6 +670,8 @@ def _shared_component_mask(
             mask &= values[f"{branch}_{stage}_valid"].astype(bool)
             mask &= np.isfinite(values[f"{branch}_{stage}_local"][:, component])
             mask &= np.isfinite(values[f"{branch}_{stage}_angle"])
+            mask &= np.isfinite(values[f"{branch}_{stage}_tangent"]).all(axis=1)
+            mask &= np.linalg.norm(values[f"{branch}_{stage}_tangent"], axis=1) > 0.0
             mask &= np.isfinite(values[f"{branch}_{stage}_rho"])
         mask &= np.isfinite(values[f"{branch}_acts_local"][:, component])
     return mask
@@ -664,9 +687,19 @@ def _intersection_failures(
             failures = int((requested & ~valid).sum())
             result[f"{branch}_{stage}"] = {
                 "count": failures,
-                "rate": float(failures / count) if count else 1.0,
+                "rate": float(failures / count) if count else None,
             }
     return result
+
+
+def _tangent_angles(values: dict[str, np.ndarray], selection: np.ndarray) -> np.ndarray:
+    """Geometric angle between the two fitted helices on nominal surfaces."""
+    nominal = values["nominal_refit_tangent"][selection]
+    misaligned = values["misaligned_refit_tangent"][selection]
+    nominal_unit = nominal / np.linalg.norm(nominal, axis=1, keepdims=True)
+    misaligned_unit = misaligned / np.linalg.norm(misaligned, axis=1, keepdims=True)
+    cosine = np.clip(np.sum(nominal_unit * misaligned_unit, axis=1), -1.0, 1.0)
+    return np.arccos(cosine)
 
 
 def _group_statistics(
@@ -698,9 +731,15 @@ def _group_statistics(
                 "direction_angle_branch_difference_bias_rad": None,
                 "rho_branch_difference_rms_per_mm": None,
                 "rho_branch_difference_bias_per_mm": None,
-                "recovery_ratio_q_ci95": {"low": None, "high": None},
-                "practical_equivalence_ratio_ci95": {"low": None, "high": None},
-                "refit_branch_difference_bias_mm_ci95": {"low": None, "high": None},
+                "recovery_ratio_q_ci95": _cluster_bootstrap_ci(
+                    np.array([]), np.array([]), np.array([], dtype=np.int64), lambda *_: float("nan"), rng
+                ),
+                "practical_equivalence_ratio_ci95": _cluster_bootstrap_ci(
+                    np.array([]), np.array([]), np.array([], dtype=np.int64), lambda *_: float("nan"), rng
+                ),
+                "refit_branch_difference_bias_mm_ci95": _cluster_bootstrap_ci(
+                    np.array([]), np.array([]), np.array([], dtype=np.int64), lambda *_: float("nan"), rng
+                ),
                 "verdict": "inconclusive",
                 "gates": {"restoration": False, "practical_equivalence": False, "bias": False},
             }
@@ -755,10 +794,10 @@ def _group_statistics(
             "misaligned_refit_to_nominal_ACTS_rmse_mm": _json_number(misaligned_reference_rmse),
             "practical_equivalence_ratio": _json_number(practical),
             "direction_angle_branch_difference_rms_rad": _json_number(
-                _rmse(values["misaligned_refit_angle"][selection] - values["nominal_refit_angle"][selection])
+                _rmse(_tangent_angles(values, selection))
             ),
             "direction_angle_branch_difference_bias_rad": _json_number(
-                np.mean(values["misaligned_refit_angle"][selection] - values["nominal_refit_angle"][selection])
+                np.mean(_tangent_angles(values, selection))
             ),
             "rho_branch_difference_rms_per_mm": _json_number(
                 _rmse(values["misaligned_refit_rho"][selection] - values["nominal_refit_rho"][selection])
@@ -771,15 +810,20 @@ def _group_statistics(
             "refit_branch_difference_bias_mm_ci95": bias_ci,
         }
     )
-    restoration = q_ci["high"] is not None and q_ci["high"] < 1.0
-    equivalence = practical_ci["high"] is not None and practical_ci["high"] <= PRACTICAL_EQUIVALENCE_RATIO_LIMIT
+    restoration = q_ci["valid"] and q_ci["high"] is not None and q_ci["high"] < 1.0
+    equivalence = (
+        practical_ci["valid"]
+        and practical_ci["high"] is not None
+        and practical_ci["high"] <= PRACTICAL_EQUIVALENCE_RATIO_LIMIT + GATE_FLOAT_TOLERANCE
+    )
     bias_limit = BIAS_REFERENCE_FRACTION * nominal_reference_rmse
     bias = (
         np.isfinite(bias_limit)
+        and bias_ci["valid"]
         and bias_ci["low"] is not None
         and bias_ci["high"] is not None
-        and bias_ci["low"] >= -bias_limit
-        and bias_ci["high"] <= bias_limit
+        and bias_ci["low"] >= -bias_limit - GATE_FLOAT_TOLERANCE
+        and bias_ci["high"] <= bias_limit + GATE_FLOAT_TOLERANCE
     )
     gates = {
         "restoration": bool(restoration),
@@ -861,11 +905,19 @@ def summarize_four_arm_recovery(report: FourArmRecovery) -> dict[str, object]:
     rng = np.random.default_rng(BOOTSTRAP_SEED)
     exposure_values = {exposure: _probe_observables(report, exposure) for exposure in ("protected", "exposed")}
     exposure_report: dict[str, dict[str, object]] = {}
-    unique_layers = sorted(set(map(tuple, layer_ids.tolist())))
+    target_layers = {
+        (identity.volume_id, identity.layer_id)
+        for identity, is_target in zip(
+            cohort.nominal.identities, cohort.nominal.target_mask.detach().cpu().tolist()
+        )
+        if is_target
+    }
+    if not target_layers:
+        raise ValueError("Frozen recovery cohort has no target-layer identities.")
     for exposure in ("protected", "exposed"):
         values = exposure_values[exposure]
         groups: dict[str, dict[str, object]] = {}
-        for volume, layer in unique_layers:
+        for volume, layer in sorted(target_layers):
             for mode in RECOVERY_PREDICTION_MODES:
                 in_group = (layer_ids[:, 0] == volume) & (layer_ids[:, 1] == layer) & (modes == mode)
                 for component, name in enumerate(("LOC0", "LOC1")):
