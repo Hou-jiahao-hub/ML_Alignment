@@ -1,16 +1,20 @@
-"""ACTS-independent paired diagnostic stages for helix recovery.
-
-This module deliberately owns no ROOT I/O, CLI, files, or statistics.  It
-turns already-loaded per-hit values into one frozen paired cohort and runs the
-same helix seed/refit implementation for the nominal and misaligned branches.
-"""
+"""ACTS-independent paired diagnostic stages for helix recovery."""
 
 from __future__ import annotations
 
+import argparse
+import csv
+import json
+import sys
+import tempfile
+from collections import Counter
 from dataclasses import dataclass, replace
+from pathlib import Path
 
+import awkward as ak
 import numpy as np
 import torch
+import uproot
 
 try:
     from .validate_helix_model import (
@@ -20,7 +24,10 @@ try:
         evaluate_helix_on_surfaces,
         fit_helices_gauss_newton,
         helix_tangent,
+        load_nominal_geometry,
+        load_working_geometry,
         seed_helices,
+        expand_measurement_errors,
     )
 except ImportError:  # Direct script execution and importlib-based tests.
     from validate_helix_model import (
@@ -30,8 +37,23 @@ except ImportError:  # Direct script execution and importlib-based tests.
         evaluate_helix_on_surfaces,
         fit_helices_gauss_newton,
         helix_tangent,
+        load_nominal_geometry,
+        load_working_geometry,
         seed_helices,
+        expand_measurement_errors,
     )
+
+try:
+    from .event_split import DEFAULT_SPLIT_SEED, PARTITIONS, event_partition_mask
+except ImportError:  # Direct script execution and importlib-based tests.
+    from event_split import DEFAULT_SPLIT_SEED, PARTITIONS, event_partition_mask
+
+try:
+    from .experiment_manifest import finalize_experiment_manifest, write_experiment_manifest
+    from .project_config import ProjectConfig, absolute_project_path, load_project_config
+except ImportError:  # Direct script execution and importlib-based tests.
+    from experiment_manifest import finalize_experiment_manifest, write_experiment_manifest
+    from project_config import ProjectConfig, absolute_project_path, load_project_config
 
 
 @dataclass(frozen=True, order=True)
@@ -145,6 +167,216 @@ RECOVERY_PREDICTION_MODES = (
     "backward_extrapolation",
 )
 
+_PAIRED_ROOT_PER_STATE_BRANCHES = (
+    "volume_id",
+    "layer_id",
+    "module_id",
+    "pathLength",
+    "l_x_hit",
+    "l_y_hit",
+    "eLOC0_smt",
+    "eLOC1_smt",
+    "g_x_smt",
+    "g_y_smt",
+    "g_z_smt",
+    "px_smt",
+    "py_smt",
+    "pz_smt",
+)
+
+
+def _flatten_jagged(array) -> np.ndarray:
+    return ak.to_numpy(ak.flatten(array, axis=None))
+
+
+def _load_recovery_branch(
+    path: str | Path,
+    geometry: NominalGeometry,
+    target_layers: tuple[tuple[int, int], ...],
+) -> RecoveryHitInputs:
+    """Load one branch while retaining each measurement's source state ordinal."""
+    path = Path(path)
+    with uproot.open(path) as root_file:
+        if "trackstates" not in root_file:
+            raise ValueError(f"ROOT file {path} has no 'trackstates' tree.")
+        tree = root_file["trackstates"]
+        required = (*_PAIRED_ROOT_PER_STATE_BRANCHES, "err_x_hit", "err_y_hit", "event_nr", "track_nr")
+        missing = [name for name in required if name not in tree]
+        if missing:
+            raise ValueError(f"ROOT trackstates is missing required branches: {missing}")
+        arrays = tree.arrays(_PAIRED_ROOT_PER_STATE_BRANCHES, library="ak")
+        errors_x = tree["err_x_hit"].array(library="ak")
+        errors_y = tree["err_y_hit"].array(library="ak")
+        events = ak.to_numpy(tree["event_nr"].array(library="ak"))
+        tracks = ak.to_numpy(tree["track_nr"].array(library="ak"))
+
+    counts = ak.to_numpy(ak.num(arrays["volume_id"], axis=1))
+    if len(events) != len(counts) or len(tracks) != len(counts):
+        raise ValueError("event_nr/track_nr entries do not align with jagged state entries.")
+    for name in _PAIRED_ROOT_PER_STATE_BRANCHES:
+        branch_counts = ak.to_numpy(ak.num(arrays[name], axis=1))
+        if not np.array_equal(branch_counts, counts):
+            raise ValueError(f"ROOT branch {name} does not align with per-track state counts.")
+
+    flat = {name: _flatten_jagged(arrays[name]) for name in _PAIRED_ROOT_PER_STATE_BRANCHES}
+    flat["err_x_hit"], flat["err_y_hit"] = expand_measurement_errors(
+        arrays["l_x_hit"], errors_x, errors_y
+    )
+    flat["event_nr"] = np.repeat(events, counts)
+    flat["track_nr"] = np.repeat(tracks, counts)
+    flat["occurrence"] = np.concatenate(
+        [np.arange(int(count), dtype=np.int64) for count in counts]
+    ) if len(counts) else np.asarray([], dtype=np.int64)
+
+    measured = np.isfinite(flat["l_x_hit"])
+    if not measured.any():
+        raise ValueError("No measured states with finite l_x_hit are available.")
+    module = flat["module_id"].astype(np.int64)
+    if (measured & (module <= 0)).any():
+        raise ValueError("Measured states must have positive module IDs.")
+    invalid_x = measured & (~np.isfinite(flat["err_x_hit"]) | (flat["err_x_hit"] <= 0))
+    if invalid_x.any():
+        raise ValueError("Measured states have invalid err_x_hit values.")
+    required_finite = (
+        "eLOC0_smt", "eLOC1_smt", "g_x_smt", "g_y_smt", "g_z_smt",
+        "px_smt", "py_smt", "pz_smt", "pathLength",
+    )
+    if any((measured & ~np.isfinite(flat[name])).any() for name in required_finite):
+        raise ValueError("Measured states contain non-finite SMT or path values.")
+
+    keep = np.flatnonzero(measured)
+    loc1 = (
+        np.isfinite(flat["l_y_hit"][keep])
+        & np.isfinite(flat["err_y_hit"][keep])
+        & (flat["err_y_hit"][keep] > 0)
+    )
+    keys = [
+        (int(flat["volume_id"][index]), int(flat["layer_id"][index]), int(module[index]))
+        for index in keep
+    ]
+    missing_surfaces = sorted({key for key in keys if key not in geometry.id_to_idx})
+    if missing_surfaces:
+        raise ValueError(
+            "Measured states reference surfaces absent from branch geometry; "
+            f"examples: {missing_surfaces[:5]}."
+        )
+
+    def matrix(names: tuple[str, ...]) -> torch.Tensor:
+        return torch.tensor(
+            np.column_stack([flat[name][keep] for name in names]), dtype=torch.float64
+        )
+
+    event_tensor = torch.tensor(flat["event_nr"][keep], dtype=torch.long)
+    track_tensor = torch.tensor(flat["track_nr"][keep], dtype=torch.long)
+    volume_tensor = torch.tensor(flat["volume_id"][keep], dtype=torch.long)
+    layer_tensor = torch.tensor(flat["layer_id"][keep], dtype=torch.long)
+    module_tensor = torch.tensor(module[keep], dtype=torch.long)
+    occurrence_tensor = torch.tensor(flat["occurrence"][keep], dtype=torch.long)
+    measured_y = np.where(loc1, flat["l_y_hit"][keep], 0.0)
+    variance_y = np.where(loc1, np.square(flat["err_y_hit"][keep]), 1.0)
+    return RecoveryHitInputs(
+        identities=build_hit_identities(
+            event_tensor,
+            track_tensor,
+            volume_tensor,
+            layer_tensor,
+            module_tensor,
+            occurrence_tensor,
+        ),
+        measured_local=torch.tensor(
+            np.column_stack((flat["l_x_hit"][keep], measured_y)), dtype=torch.float64
+        ),
+        measurement_variance=torch.tensor(
+            np.column_stack((np.square(flat["err_x_hit"][keep]), variance_y)),
+            dtype=torch.float64,
+        ),
+        component_mask=torch.tensor(
+            np.column_stack((np.ones(len(keep), dtype=bool), loc1)), dtype=torch.bool
+        ),
+        smt_local=matrix(("eLOC0_smt", "eLOC1_smt")),
+        global_positions=matrix(("g_x_smt", "g_y_smt", "g_z_smt")),
+        directions=matrix(("px_smt", "py_smt", "pz_smt")),
+        sensor_idx=torch.tensor([geometry.id_to_idx[key] for key in keys], dtype=torch.long),
+        target_mask=torch.tensor(
+            [(key[0], key[1]) in target_layers for key in keys], dtype=torch.bool
+        ),
+        path_length=torch.tensor(flat["pathLength"][keep], dtype=torch.float64),
+    )
+
+
+def _select_recovery_hits(inputs: RecoveryHitInputs, selected: torch.Tensor) -> RecoveryHitInputs:
+    indices = selected.nonzero(as_tuple=False).flatten()
+    return replace(
+        inputs,
+        identities=tuple(inputs.identities[index] for index in indices.tolist()),
+        measured_local=inputs.measured_local[indices],
+        measurement_variance=inputs.measurement_variance[indices],
+        component_mask=inputs.component_mask[indices],
+        smt_local=inputs.smt_local[indices],
+        global_positions=inputs.global_positions[indices],
+        directions=inputs.directions[indices],
+        sensor_idx=inputs.sensor_idx[indices],
+        target_mask=inputs.target_mask[indices],
+        path_length=inputs.path_length[indices],
+    )
+
+
+def load_paired_recovery_inputs(
+    nominal_states: str | Path,
+    misaligned_states: str | Path,
+    nominal_geometry: str | Path,
+    misaligned_geometry: str | Path,
+    *,
+    target_layers: tuple[tuple[int, int], ...],
+    event_partition: str = "validation",
+    event_split_seed: int = DEFAULT_SPLIT_SEED,
+    max_tracks: int = 0,
+) -> tuple[RecoveryHitInputs, RecoveryHitInputs]:
+    """Load, validate, partition, and deterministically cap a paired ROOT cohort."""
+    if event_partition not in (*PARTITIONS, "all"):
+        raise ValueError(f"Unknown event partition {event_partition!r}.")
+    if max_tracks < 0:
+        raise ValueError("max_tracks must be non-negative.")
+    target_layers = tuple((int(volume), int(layer)) for volume, layer in target_layers)
+    if not target_layers or len(set(target_layers)) != len(target_layers):
+        raise ValueError("target_layers must be non-empty and unique.")
+    nominal_geometry_data = load_nominal_geometry(nominal_geometry)
+    misaligned_geometry_data = load_nominal_geometry(misaligned_geometry)
+    nominal_keys = set(nominal_geometry_data.id_to_idx)
+    misaligned_keys = set(misaligned_geometry_data.id_to_idx)
+    if misaligned_keys != nominal_keys:
+        if not misaligned_keys.issubset(nominal_keys):
+            extras = sorted(misaligned_keys - nominal_keys)[:5]
+            raise ValueError(f"Misaligned geometry contains surfaces absent from nominal: {extras}.")
+        misaligned_geometry_data = load_working_geometry(misaligned_geometry, nominal_geometry)
+    nominal = _canonicalize(
+        _load_recovery_branch(nominal_states, nominal_geometry_data, target_layers)
+    )
+    misaligned = _canonicalize(
+        _load_recovery_branch(
+            misaligned_states, misaligned_geometry_data, target_layers
+        )
+    )
+    _require_paired_contract(nominal, misaligned)
+
+    events = np.asarray([identity.event_nr for identity in nominal.identities], dtype=np.int64)
+    selected = np.ones(len(events), dtype=bool)
+    if event_partition != "all":
+        selected &= event_partition_mask(events, event_partition, event_split_seed)
+    tracks = sorted(
+        {(identity.event_nr, identity.track_nr) for identity, use in zip(nominal.identities, selected) if use}
+    )
+    if max_tracks:
+        tracks = tracks[:max_tracks]
+    selected_tracks = set(tracks)
+    selected &= np.asarray(
+        [(identity.event_nr, identity.track_nr) in selected_tracks for identity in nominal.identities]
+    )
+    if not selected.any():
+        raise ValueError("No paired measured states remain after partition and track filtering.")
+    mask = torch.tensor(selected, dtype=torch.bool)
+    return _select_recovery_hits(nominal, mask), _select_recovery_hits(misaligned, mask)
+
 
 def build_hit_identities(
     event_nr: torch.Tensor,
@@ -255,6 +487,10 @@ def _require_paired_contract(
         raise ValueError("paired inputs have different target masks; refusing to shrink an arm.")
     if not torch.equal(nominal.component_mask, misaligned.component_mask):
         raise ValueError("paired inputs have different component availability; refusing to shrink an arm.")
+    if not torch.equal(nominal.measured_local, misaligned.measured_local):
+        raise ValueError("paired inputs have different measurement coordinates; refusing to pair states.")
+    if not torch.equal(nominal.measurement_variance, misaligned.measurement_variance):
+        raise ValueError("paired inputs have different measurement uncertainties; refusing to pair states.")
 
 
 def _probe_mode(probe_path: float, non_target_paths: torch.Tensor) -> str:
@@ -534,6 +770,7 @@ def _cluster_bootstrap_ci(
     event_ids: np.ndarray,
     statistic,
     rng: np.random.Generator,
+    n_replicates: int = BOOTSTRAP_REPLICATES,
 ) -> dict[str, float | None]:
     """Percentile CI from whole-event resampling, never global NumPy state.
 
@@ -550,7 +787,7 @@ def _cluster_bootstrap_ci(
             "low": None,
             "high": None,
             "valid": False,
-            "n_requested_resamples": BOOTSTRAP_REPLICATES,
+            "n_requested_resamples": n_replicates,
             "n_finite_resamples": 0,
         }
     _events, inverse = np.unique(event_ids, return_inverse=True)
@@ -558,10 +795,10 @@ def _cluster_bootstrap_ci(
     count = np.bincount(inverse, minlength=n_events).astype(np.float64)
     first_by_event = np.bincount(inverse, weights=first, minlength=n_events)
     second_by_event = np.bincount(inverse, weights=second, minlength=n_events)
-    samples = np.empty(BOOTSTRAP_REPLICATES, dtype=np.float64)
+    samples = np.empty(n_replicates, dtype=np.float64)
     # Chunking bounds temporary allocation when a group spans many events.
-    for start in range(0, BOOTSTRAP_REPLICATES, 64):
-        stop = min(start + 64, BOOTSTRAP_REPLICATES)
+    for start in range(0, n_replicates, 64):
+        stop = min(start + 64, n_replicates)
         draws = rng.integers(0, n_events, size=(stop - start, n_events))
         with np.errstate(all="ignore"):
             samples[start:stop] = statistic(
@@ -570,12 +807,12 @@ def _cluster_bootstrap_ci(
                 count[draws].sum(axis=1),
             )
     finite = samples[np.isfinite(samples)]
-    valid = finite.size == BOOTSTRAP_REPLICATES
+    valid = finite.size == n_replicates
     return {
         "low": _json_number(np.percentile(finite, 2.5)) if valid else None,
         "high": _json_number(np.percentile(finite, 97.5)) if valid else None,
         "valid": bool(valid),
-        "n_requested_resamples": BOOTSTRAP_REPLICATES,
+        "n_requested_resamples": n_replicates,
         "n_finite_resamples": int(finite.size),
     }
 
@@ -708,6 +945,7 @@ def _group_statistics(
     component: int,
     event_ids: np.ndarray,
     rng: np.random.Generator,
+    bootstrap_replicates: int,
 ) -> dict[str, object]:
     selection = np.flatnonzero(shared)
     entry: dict[str, object] = {
@@ -731,13 +969,16 @@ def _group_statistics(
                 "rho_branch_difference_rms_per_mm": None,
                 "rho_branch_difference_bias_per_mm": None,
                 "recovery_ratio_q_ci95": _cluster_bootstrap_ci(
-                    np.array([]), np.array([]), np.array([], dtype=np.int64), lambda *_: float("nan"), rng
+                    np.array([]), np.array([]), np.array([], dtype=np.int64), lambda *_: float("nan"), rng,
+                    bootstrap_replicates,
                 ),
                 "practical_equivalence_ratio_ci95": _cluster_bootstrap_ci(
-                    np.array([]), np.array([]), np.array([], dtype=np.int64), lambda *_: float("nan"), rng
+                    np.array([]), np.array([]), np.array([], dtype=np.int64), lambda *_: float("nan"), rng,
+                    bootstrap_replicates,
                 ),
                 "refit_branch_difference_bias_mm_ci95": _cluster_bootstrap_ci(
-                    np.array([]), np.array([]), np.array([], dtype=np.int64), lambda *_: float("nan"), rng
+                    np.array([]), np.array([]), np.array([], dtype=np.int64), lambda *_: float("nan"), rng,
+                    bootstrap_replicates,
                 ),
                 "verdict": "inconclusive",
                 "gates": {"restoration": False, "practical_equivalence": False, "bias": False},
@@ -767,10 +1008,12 @@ def _group_statistics(
         return _ratio(second_rmse, first_rmse)
 
     q_ci = _cluster_bootstrap_ci(
-        np.square(seed_difference), np.square(refit_difference), selected_events, ratio_stat, rng
+        np.square(seed_difference), np.square(refit_difference), selected_events, ratio_stat, rng,
+        bootstrap_replicates,
     )
     practical_ci = _cluster_bootstrap_ci(
-        np.square(nominal_reference), np.square(misaligned_reference), selected_events, ratio_stat, rng
+        np.square(nominal_reference), np.square(misaligned_reference), selected_events, ratio_stat, rng,
+        bootstrap_replicates,
     )
     bias_ci = _cluster_bootstrap_ci(
         refit_difference, np.zeros_like(refit_difference), selected_events,
@@ -781,6 +1024,7 @@ def _group_statistics(
             where=np.asarray(count) > 0,
         ),
         rng,
+        bootstrap_replicates,
     )
     entry.update(
         {
@@ -874,13 +1118,25 @@ def _per_row_table(report: FourArmRecovery, values_by_exposure: dict[str, dict[s
     return rows
 
 
-def summarize_four_arm_recovery(report: FourArmRecovery) -> dict[str, object]:
+def summarize_four_arm_recovery(
+    report: FourArmRecovery,
+    *,
+    bootstrap_replicates: int = BOOTSTRAP_REPLICATES,
+    bootstrap_seed: int = BOOTSTRAP_SEED,
+    exposures: tuple[str, ...] = ("protected", "exposed"),
+) -> dict[str, object]:
     """Compute paired recovery metrics, event-cluster CIs, verdicts, and rows.
 
     This function intentionally has no filesystem side effects.  Task 3 owns
     JSON/CSV/plot emission and manifest lifecycle; keeping this boundary pure
     lets the statistical contract be exercised without ACTS or ROOT.
     """
+    if bootstrap_replicates < 1:
+        raise ValueError("bootstrap_replicates must be positive.")
+    if not exposures or len(set(exposures)) != len(exposures) or any(
+        exposure not in {"protected", "exposed"} for exposure in exposures
+    ):
+        raise ValueError("exposures must be a non-empty unique selection of protected/exposed.")
     cohort = report.cohort
     columns = _probe_columns(cohort)
     row_indices = cohort.row_indices[torch.arange(cohort.n_rows), columns]
@@ -890,7 +1146,7 @@ def summarize_four_arm_recovery(report: FourArmRecovery) -> dict[str, object]:
     modes = np.asarray(cohort.probe_mode, dtype=object)
     availability = cohort.nominal.component_mask[row_indices].detach().cpu().numpy()
     numerical: dict[str, dict[str, object]] = {}
-    for exposure in ("protected", "exposed"):
+    for exposure in exposures:
         for branch in ("nominal", "misaligned"):
             arm = report.arms.get((branch, exposure))
             if arm is None:
@@ -901,8 +1157,8 @@ def summarize_four_arm_recovery(report: FourArmRecovery) -> dict[str, object]:
             numerical[f"{branch}|{exposure}|refit"] = _stationarity_valid(
                 arm.gauss_newton.diagnostics, stage="refit"
             )
-    rng = np.random.default_rng(BOOTSTRAP_SEED)
-    exposure_values = {exposure: _probe_observables(report, exposure) for exposure in ("protected", "exposed")}
+    rng = np.random.default_rng(bootstrap_seed)
+    exposure_values = {exposure: _probe_observables(report, exposure) for exposure in exposures}
     exposure_report: dict[str, dict[str, object]] = {}
     target_layers = {
         (identity.volume_id, identity.layer_id)
@@ -913,7 +1169,7 @@ def summarize_four_arm_recovery(report: FourArmRecovery) -> dict[str, object]:
     }
     if not target_layers:
         raise ValueError("Frozen recovery cohort has no target-layer identities.")
-    for exposure in ("protected", "exposed"):
+    for exposure in exposures:
         values = exposure_values[exposure]
         groups: dict[str, dict[str, object]] = {}
         for volume, layer in sorted(target_layers):
@@ -923,7 +1179,8 @@ def summarize_four_arm_recovery(report: FourArmRecovery) -> dict[str, object]:
                     requested = in_group & availability[:, component]
                     shared = in_group & _shared_component_mask(availability[:, component], values, component)
                     groups[f"{volume}:{layer}|{mode}|{name}"] = _group_statistics(
-                        requested, shared, values, component, event_ids, rng
+                        requested, shared, values, component, event_ids, rng,
+                        bootstrap_replicates,
                     )
         numerical_ok = all(
             bool(numerical[f"{branch}|{exposure}|{stage}"]["valid"])
@@ -940,10 +1197,379 @@ def summarize_four_arm_recovery(report: FourArmRecovery) -> dict[str, object]:
         )
         exposure_report[exposure] = {"verdict": verdict, "groups": groups}
     return {
-        "bootstrap": {"replicates": BOOTSTRAP_REPLICATES, "seed": BOOTSTRAP_SEED},
+        "bootstrap": {"replicates": bootstrap_replicates, "seed": bootstrap_seed},
         "minimum_valid_components": MIN_VALID_COMPONENTS,
         "absolute_detector_thresholds_diagnostic_only": ABSOLUTE_DETECTOR_THRESHOLDS,
         "numerical_validity": numerical,
         "exposures": exposure_report,
         "per_row": _per_row_table(report, exposure_values),
     }
+
+
+def _parse_cli_layers(value: str) -> tuple[tuple[int, int], ...]:
+    layers: list[tuple[int, int]] = []
+    for item in value.split(","):
+        try:
+            volume_text, layer_text = item.strip().split(":", maxsplit=1)
+            layer = (int(volume_text), int(layer_text))
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(
+                "target layers must use comma-separated positive volume:layer values"
+            ) from error
+        if layer[0] <= 0 or layer[1] <= 0:
+            raise argparse.ArgumentTypeError("target layers must be positive")
+        layers.append(layer)
+    if not layers or len(set(layers)) != len(layers):
+        raise argparse.ArgumentTypeError("target layers must be non-empty and unique")
+    return tuple(layers)
+
+
+def _default_cli_paths(config: ProjectConfig) -> dict[str, str]:
+    suffix = config.target_layer_suffix
+    target = config.target_layer_dir
+    return {
+        "nominal_states": str(
+            config.data_root / "reconstruction" / "nominal" / target / f"trackstates_kf_{suffix}.root"
+        ),
+        "misaligned_states": str(
+            config.data_root / "reconstruction" / "misaligned" / target / f"trackstates_kf_{suffix}.root"
+        ),
+        "nominal_geometry": str(config.data_root / "geometry" / "odd_transforms.json"),
+        "misaligned_geometry": str(
+            config.data_root / "alignment" / target / f"misalignment_applied_{suffix}.json"
+        ),
+        "output_dir": str(config.data_root / "experiments" / "helix_recovery" / target),
+    }
+
+
+def build_argument_parser(config: ProjectConfig | None = None) -> argparse.ArgumentParser:
+    config = config or load_project_config()
+    defaults = _default_cli_paths(config)
+    parser = argparse.ArgumentParser(
+        description="Compare nominal and misaligned helix recovery on one strictly paired cohort."
+    )
+    parser.add_argument("--nominal-states", type=absolute_project_path, default=defaults["nominal_states"])
+    parser.add_argument("--misaligned-states", type=absolute_project_path, default=defaults["misaligned_states"])
+    parser.add_argument("--nominal-geometry", type=absolute_project_path, default=defaults["nominal_geometry"])
+    parser.add_argument("--misaligned-geometry", type=absolute_project_path, default=defaults["misaligned_geometry"])
+    parser.add_argument("--target-layers", type=_parse_cli_layers, default=config.target_layers)
+    parser.add_argument(
+        "--event-partition", choices=(*PARTITIONS, "all"), default="validation"
+    )
+    parser.add_argument("--event-split-seed", type=int, default=DEFAULT_SPLIT_SEED)
+    parser.add_argument("--exposure", choices=("both", "protected", "exposed"), default="both")
+    parser.add_argument("--max-tracks", type=int, default=0)
+    parser.add_argument("--output-dir", type=absolute_project_path, default=defaults["output_dir"])
+    parser.add_argument("--seed-iters", type=int, default=200)
+    parser.add_argument("--refit-iters", type=int, default=60)
+    parser.add_argument("--bootstrap-replicates", type=int, default=BOOTSTRAP_REPLICATES)
+    parser.add_argument("--bootstrap-seed", type=int, default=BOOTSTRAP_SEED)
+    parser.add_argument("--gpu", action="store_true")
+    parser.add_argument("--config", help="Path to a TOML project configuration override.")
+    return parser
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+    ) as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True, allow_nan=False)
+        stream.write("\n")
+        temporary = Path(stream.name)
+    temporary.replace(path)
+
+
+def _atomic_write_csv(path: Path, rows: list[dict], fieldnames: tuple[str, ...] | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if fieldnames is None:
+        fieldnames = tuple(rows[0]) if rows else ()
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", newline="", dir=path.parent,
+        prefix=f".{path.name}.", suffix=".tmp", delete=False,
+    ) as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+        temporary = Path(stream.name)
+    temporary.replace(path)
+
+
+def _plot_paths(output_dir: Path, exposures: tuple[str, ...]) -> dict[str, Path]:
+    result: dict[str, Path] = {}
+    for exposure in exposures:
+        result[f"seed_vs_refit_paired_difference_{exposure}"] = (
+            output_dir / f"seed_vs_refit_paired_difference_{exposure}.png"
+        )
+        result[f"refit_difference_distribution_{exposure}"] = (
+            output_dir / f"refit_difference_distribution_{exposure}.png"
+        )
+        result[f"grouped_recovery_ratios_{exposure}"] = (
+            output_dir / f"grouped_recovery_ratios_{exposure}.png"
+        )
+    return result
+
+
+def _save_figure_atomic(figure, path: Path) -> None:
+    with tempfile.NamedTemporaryFile(
+        "wb", dir=path.parent, prefix=f".{path.name}.", suffix=".png", delete=False
+    ) as stream:
+        temporary = Path(stream.name)
+    try:
+        figure.savefig(temporary, dpi=140, bbox_inches="tight")
+        temporary.replace(path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def write_diagnostic_plots(
+    output_dir: Path,
+    statistics: dict[str, object],
+    exposures: tuple[str, ...],
+) -> dict[str, Path]:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    paths = _plot_paths(output_dir, exposures)
+    rows = statistics["per_row"]
+    figures = []
+    try:
+        for exposure in exposures:
+            seed_values: list[float] = []
+            refit_values: list[float] = []
+            for row in rows:
+                for component in ("LOC0", "LOC1"):
+                    if not row.get(f"shared_valid_{exposure}_{component}", False):
+                        continue
+                    seed_values.append(
+                        row[f"{exposure}_misaligned_seed_{component}_mm"]
+                        - row[f"{exposure}_nominal_seed_{component}_mm"]
+                    )
+                    refit_values.append(
+                        row[f"{exposure}_misaligned_refit_{component}_mm"]
+                        - row[f"{exposure}_nominal_refit_{component}_mm"]
+                    )
+
+            figure, axis = plt.subplots(figsize=(6.4, 4.8))
+            figures.append(figure)
+            axis.scatter(seed_values, refit_values, s=10, alpha=0.55)
+            axis.axhline(0.0, color="black", linewidth=0.8)
+            axis.axvline(0.0, color="black", linewidth=0.8)
+            axis.set(xlabel="seed branch difference [mm]", ylabel="refit branch difference [mm]", title=f"{exposure}: seed vs refit")
+            _save_figure_atomic(figure, paths[f"seed_vs_refit_paired_difference_{exposure}"])
+            plt.close(figure)
+            figures.remove(figure)
+
+            figure, axis = plt.subplots(figsize=(6.4, 4.8))
+            figures.append(figure)
+            axis.hist(refit_values, bins=min(40, max(5, len(refit_values))), alpha=0.75)
+            axis.set(xlabel="refit branch difference [mm]", ylabel="components", title=f"{exposure}: refit differences")
+            _save_figure_atomic(figure, paths[f"refit_difference_distribution_{exposure}"])
+            plt.close(figure)
+            figures.remove(figure)
+
+            groups = statistics["exposures"][exposure]["groups"]
+            labels = [name for name, group in groups.items() if group["recovery_ratio_q"] is not None]
+            ratios = [groups[name]["recovery_ratio_q"] for name in labels]
+            figure, axis = plt.subplots(figsize=(max(7.0, len(labels) * 0.45), 4.8))
+            figures.append(figure)
+            axis.bar(range(len(labels)), ratios)
+            axis.axhline(1.0, color="black", linestyle="--", linewidth=0.8)
+            axis.set_xticks(range(len(labels)), labels, rotation=75, ha="right")
+            axis.set(ylabel="recovery ratio Q", title=f"{exposure}: grouped recovery")
+            _save_figure_atomic(figure, paths[f"grouped_recovery_ratios_{exposure}"])
+            plt.close(figure)
+            figures.remove(figure)
+    finally:
+        for figure in figures:
+            plt.close(figure)
+    return paths
+
+
+def _selected_exposures(value: str) -> tuple[str, ...]:
+    return ("protected", "exposed") if value == "both" else (value,)
+
+
+def _effective_experiment_config(args, *, device: torch.device, dtype: torch.dtype) -> dict[str, object]:
+    return {
+        "nominal_states": args.nominal_states,
+        "misaligned_states": args.misaligned_states,
+        "nominal_geometry": args.nominal_geometry,
+        "misaligned_geometry": args.misaligned_geometry,
+        "target_layers": [f"{volume}:{layer}" for volume, layer in args.target_layers],
+        "event_partition": args.event_partition,
+        "event_split_seed": args.event_split_seed,
+        "exposures": list(_selected_exposures(args.exposure)),
+        "max_tracks": args.max_tracks,
+        "seed_iterations": args.seed_iters,
+        "refit_iterations": args.refit_iters,
+        "bootstrap_replicates": args.bootstrap_replicates,
+        "bootstrap_seed": args.bootstrap_seed,
+        "gpu_requested": bool(args.gpu),
+        "device": str(device),
+        "dtype": str(dtype).removeprefix("torch."),
+    }
+
+
+def _cohort_counts(nominal: RecoveryHitInputs, cohort: PairedRecoveryCohort) -> dict[str, object]:
+    tracks = {(identity.event_nr, identity.track_nr) for identity in nominal.identities}
+    return {
+        "paired_measured_hits": len(nominal.identities),
+        "paired_unique_tracks": len(tracks),
+        "paired_target_hits": int(nominal.target_mask.sum()),
+        "frozen_probe_rows": cohort.n_rows,
+        "prediction_modes": dict(sorted(Counter(cohort.probe_mode).items())),
+    }
+
+
+def _output_paths(output_dir: Path, exposures: tuple[str, ...]) -> dict[str, Path]:
+    return {
+        "paired_track_keys": output_dir / "paired_track_keys.csv",
+        "per_track_stage_metrics": output_dir / "per_track_stage_metrics.csv",
+        "summary": output_dir / "helix_recovery_summary.json",
+        **_plot_paths(output_dir, exposures),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_arguments = list(sys.argv[1:] if argv is None else argv)
+    config_probe = argparse.ArgumentParser(add_help=False)
+    config_probe.add_argument("--config")
+    requested_config, _unknown = config_probe.parse_known_args(raw_arguments)
+    config = load_project_config(requested_config.config)
+    args = build_argument_parser(config).parse_args(raw_arguments)
+    if args.max_tracks < 0:
+        raise ValueError("--max-tracks must be non-negative")
+    if args.seed_iters < 1 or args.refit_iters < 1 or args.bootstrap_replicates < 1:
+        raise ValueError("iteration and bootstrap budgets must be positive")
+
+    exposures = _selected_exposures(args.exposure)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    outputs = _output_paths(output_dir, exposures)
+    inputs = {
+        "nominal_trackstates": args.nominal_states,
+        "misaligned_trackstates": args.misaligned_states,
+        "nominal_geometry": args.nominal_geometry,
+        "misaligned_geometry": args.misaligned_geometry,
+    }
+    use_cuda = bool(args.gpu and torch.cuda.is_available())
+    if args.gpu and not use_cuda:
+        print("[warn] --gpu requested but CUDA is unavailable; using CPU float64.", file=sys.stderr)
+    device = torch.device("cuda" if use_cuda else "cpu")
+    dtype = torch.float32 if use_cuda else torch.float64
+    effective = _effective_experiment_config(args, device=device, dtype=dtype)
+    command = [sys.executable, str(Path(__file__).resolve()), *raw_arguments]
+    try:
+        manifest_path = write_experiment_manifest(
+            output_dir,
+            run_id=output_dir.name or "helix-recovery",
+            command=command,
+            config=config,
+            inputs=inputs,
+            outputs=outputs,
+            metrics={"effective_experiment_config": effective},
+            status="running",
+        )
+    except Exception as error:
+        print(f"Helix recovery failed before manifest creation: {error}", file=sys.stderr)
+        return 1
+
+    try:
+        nominal, misaligned = load_paired_recovery_inputs(
+            args.nominal_states,
+            args.misaligned_states,
+            args.nominal_geometry,
+            args.misaligned_geometry,
+            target_layers=args.target_layers,
+            event_partition=args.event_partition,
+            event_split_seed=args.event_split_seed,
+            max_tracks=args.max_tracks,
+        )
+        cohort = freeze_paired_cohort(nominal, misaligned)
+        nominal_geometry = load_nominal_geometry(args.nominal_geometry)
+        misaligned_geometry = load_nominal_geometry(args.misaligned_geometry)
+        if set(misaligned_geometry.id_to_idx) != set(nominal_geometry.id_to_idx):
+            misaligned_geometry = load_working_geometry(
+                args.misaligned_geometry, args.nominal_geometry
+            )
+        report = run_four_arm_recovery(
+            cohort,
+            nominal_geometry=nominal_geometry,
+            misaligned_geometry=misaligned_geometry,
+            seed_iterations=args.seed_iters,
+            refit_iterations=args.refit_iters,
+            device=device,
+            dtype=dtype,
+        )
+        statistics = summarize_four_arm_recovery(
+            report,
+            bootstrap_replicates=args.bootstrap_replicates,
+            bootstrap_seed=args.bootstrap_seed,
+            exposures=exposures,
+        )
+        counts = _cohort_counts(nominal, cohort)
+        verdicts = {
+            exposure: statistics["exposures"][exposure]["verdict"]
+            for exposure in exposures
+        }
+        summary = {
+            "schema_version": 1,
+            "effective_experiment_config": effective,
+            "cohort_counts": counts,
+            "bootstrap": statistics["bootstrap"],
+            "minimum_valid_components": statistics["minimum_valid_components"],
+            "absolute_detector_thresholds_diagnostic_only": statistics[
+                "absolute_detector_thresholds_diagnostic_only"
+            ],
+            "numerical_validity": statistics["numerical_validity"],
+            "exposures": statistics["exposures"],
+            "verdicts": verdicts,
+        }
+        keys = [
+            {
+                name: row[name]
+                for name in (
+                    "event_nr", "track_nr", "volume_id", "layer_id", "module_id",
+                    "occurrence", "prediction_mode",
+                )
+            }
+            for row in statistics["per_row"]
+        ]
+        _atomic_write_csv(
+            outputs["paired_track_keys"],
+            keys,
+            ("event_nr", "track_nr", "volume_id", "layer_id", "module_id", "occurrence", "prediction_mode"),
+        )
+        _atomic_write_csv(outputs["per_track_stage_metrics"], statistics["per_row"])
+        _atomic_write_json(outputs["summary"], summary)
+        plot_outputs = write_diagnostic_plots(output_dir, statistics, exposures)
+        finalize_experiment_manifest(
+            manifest_path,
+            status="completed",
+            outputs={**outputs, **plot_outputs},
+            metrics={
+                "effective_experiment_config": effective,
+                "cohort_counts": counts,
+                "bootstrap": statistics["bootstrap"],
+                "verdicts": verdicts,
+                "numerical_validity": statistics["numerical_validity"],
+            },
+        )
+    except Exception as error:
+        finalize_experiment_manifest(
+            manifest_path, status="failed", metrics={"failure_reason": str(error)}
+        )
+        print(f"Helix recovery failed: {error}", file=sys.stderr)
+        return 1
+
+    print(f"Helix recovery outputs: {output_dir}")
+    print(f"Manifest: {manifest_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

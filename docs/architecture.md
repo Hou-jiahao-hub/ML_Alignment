@@ -27,6 +27,7 @@ simulation -> ROOT/geometry JSON -> loaders -> solver -> aligned geometry
 | `ml_alignment_helix.py` | Frozen-helix holdout alignment | None |
 | `material_artifact.py` | Per-track material-node artifact from ACTS ROOT output | None |
 | `validate_helix_model.py` | Holdout validation, acceptance gates, paired single/broken-helix comparison | None |
+| `compare_helix_recovery.py` | Paired nominal/misaligned helix seed-to-refit recovery diagnostic | None |
 | `reconstruction_acceptance.py` | Reconstructed measurement/smoothed-state chi2 acceptance | None |
 | `plot_*.py` | Residual, chi2/NDF, and hit diagnostics | ROOT/uproot |
 | `experiment_manifest.py` | Reproducibility metadata and input hashes | None |
@@ -79,6 +80,7 @@ data/
     iterative_ml/
     surface_helix/
     helix_validation/
+    helix_recovery/
     material/
     ablation/
   archive/                  historical logs, figures, and retired artifacts
@@ -189,6 +191,33 @@ shared; the count is gated by `MAX_RANK_DEFICIENT_ROW_FRACTION` so a silently
 shrinking row set cannot pass as a result. On the full 20000-event set exactly
 one row of 70352 qualifies -- a single-arm fit with 4 hits against 5 gauge-fixed
 parameters. Passing a single such matrix, rather than a batch, still raises.
+
+## Paired helix-recovery diagnostic
+
+`compare_helix_recovery.py` tests whether the shared standalone helix machinery
+actually removes a branch-dependent geometry effect. It loads nominal and
+misaligned `trackstates` together with uproot and assigns every measured hit its
+original per-track jagged state ordinal. Before event splitting or track limits,
+the loader requires identical event/track/state identities, measurements,
+measurement uncertainties, target membership, and LOC availability. It never
+intersects mismatched files. SMT local/global positions, directions, and sensor
+indices remain branch-local; both fitted branches are evaluated on nominal
+surfaces for the final paired comparison.
+
+Each retained target hit becomes one frozen probe row. The protected exposure
+fits only non-target measurements, while the exposed exposure additionally fits
+that row's probe. Both nominal and misaligned branches run the same LM seed and
+Gauss--Newton measurement refit, forming four independently reported arms.
+Event-cluster bootstraps and numerical-stationarity checks produce separate
+protected/exposed verdicts; a scientific `failed` or `inconclusive` verdict is a
+completed experiment rather than a runtime failure.
+
+Every run starts `manifest.json` before ROOT loading and writes
+`paired_track_keys.csv`, flattened `per_track_stage_metrics.csv`, a strict-JSON
+`helix_recovery_summary.json`, and three diagnostic PNGs per requested exposure.
+The manifest hashes both ROOT and both geometry inputs and is finalized on both
+normal and exceptional exits. Runnable smoke and partitioned examples are in
+[`docs/helix-recovery.md`](helix-recovery.md).
 
 ## Input/output contracts
 

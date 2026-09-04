@@ -53,6 +53,7 @@ versioned default configuration.
 | Iterative experiment | Misaligned or prior-iteration geometry and ROOT files | Geometry, aligned reconstruction ROOT files, plots, and logs under `data/experiments/iterative_ml/<target>` |
 | Surface/helix experiment | Nominal and candidate ROOT files plus geometry JSON | Run-tagged geometry, summaries, ROOT files, and logs under `data/experiments/surface_helix/<target>/<run_tag>` |
 | Helix validation | Nominal trackstates and geometry JSON | `helix_validation_summary.json`, `helix_measurement_comparison.csv`, compatibility `helix_smt_comparison.csv`, `manifest.json`, and `plots/*.png` under `data/experiments/helix_validation/<target>` |
+| Paired helix recovery | Nominal/misaligned trackstates and their geometry JSON files | Paired keys, per-row stage metrics, strict-JSON summary, exposure plots, and `manifest.json` under `data/experiments/helix_recovery/<target>/<run>`; see [helix-recovery.md](helix-recovery.md) |
 
 The inventory command publishes concrete default paths and absolute templates
 containing `{run_tag}`, `{iteration}`, `{axis}`, or `{layer}` for dynamic files.
