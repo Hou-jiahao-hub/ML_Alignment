@@ -524,11 +524,14 @@ def test_bootstrap_refuses_a_gate_when_some_event_resamples_have_zero_denominato
 
 
 @pytest.mark.parametrize(
-    ("misaligned_refit", "expected_practical", "expected_bias"),
-    ((1.10, True, True), (1.1001, False, False)),
+    ("misaligned_refit", "expected_practical"),
+    (
+        (1.10, True),
+        (np.nextafter(1.10, np.inf), False),
+    ),
 )
-def test_recovery_statistics_enforce_practical_and_bias_gate_boundaries(
-    misaligned_refit, expected_practical, expected_bias
+def test_recovery_statistics_practical_gate_uses_exact_inclusive_boundary(
+    misaligned_refit, expected_practical
 ):
     m = load_module()
     report = _four_arm_statistics_fixture(m)
@@ -551,4 +554,72 @@ def test_recovery_statistics_enforce_practical_and_bias_gate_boundaries(
 
     group = result["exposures"]["protected"]["groups"]["17:8|interpolation|LOC0"]
     assert group["gates"]["practical_equivalence"] is expected_practical
+
+
+@pytest.mark.parametrize(
+    ("misaligned_refit", "expected_bias"),
+    (
+        (1.375, True),
+        (np.nextafter(1.375, np.inf), False),
+    ),
+)
+def test_recovery_statistics_bias_gate_uses_exact_inclusive_margin(
+    misaligned_refit, expected_bias
+):
+    m = load_module()
+    report = _four_arm_statistics_fixture(m)
+    for exposure in ("protected", "exposed"):
+        arm = report.arms[("nominal", exposure)]
+        report.arms[("nominal", exposure)] = m.replace(
+            arm,
+            gauss_newton=m.replace(
+                arm.gauss_newton,
+                evaluation=m.replace(
+                    arm.gauss_newton.evaluation,
+                    local_position=torch.full_like(
+                        arm.gauss_newton.evaluation.local_position, 1.25
+                    ),
+                ),
+            ),
+        )
+        arm = report.arms[("misaligned", exposure)]
+        report.arms[("misaligned", exposure)] = m.replace(
+            arm,
+            gauss_newton=m.replace(
+                arm.gauss_newton,
+                evaluation=m.replace(
+                    arm.gauss_newton.evaluation,
+                    local_position=torch.full_like(
+                        arm.gauss_newton.evaluation.local_position, misaligned_refit
+                    ),
+                ),
+            ),
+        )
+
+    result = m.summarize_four_arm_recovery(report)
+
+    group = result["exposures"]["protected"]["groups"]["17:8|interpolation|LOC0"]
     assert group["gates"]["bias"] is expected_bias
+
+
+def test_recovery_statistics_restoration_requires_q_strictly_below_one():
+    m = load_module()
+    report = _four_arm_statistics_fixture(m)
+    for exposure in ("protected", "exposed"):
+        arm = report.arms[("misaligned", exposure)]
+        report.arms[("misaligned", exposure)] = m.replace(
+            arm,
+            gauss_newton=m.replace(
+                arm.gauss_newton,
+                evaluation=m.replace(
+                    arm.gauss_newton.evaluation,
+                    local_position=torch.full_like(arm.gauss_newton.evaluation.local_position, 3.0),
+                ),
+            ),
+        )
+
+    result = m.summarize_four_arm_recovery(report)
+
+    group = result["exposures"]["protected"]["groups"]["17:8|interpolation|LOC0"]
+    assert group["recovery_ratio_q_ci95"]["high"] == pytest.approx(1.0)
+    assert group["gates"]["restoration"] is False

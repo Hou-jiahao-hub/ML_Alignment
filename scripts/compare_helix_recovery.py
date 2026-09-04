@@ -133,7 +133,6 @@ MIN_VALID_COMPONENTS = 200
 MAX_NON_STATIONARY_ROW_FRACTION = 0.001
 PRACTICAL_EQUIVALENCE_RATIO_LIMIT = 1.10
 BIAS_REFERENCE_FRACTION = 0.10
-GATE_FLOAT_TOLERANCE = 32.0 * np.finfo(np.float64).eps
 ABSOLUTE_DETECTOR_THRESHOLDS = {
     "pixel_local_mm": 0.05,
     "strip_LOC0_mm": 0.10,
@@ -814,7 +813,7 @@ def _group_statistics(
     equivalence = (
         practical_ci["valid"]
         and practical_ci["high"] is not None
-        and practical_ci["high"] <= PRACTICAL_EQUIVALENCE_RATIO_LIMIT + GATE_FLOAT_TOLERANCE
+        and practical_ci["high"] <= PRACTICAL_EQUIVALENCE_RATIO_LIMIT
     )
     bias_limit = BIAS_REFERENCE_FRACTION * nominal_reference_rmse
     bias = (
@@ -822,8 +821,8 @@ def _group_statistics(
         and bias_ci["valid"]
         and bias_ci["low"] is not None
         and bias_ci["high"] is not None
-        and bias_ci["low"] >= -bias_limit - GATE_FLOAT_TOLERANCE
-        and bias_ci["high"] <= bias_limit + GATE_FLOAT_TOLERANCE
+        and bias_ci["low"] >= -bias_limit
+        and bias_ci["high"] <= bias_limit
     )
     gates = {
         "restoration": bool(restoration),
