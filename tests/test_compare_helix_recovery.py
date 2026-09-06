@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import importlib.util
 import json
 import sys
@@ -37,7 +38,7 @@ def _write_geometry(path, surfaces):
     path.write_text(json.dumps(transforms), encoding="utf-8")
 
 
-def _write_trackstates(path, tracks, *, local_x_override=None):
+def _write_trackstates(path, tracks, *, local_x_override=None, err_x_override=None):
     per_state = {
         name: []
         for name in (
@@ -87,6 +88,9 @@ def _write_trackstates(path, tracks, *, local_x_override=None):
     if local_x_override is not None:
         entry, state, value = local_x_override
         per_state["l_x_hit"][entry][state] = value
+    if err_x_override is not None:
+        entry, measurement, value = err_x_override
+        per_state["err_x_hit"][entry][measurement] = value
     with uproot.recreate(path) as root_file:
         root_file["trackstates"] = {
             "event_nr": np.asarray([track[0] for track in tracks], dtype=np.int64),
@@ -121,7 +125,15 @@ def _loader_fixture(tmp_path):
         )
 
     tracks = [
-        (5, 20, [state(10, 1, 1, 0.0, 1.0), state(10, 1, 1, 1.0, 2.0)]),
+        (
+            5,
+            20,
+            [
+                state(10, 1, 1, 0.0, 1.0),
+                state(10, 1, 1, 0.5, np.nan, np.nan),
+                state(10, 1, 1, 1.0, 2.0),
+            ],
+        ),
         (5, 10, [state(10, 1, 1, 0.0, 3.0), state(17, 8, 2, 1.0, 4.0)]),
         (2, 30, [state(10, 1, 1, 0.0, 5.0), state(17, 8, 2, 1.0, 6.0)]),
     ]
@@ -193,6 +205,28 @@ def test_paired_root_loader_preserves_state_ordinal_then_partitions_and_caps_tra
     assert misaligned.sensor_idx.tolist() == [1, 0]
 
 
+def test_paired_root_loader_occurrence_is_original_jagged_state_ordinal(tmp_path):
+    m = load_module()
+    nominal_states, misaligned_states, nominal_geometry, misaligned_geometry, _tracks = (
+        _loader_fixture(tmp_path)
+    )
+
+    nominal, _misaligned = m.load_paired_recovery_inputs(
+        nominal_states,
+        misaligned_states,
+        nominal_geometry,
+        misaligned_geometry,
+        target_layers=((17, 8),),
+        event_partition="all",
+    )
+
+    duplicate_states = [
+        identity for identity in nominal.identities
+        if (identity.event_nr, identity.track_nr) == (5, 20)
+    ]
+    assert [identity.occurrence for identity in duplicate_states] == [0, 2]
+
+
 def test_paired_root_loader_refuses_measurement_mismatch_before_partition_filtering(tmp_path):
     m = load_module()
     nominal_states, misaligned_states, nominal_geometry, misaligned_geometry, tracks = (
@@ -219,11 +253,29 @@ def test_paired_root_loader_refuses_swapped_duplicate_surface_measurements(tmp_p
     )
     swapped = list(tracks)
     first = list(swapped[0][2])
-    first[0], first[1] = first[1], first[0]
+    first[0], first[2] = first[2], first[0]
     swapped[0] = (swapped[0][0], swapped[0][1], first)
     _write_trackstates(misaligned_states, swapped)
 
     with pytest.raises(ValueError, match="measurement coordinates"):
+        m.load_paired_recovery_inputs(
+            nominal_states,
+            misaligned_states,
+            nominal_geometry,
+            misaligned_geometry,
+            target_layers=((17, 8),),
+            event_partition="all",
+        )
+
+
+def test_paired_root_loader_refuses_cross_branch_variance_mismatch(tmp_path):
+    m = load_module()
+    nominal_states, misaligned_states, nominal_geometry, misaligned_geometry, tracks = (
+        _loader_fixture(tmp_path)
+    )
+    _write_trackstates(misaligned_states, tracks, err_x_override=(1, 0, 0.123))
+
+    with pytest.raises(ValueError, match="measurement uncertainties"):
         m.load_paired_recovery_inputs(
             nominal_states,
             misaligned_states,
@@ -315,13 +367,34 @@ def test_cli_writes_selected_exposure_artifacts_and_completed_manifest(tmp_path)
         "grouped_recovery_ratios_protected.png",
         "manifest.json",
     }
-    summary = json.loads((output_dir / "helix_recovery_summary.json").read_text())
+    def reject_nonfinite(value):
+        raise AssertionError(f"non-finite JSON token: {value}")
+
+    summary = json.loads(
+        (output_dir / "helix_recovery_summary.json").read_text(),
+        parse_constant=reject_nonfinite,
+    )
     assert summary["schema_version"] == 1
     assert summary["bootstrap"] == {"replicates": 7, "seed": 23}
     assert set(summary["exposures"]) == {"protected"}
     assert set(summary["verdicts"]) == {"protected"}
     assert summary["effective_experiment_config"]["max_tracks"] == 1
     assert summary["cohort_counts"]["frozen_probe_rows"] == 1
+    with (output_dir / "paired_track_keys.csv").open(newline="", encoding="utf-8") as stream:
+        key_rows = list(csv.DictReader(stream))
+    assert len(key_rows) == 1
+    assert key_rows[0]["prediction_mode"] == "interpolation"
+    assert key_rows[0]["occurrence"] == "5"
+    with (output_dir / "per_track_stage_metrics.csv").open(
+        newline="", encoding="utf-8"
+    ) as stream:
+        metric_rows = list(csv.DictReader(stream))
+    assert len(metric_rows) == 1
+    assert "protected_nominal_seed_LOC0_mm" in metric_rows[0]
+    for png_path in output_dir.glob("*.png"):
+        content = png_path.read_bytes()
+        assert content.startswith(b"\x89PNG\r\n\x1a\n")
+        assert len(content) > 100
     manifest = json.loads((output_dir / "manifest.json").read_text())
     assert manifest["status"] == "completed"
     assert set(manifest["inputs"]) == {
@@ -362,6 +435,259 @@ def test_cli_finalizes_failed_manifest_when_root_loading_raises(tmp_path):
     assert manifest["metrics"]["failure_reason"]
     assert manifest["inputs"]["nominal_trackstates"]["sha256"]
     assert not (output_dir / "helix_recovery_summary.json").exists()
+
+
+def test_cli_replaces_stale_completed_manifest_and_records_missing_input_failure(tmp_path):
+    m = load_module()
+    nominal_states, misaligned_states, nominal_geometry, misaligned_geometry = _cli_fixture(tmp_path)
+    nominal_states.unlink()
+    output_dir = tmp_path / "missing-input-run"
+    output_dir.mkdir()
+    (output_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "command": [sys.executable, str(Path(m.__file__).resolve())],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = m.main(
+        [
+            "--nominal-states", str(nominal_states),
+            "--misaligned-states", str(misaligned_states),
+            "--nominal-geometry", str(nominal_geometry),
+            "--misaligned-geometry", str(misaligned_geometry),
+            "--target-layers", "17:8",
+            "--event-partition", "all",
+            "--output-dir", str(output_dir),
+        ]
+    )
+
+    assert result != 0
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert manifest["status"] == "failed"
+    assert manifest["inputs"]["nominal_trackstates"]["exists"] is False
+    assert manifest["metrics"]["failure_reason"]
+
+
+def test_cli_starts_manifest_before_input_hash_and_finalizes_unreadable_failure(
+    tmp_path, monkeypatch
+):
+    m = load_module()
+    nominal_states, misaligned_states, nominal_geometry, misaligned_geometry = _cli_fixture(tmp_path)
+    output_dir = tmp_path / "unreadable-input-run"
+    manifest_module = sys.modules[m.write_experiment_manifest.__module__]
+
+    def fail_hash(_path):
+        running = json.loads((output_dir / "manifest.json").read_text())
+        assert running["status"] == "running"
+        raise PermissionError("input is unreadable")
+
+    monkeypatch.setattr(manifest_module, "_sha256", fail_hash)
+
+    result = m.main(
+        [
+            "--nominal-states", str(nominal_states),
+            "--misaligned-states", str(misaligned_states),
+            "--nominal-geometry", str(nominal_geometry),
+            "--misaligned-geometry", str(misaligned_geometry),
+            "--target-layers", "17:8",
+            "--event-partition", "all",
+            "--output-dir", str(output_dir),
+        ]
+    )
+
+    assert result != 0
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert manifest["status"] == "failed"
+    assert manifest["metrics"]["failure_reason"] == (
+        "PermissionError: input is unreadable"
+    )
+
+
+def test_cli_finalizes_failed_manifest_on_keyboard_interrupt_after_start(tmp_path, monkeypatch):
+    m = load_module()
+    nominal_states, misaligned_states, nominal_geometry, misaligned_geometry = _cli_fixture(tmp_path)
+    output_dir = tmp_path / "interrupted-run"
+
+    def interrupt(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(m, "load_paired_recovery_inputs", interrupt)
+
+    result = m.main(
+        [
+            "--nominal-states", str(nominal_states),
+            "--misaligned-states", str(misaligned_states),
+            "--nominal-geometry", str(nominal_geometry),
+            "--misaligned-geometry", str(misaligned_geometry),
+            "--target-layers", "17:8",
+            "--event-partition", "all",
+            "--output-dir", str(output_dir),
+        ]
+    )
+
+    assert result != 0
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert manifest["status"] == "failed"
+    assert "KeyboardInterrupt" in manifest["metrics"]["failure_reason"]
+
+
+def test_cli_late_failure_preserves_available_scientific_metrics(tmp_path, monkeypatch):
+    m = load_module()
+    nominal_states, misaligned_states, nominal_geometry, misaligned_geometry = _cli_fixture(tmp_path)
+    output_dir = tmp_path / "late-failure-run"
+
+    def fail_plots(*_args, **_kwargs):
+        raise RuntimeError("plot write failed")
+
+    monkeypatch.setattr(m, "write_diagnostic_plots", fail_plots)
+
+    result = m.main(
+        [
+            "--nominal-states", str(nominal_states),
+            "--misaligned-states", str(misaligned_states),
+            "--nominal-geometry", str(nominal_geometry),
+            "--misaligned-geometry", str(misaligned_geometry),
+            "--target-layers", "17:8",
+            "--event-partition", "all",
+            "--exposure", "protected",
+            "--max-tracks", "1",
+            "--output-dir", str(output_dir),
+            "--seed-iters", "4",
+            "--refit-iters", "4",
+            "--bootstrap-replicates", "7",
+            "--bootstrap-seed", "23",
+        ]
+    )
+
+    assert result != 0
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert manifest["status"] == "failed"
+    assert manifest["metrics"]["failure_reason"] == "RuntimeError: plot write failed"
+    assert manifest["metrics"]["cohort_counts"]["frozen_probe_rows"] == 1
+    assert manifest["metrics"]["bootstrap"] == {"replicates": 7, "seed": 23}
+    assert set(manifest["metrics"]["verdicts"]) == {"protected"}
+    assert set(manifest["metrics"]["numerical_validity"]) == {
+        "nominal|protected|seed",
+        "nominal|protected|refit",
+        "misaligned|protected|seed",
+        "misaligned|protected|refit",
+    }
+
+
+def test_cli_fit_failure_preserves_already_available_cohort_counts(tmp_path, monkeypatch):
+    m = load_module()
+    nominal_states, misaligned_states, nominal_geometry, misaligned_geometry = _cli_fixture(tmp_path)
+    output_dir = tmp_path / "fit-failure-run"
+
+    def fail_fit(*_args, **_kwargs):
+        raise RuntimeError("fit failed")
+
+    monkeypatch.setattr(m, "run_four_arm_recovery", fail_fit)
+
+    result = m.main(
+        [
+            "--nominal-states", str(nominal_states),
+            "--misaligned-states", str(misaligned_states),
+            "--nominal-geometry", str(nominal_geometry),
+            "--misaligned-geometry", str(misaligned_geometry),
+            "--target-layers", "17:8",
+            "--event-partition", "all",
+            "--output-dir", str(output_dir),
+        ]
+    )
+
+    assert result != 0
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert manifest["status"] == "failed"
+    assert manifest["metrics"]["failure_reason"] == "RuntimeError: fit failed"
+    assert manifest["metrics"]["cohort_counts"] == {
+        "paired_measured_hits": 11,
+        "paired_unique_tracks": 1,
+        "paired_target_hits": 1,
+        "frozen_probe_rows": 1,
+        "prediction_modes": {"interpolation": 1},
+    }
+
+
+def test_main_activates_explicit_config_before_building_path_defaults(tmp_path, monkeypatch):
+    m = load_module()
+    data_root = tmp_path / "configured-data"
+    config_path = tmp_path / "override.toml"
+    config_path.write_text(
+        "\n".join(
+            (
+                "[project]",
+                f'data_root = "{data_root}"',
+                "[alignment]",
+                'target_layers = ["16:6", "23:4"]',
+            )
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def inspect_manifest(run_dir, **kwargs):
+        captured["run_dir"] = Path(run_dir)
+        captured["inputs"] = kwargs["inputs"]
+        captured["config"] = kwargs["config"]
+        raise RuntimeError("stop after config inspection")
+
+    monkeypatch.setattr(m, "write_experiment_manifest", inspect_manifest)
+
+    assert m.main(["--config", str(config_path)]) == 1
+    assert captured["config"].source_path == config_path
+    assert captured["run_dir"] == (
+        data_root / "experiments" / "helix_recovery" / "Vol16_Lay6__Vol23_Lay4"
+    )
+    assert Path(captured["inputs"]["nominal_trackstates"]).name == (
+        "trackstates_kf_v16l6_v23l4.root"
+    )
+    assert Path(captured["inputs"]["misaligned_geometry"]).name == (
+        "misalignment_applied_v16l6_v23l4.json"
+    )
+
+
+def test_atomic_json_writer_removes_temporary_file_on_serialization_failure(tmp_path):
+    m = load_module()
+    destination = tmp_path / "summary.json"
+
+    with pytest.raises(ValueError, match="Out of range float"):
+        m._atomic_write_json(destination, {"bad": float("nan")})
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_atomic_csv_writer_removes_temporary_file_on_write_failure(tmp_path):
+    m = load_module()
+    destination = tmp_path / "metrics.csv"
+
+    with pytest.raises(ValueError, match="fields not in fieldnames"):
+        m._atomic_write_csv(destination, [{"expected": 1, "unexpected": 2}], ("expected",))
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_diagnostic_plot_writer_closes_figures_when_save_fails(tmp_path, monkeypatch):
+    m = load_module()
+    statistics = m.summarize_four_arm_recovery(
+        _four_arm_statistics_fixture(m), bootstrap_replicates=3,
+        exposures=("protected",),
+    )
+
+    def fail_save(*_args, **_kwargs):
+        raise RuntimeError("save failed")
+
+    monkeypatch.setattr(m, "_save_figure_atomic", fail_save)
+    with pytest.raises(RuntimeError, match="save failed"):
+        m.write_diagnostic_plots(tmp_path, statistics, ("protected",))
+
+    import matplotlib.pyplot as plt
+
+    assert plt.get_fignums() == []
 
 
 def _inputs(module, *, reverse=False, target_at=5):
@@ -545,6 +871,31 @@ def test_four_arm_runner_reuses_shared_stages_and_evaluates_on_nominal_surfaces(
         assert arm.gauss_newton.intersection_valid.shape == (1, 11)
         assert arm.lm_seed.intersection_valid.all()
         assert arm.gauss_newton.intersection_valid.all()
+
+
+def test_four_arm_runner_does_not_execute_an_unrequested_broken_exposure(monkeypatch):
+    m = load_module()
+    cohort = m.freeze_paired_cohort(_inputs(m), _inputs(m))
+    geometry = _geometry(m)
+    real_seed = m.seed_helices
+
+    def fail_if_exposed(batches, *args, **kwargs):
+        if batches.fit_mask[0, 5]:
+            raise RuntimeError("exposed arm is broken")
+        return real_seed(batches, *args, **kwargs)
+
+    monkeypatch.setattr(m, "seed_helices", fail_if_exposed)
+
+    report = m.run_four_arm_recovery(
+        cohort,
+        nominal_geometry=geometry,
+        misaligned_geometry=geometry,
+        seed_iterations=4,
+        refit_iterations=4,
+        exposures=("protected",),
+    )
+
+    assert set(report.arms) == {("nominal", "protected"), ("misaligned", "protected")}
 
 
 def test_nominal_surface_evaluation_retains_invalid_intersections():
@@ -885,6 +1236,38 @@ def test_recovery_statistics_honor_bootstrap_overrides_and_emit_only_requested_e
     ]["recovery_ratio_q_ci95"]
     assert interval["n_requested_resamples"] == 17
     assert "shared_valid_exposed_LOC0" not in result["per_row"][0]
+
+
+def test_exposed_bootstrap_stream_is_invariant_to_whether_protected_is_requested():
+    m = load_module()
+    report = _four_arm_statistics_fixture(m)
+    values = torch.linspace(1.01, 1.50, report.cohort.n_rows, dtype=torch.float64)
+    for exposure in ("protected", "exposed"):
+        arm = report.arms[("misaligned", exposure)]
+        local = values[:, None, None].expand(-1, 1, 2).clone()
+        report.arms[("misaligned", exposure)] = m.replace(
+            arm,
+            gauss_newton=m.replace(
+                arm.gauss_newton,
+                evaluation=m.replace(arm.gauss_newton.evaluation, local_position=local),
+            ),
+        )
+
+    both = m.summarize_four_arm_recovery(
+        report, bootstrap_replicates=101, bootstrap_seed=23,
+        exposures=("protected", "exposed"),
+    )
+    exposed_only = m.summarize_four_arm_recovery(
+        report, bootstrap_replicates=101, bootstrap_seed=23,
+        exposures=("exposed",),
+    )
+    protected_only = m.summarize_four_arm_recovery(
+        report, bootstrap_replicates=101, bootstrap_seed=23,
+        exposures=("protected",),
+    )
+
+    assert both["exposures"]["exposed"] == exposed_only["exposures"]["exposed"]
+    assert both["exposures"]["protected"] == protected_only["exposures"]["protected"]
 
 
 def test_recovery_statistics_reject_duplicate_or_unknown_exposure_selection():

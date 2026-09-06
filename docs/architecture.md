@@ -207,16 +207,18 @@ surfaces for the final paired comparison.
 Each retained target hit becomes one frozen probe row. The protected exposure
 fits only non-target measurements, while the exposed exposure additionally fits
 that row's probe. Both nominal and misaligned branches run the same LM seed and
-Gauss--Newton measurement refit, forming four independently reported arms.
+Gauss--Newton measurement refit, forming up to four independently reported
+arms; a single-exposure request does not execute the other exposure.
 Event-cluster bootstraps and numerical-stationarity checks produce separate
 protected/exposed verdicts; a scientific `failed` or `inconclusive` verdict is a
 completed experiment rather than a runtime failure.
 
-Every run starts `manifest.json` before ROOT loading and writes
+Every run starts `manifest.json` before input hashing or ROOT loading and writes
 `paired_track_keys.csv`, flattened `per_track_stage_metrics.csv`, a strict-JSON
 `helix_recovery_summary.json`, and three diagnostic PNGs per requested exposure.
 The manifest hashes both ROOT and both geometry inputs and is finalized on both
-normal and exceptional exits. Runnable smoke and partitioned examples are in
+normal, exceptional, and interrupted exits while retaining every metric already
+computed. Runnable smoke and partitioned examples are in
 [`docs/helix-recovery.md`](helix-recovery.md).
 
 ## Input/output contracts

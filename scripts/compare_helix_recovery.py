@@ -684,16 +684,21 @@ def run_four_arm_recovery(
     refit_iterations: int = 60,
     device: str | torch.device = "cpu",
     dtype: torch.dtype = torch.float64,
+    exposures: tuple[str, ...] = ("protected", "exposed"),
 ) -> FourArmRecovery:
-    """Run ACTS-SMT, the shared LM seed, and shared GN refit in four arms."""
+    """Run requested exposure arms for both branches with the shared solvers."""
     if seed_iterations < 1 or refit_iterations < 1:
         raise ValueError("seed_iterations and refit_iterations must be at least 1.")
+    if not exposures or len(set(exposures)) != len(exposures) or any(
+        exposure not in {"protected", "exposed"} for exposure in exposures
+    ):
+        raise ValueError("exposures must be a non-empty unique selection of protected/exposed.")
     arms: dict[tuple[str, str], RecoveryArm] = {}
     for branch, fit_geometry in (
         ("nominal", nominal_geometry),
         ("misaligned", misaligned_geometry),
     ):
-        for exposure in ("protected", "exposed"):
+        for exposure in exposures:
             batches = _batches_for(
                 cohort, branch, exposure, sensor_lookup_branch=branch
             )
@@ -1157,7 +1162,6 @@ def summarize_four_arm_recovery(
             numerical[f"{branch}|{exposure}|refit"] = _stationarity_valid(
                 arm.gauss_newton.diagnostics, stage="refit"
             )
-    rng = np.random.default_rng(bootstrap_seed)
     exposure_values = {exposure: _probe_observables(report, exposure) for exposure in exposures}
     exposure_report: dict[str, dict[str, object]] = {}
     target_layers = {
@@ -1170,6 +1174,12 @@ def summarize_four_arm_recovery(
     if not target_layers:
         raise ValueError("Frozen recovery cohort has no target-layer identities.")
     for exposure in exposures:
+        # Separate named streams make an exposure bitwise invariant to whether
+        # the other exposure was requested or evaluated first.
+        exposure_code = 0 if exposure == "protected" else 1
+        rng = np.random.default_rng(
+            np.random.SeedSequence([bootstrap_seed, exposure_code])
+        )
         values = exposure_values[exposure]
         groups: dict[str, dict[str, object]] = {}
         for volume, layer in sorted(target_layers):
@@ -1271,28 +1281,41 @@ def build_argument_parser(config: ProjectConfig | None = None) -> argparse.Argum
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
-    ) as stream:
-        json.dump(payload, stream, indent=2, sort_keys=True, allow_nan=False)
-        stream.write("\n")
-        temporary = Path(stream.name)
-    temporary.replace(path)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(payload, stream, indent=2, sort_keys=True, allow_nan=False)
+            stream.write("\n")
+        temporary.replace(path)
+    except BaseException:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
 
 
 def _atomic_write_csv(path: Path, rows: list[dict], fieldnames: tuple[str, ...] | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if fieldnames is None:
         fieldnames = tuple(rows[0]) if rows else ()
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", newline="", dir=path.parent,
-        prefix=f".{path.name}.", suffix=".tmp", delete=False,
-    ) as stream:
-        writer = csv.DictWriter(stream, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-        temporary = Path(stream.name)
-    temporary.replace(path)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", newline="", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            writer = csv.DictWriter(stream, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        temporary.replace(path)
+    except BaseException:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
 
 
 def _plot_paths(output_dir: Path, exposures: tuple[str, ...]) -> dict[str, Path]:
@@ -1434,6 +1457,34 @@ def _output_paths(output_dir: Path, exposures: tuple[str, ...]) -> dict[str, Pat
     }
 
 
+def _failure_reason(error: BaseException) -> str:
+    detail = str(error).strip()
+    return f"{type(error).__name__}: {detail}" if detail else type(error).__name__
+
+
+def _finalize_started_failure(
+    manifest_path: Path,
+    *,
+    command: list[str],
+    metrics: dict[str, object],
+    error: BaseException,
+) -> bool:
+    """Finalize only the running manifest started by this exact invocation."""
+    try:
+        current = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if current.get("status") != "running" or current.get("command") != command:
+            return False
+        finalize_experiment_manifest(
+            manifest_path,
+            status="failed",
+            metrics={**metrics, "failure_reason": _failure_reason(error)},
+        )
+        return True
+    except Exception as manifest_error:
+        print(f"Could not finalize failed manifest: {manifest_error}", file=sys.stderr)
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_arguments = list(sys.argv[1:] if argv is None else argv)
     config_probe = argparse.ArgumentParser(add_help=False)
@@ -1463,6 +1514,8 @@ def main(argv: list[str] | None = None) -> int:
     dtype = torch.float32 if use_cuda else torch.float64
     effective = _effective_experiment_config(args, device=device, dtype=dtype)
     command = [sys.executable, str(Path(__file__).resolve()), *raw_arguments]
+    manifest_path = output_dir / "manifest.json"
+    available_metrics: dict[str, object] = {"effective_experiment_config": effective}
     try:
         manifest_path = write_experiment_manifest(
             output_dir,
@@ -1471,11 +1524,18 @@ def main(argv: list[str] | None = None) -> int:
             config=config,
             inputs=inputs,
             outputs=outputs,
-            metrics={"effective_experiment_config": effective},
+            metrics=available_metrics,
             status="running",
+            allow_missing_inputs=True,
         )
-    except Exception as error:
-        print(f"Helix recovery failed before manifest creation: {error}", file=sys.stderr)
+    except (Exception, KeyboardInterrupt) as error:
+        _finalize_started_failure(
+            manifest_path,
+            command=command,
+            metrics=available_metrics,
+            error=error,
+        )
+        print(f"Helix recovery failed during manifest preflight: {_failure_reason(error)}", file=sys.stderr)
         return 1
 
     try:
@@ -1490,6 +1550,8 @@ def main(argv: list[str] | None = None) -> int:
             max_tracks=args.max_tracks,
         )
         cohort = freeze_paired_cohort(nominal, misaligned)
+        counts = _cohort_counts(nominal, cohort)
+        available_metrics["cohort_counts"] = counts
         nominal_geometry = load_nominal_geometry(args.nominal_geometry)
         misaligned_geometry = load_nominal_geometry(args.misaligned_geometry)
         if set(misaligned_geometry.id_to_idx) != set(nominal_geometry.id_to_idx):
@@ -1504,6 +1566,7 @@ def main(argv: list[str] | None = None) -> int:
             refit_iterations=args.refit_iters,
             device=device,
             dtype=dtype,
+            exposures=exposures,
         )
         statistics = summarize_four_arm_recovery(
             report,
@@ -1511,11 +1574,18 @@ def main(argv: list[str] | None = None) -> int:
             bootstrap_seed=args.bootstrap_seed,
             exposures=exposures,
         )
-        counts = _cohort_counts(nominal, cohort)
         verdicts = {
             exposure: statistics["exposures"][exposure]["verdict"]
             for exposure in exposures
         }
+        available_metrics.update(
+            {
+                "cohort_counts": counts,
+                "bootstrap": statistics["bootstrap"],
+                "verdicts": verdicts,
+                "numerical_validity": statistics["numerical_validity"],
+            }
+        )
         summary = {
             "schema_version": 1,
             "effective_experiment_config": effective,
@@ -1551,19 +1621,16 @@ def main(argv: list[str] | None = None) -> int:
             manifest_path,
             status="completed",
             outputs={**outputs, **plot_outputs},
-            metrics={
-                "effective_experiment_config": effective,
-                "cohort_counts": counts,
-                "bootstrap": statistics["bootstrap"],
-                "verdicts": verdicts,
-                "numerical_validity": statistics["numerical_validity"],
-            },
+            metrics=available_metrics,
         )
-    except Exception as error:
-        finalize_experiment_manifest(
-            manifest_path, status="failed", metrics={"failure_reason": str(error)}
+    except (Exception, KeyboardInterrupt) as error:
+        _finalize_started_failure(
+            Path(manifest_path),
+            command=command,
+            metrics=available_metrics,
+            error=error,
         )
-        print(f"Helix recovery failed: {error}", file=sys.stderr)
+        print(f"Helix recovery failed: {_failure_reason(error)}", file=sys.stderr)
         return 1
 
     print(f"Helix recovery outputs: {output_dir}")

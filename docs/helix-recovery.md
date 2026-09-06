@@ -37,5 +37,6 @@ python scripts/compare_helix_recovery.py \
 ```
 
 `failed` and `inconclusive` scientific verdicts still exit successfully and are
-recorded as completed experiments. ROOT, geometry, plotting, or numerical
-exceptions return nonzero and finalize the run manifest with `status: failed`.
+recorded as completed experiments. ROOT, geometry, plotting, numerical, or
+keyboard-interrupt failures return nonzero and finalize the run manifest with
+`status: failed`, retaining any cohort or scientific metrics already computed.
