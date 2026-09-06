@@ -4,6 +4,7 @@ import csv
 import importlib.util
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import awkward as ak
@@ -585,6 +586,44 @@ def test_cli_rejects_config_output_collisions_before_writing(tmp_path, capsys, a
     assert config_path.read_bytes() == source_bytes
     assert {path.name for path in output_dir.iterdir()} == {artifact_name}
     assert result == 1
+    assert "collision" in capsys.readouterr().err.lower()
+
+
+def test_cli_checks_every_configuration_source_for_output_collisions(
+    tmp_path, capsys, monkeypatch
+):
+    m = load_module()
+    paths = _cli_fixture(tmp_path)
+    output_dir = tmp_path / "layered-config-collision-run"
+    output_dir.mkdir()
+    hidden_source = output_dir / "manifest.json"
+    source_bytes = b'[alignment]\ntarget_layers = ["17:8"]\n'
+    hidden_source.write_bytes(source_bytes)
+    load_config = m.load_project_config
+
+    def layered_config(path=None):
+        config = load_config(path)
+        return replace(
+            config,
+            source_paths=(config.source_path, hidden_source),
+        )
+
+    monkeypatch.setattr(m, "load_project_config", layered_config)
+    result = m.main(
+        [
+            "--nominal-states", str(paths[0]),
+            "--misaligned-states", str(paths[1]),
+            "--nominal-geometry", str(paths[2]),
+            "--misaligned-geometry", str(paths[3]),
+            "--target-layers", "17:8",
+            "--event-partition", "all",
+            "--output-dir", str(output_dir),
+        ]
+    )
+
+    assert result == 1
+    assert hidden_source.read_bytes() == source_bytes
+    assert {path.name for path in output_dir.iterdir()} == {"manifest.json"}
     assert "collision" in capsys.readouterr().err.lower()
 
 

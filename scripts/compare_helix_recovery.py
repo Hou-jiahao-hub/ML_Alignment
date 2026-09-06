@@ -1553,7 +1553,14 @@ def main(argv: list[str] | None = None) -> int:
     resolved_outputs = {
         path.resolve(): name for name, path in {**outputs, "manifest": manifest_path}.items()
     }
-    for name, path in {**inputs, "configuration": config.source_path}.items():
+    source_paths = {
+        **inputs,
+        **{
+            f"configuration[{index}]": path
+            for index, path in enumerate(config.source_paths)
+        },
+    }
+    for name, path in source_paths.items():
         resolved = Path(path).resolve()
         if resolved in resolved_outputs:
             print(

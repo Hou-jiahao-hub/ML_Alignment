@@ -68,7 +68,7 @@ def test_effective_active_dof_is_shared_by_both_solver_modules(monkeypatch):
 def test_explicit_config_overrides_environment_and_resolves_from_repository(
     monkeypatch, tmp_path
 ):
-    from project_config import load_project_config
+    from project_config import DEFAULT_CONFIG_PATH, load_project_config
 
     environment_config = tmp_path / "environment.toml"
     environment_config.write_text(
@@ -105,6 +105,9 @@ active_dof = [0, 5]
         config.repository_root / "native" / "AlignDerivLib"
     )
     assert config.conda_setup == config.repository_root / "tools" / "conda.sh"
+    assert config.source_paths[0] == DEFAULT_CONFIG_PATH
+    assert config.source_paths[-1] == explicit_config
+    assert environment_config not in config.source_paths
 
 
 def test_cli_config_activation_supports_split_and_equals_forms(monkeypatch, tmp_path):

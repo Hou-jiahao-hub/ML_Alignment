@@ -54,6 +54,7 @@ class ProjectConfig:
     target_layers: tuple[tuple[int, int], ...]
     active_dof: tuple[int, ...]
     source_path: Path
+    source_paths: tuple[Path, ...]
 
     @property
     def target_layer_suffix(self) -> str:
@@ -104,6 +105,7 @@ class ProjectConfig:
             "target_layer_suffix": self.target_layer_suffix,
             "target_layer_dir": self.target_layer_dir,
             "source_path": str(self.source_path),
+            "source_paths": [str(path) for path in self.source_paths],
         }
 
 
@@ -168,10 +170,12 @@ def _parse_active_dof(values: list[int]) -> tuple[int, ...]:
 def load_project_config(path: str | Path | None = None) -> ProjectConfig:
     data = _read_toml(DEFAULT_CONFIG_PATH)
     source_path = DEFAULT_CONFIG_PATH
+    source_paths = [DEFAULT_CONFIG_PATH]
 
     if LOCAL_CONFIG_PATH.exists():
         data = _merge(data, _read_toml(LOCAL_CONFIG_PATH))
         source_path = LOCAL_CONFIG_PATH
+        source_paths.append(LOCAL_CONFIG_PATH)
 
     selected_path: Path | None
     if path is not None:
@@ -188,6 +192,7 @@ def load_project_config(path: str | Path | None = None) -> ProjectConfig:
             raise FileNotFoundError(f"configuration file not found: {selected_path}")
         data = _merge(data, _read_toml(selected_path))
         source_path = selected_path
+        source_paths.append(selected_path)
 
     project = data.get("project", {})
     acts = data.get("acts", {})
@@ -206,4 +211,5 @@ def load_project_config(path: str | Path | None = None) -> ProjectConfig:
         target_layers=_parse_target_layers(alignment.get("target_layers", [])),
         active_dof=_parse_active_dof(alignment.get("active_dof", [])),
         source_path=source_path,
+        source_paths=tuple(dict.fromkeys(source_paths)),
     )
