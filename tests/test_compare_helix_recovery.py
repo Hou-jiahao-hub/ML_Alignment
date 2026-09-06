@@ -144,15 +144,17 @@ def _loader_fixture(tmp_path):
     return nominal_states, misaligned_states, geometry_nominal, geometry_misaligned, tracks
 
 
-def _cli_fixture(tmp_path):
+def _cli_fixture(tmp_path, *, additional_layer_event=None):
     surfaces = [(10, index + 1, index + 1) for index in range(11)]
     surfaces[5] = (17, 8, 6)
+    if additional_layer_event is not None:
+        surfaces.append((24, 4, 12))
     nominal_geometry = tmp_path / "nominal-geometry.json"
     misaligned_geometry = tmp_path / "misaligned-geometry.json"
     _write_geometry(nominal_geometry, surfaces)
     _write_geometry(misaligned_geometry, surfaces)
     states = []
-    for index, (volume, layer, module) in enumerate(surfaces):
+    for index, (volume, layer, module) in enumerate(surfaces[:11]):
         position = float(index * 100)
         states.append(
             (
@@ -173,6 +175,10 @@ def _cli_fixture(tmp_path):
             )
         )
     tracks = [(5, 10, states)]
+    if additional_layer_event is not None:
+        additional_states = list(states)
+        additional_states[5] = (24, 4, 12, *states[5][3:])
+        tracks.append((additional_layer_event, 10, additional_states))
     nominal_states = tmp_path / "nominal-states.root"
     misaligned_states = tmp_path / "misaligned-states.root"
     _write_trackstates(nominal_states, tracks)
@@ -406,6 +412,254 @@ def test_cli_writes_selected_exposure_artifacts_and_completed_manifest(tmp_path)
     assert all(record["sha256"] for record in manifest["inputs"].values())
     assert manifest["metrics"]["bootstrap"] == {"replicates": 7, "seed": 23}
     assert set(manifest["metrics"]["verdicts"]) == {"protected"}
+
+
+@pytest.mark.parametrize(
+    ("additional_layer_event", "event_partition", "max_tracks"),
+    ((None, "all", 0), (2, "validation", 0), (6, "all", 1)),
+    ids=("absent-from-root", "removed-by-partition", "removed-by-track-cap"),
+)
+def test_cli_keeps_requested_layers_missing_after_input_selection_inconclusive(
+    tmp_path, additional_layer_event, event_partition, max_tracks
+):
+    m = load_module()
+    paths = _cli_fixture(tmp_path, additional_layer_event=additional_layer_event)
+    output_dir = tmp_path / "missing-layer-run"
+    result = m.main(
+        [
+            "--nominal-states", str(paths[0]),
+            "--misaligned-states", str(paths[1]),
+            "--nominal-geometry", str(paths[2]),
+            "--misaligned-geometry", str(paths[3]),
+            "--target-layers", "17:8,24:4",
+            "--event-partition", event_partition,
+            "--max-tracks", str(max_tracks),
+            "--output-dir", str(output_dir),
+            "--seed-iters", "8",
+            "--refit-iters", "8",
+            "--bootstrap-replicates", "7",
+        ]
+    )
+
+    assert result == 0
+    summary = json.loads((output_dir / "helix_recovery_summary.json").read_text())
+    assert summary["cohort_counts"]["frozen_probe_rows"] == 1
+    for exposure in ("protected", "exposed"):
+        groups = summary["exposures"][exposure]["groups"]
+        for mode in ("interpolation", "forward_extrapolation", "backward_extrapolation"):
+            for component in ("LOC0", "LOC1"):
+                key = f"24:4|{mode}|{component}"
+                assert key in groups
+                assert groups[key]["requested_count"] == groups[key]["valid_count"] == 0
+                assert groups[key]["verdict"] == "inconclusive"
+        assert summary["verdicts"][exposure] == "inconclusive"
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert manifest["status"] == "completed"
+    assert manifest["metrics"]["verdicts"] == summary["verdicts"]
+
+
+@pytest.mark.parametrize(
+    "input_index", range(4),
+    ids=("nominal-root", "misaligned-root", "nominal-geometry", "misaligned-geometry"),
+)
+@pytest.mark.parametrize(
+    "artifact_name",
+    (
+        "manifest.json",
+        "paired_track_keys.csv",
+        "per_track_stage_metrics.csv",
+        "helix_recovery_summary.json",
+        "seed_vs_refit_paired_difference_protected.png",
+        "refit_difference_distribution_protected.png",
+        "grouped_recovery_ratios_protected.png",
+        "seed_vs_refit_paired_difference_exposed.png",
+        "refit_difference_distribution_exposed.png",
+        "grouped_recovery_ratios_exposed.png",
+    ),
+)
+def test_cli_rejects_input_output_collisions_before_any_artifact_write(
+    tmp_path, capsys, input_index, artifact_name
+):
+    m = load_module()
+    paths = list(_cli_fixture(tmp_path))
+    output_dir = tmp_path / "collision-run"
+    output_dir.mkdir()
+    source = output_dir / artifact_name
+    source_bytes = paths[input_index].read_bytes()
+    source.write_bytes(source_bytes)
+    paths[input_index] = source
+
+    result = m.main(
+        [
+            "--nominal-states", str(paths[0]),
+            "--misaligned-states", str(paths[1]),
+            "--nominal-geometry", str(paths[2]),
+            "--misaligned-geometry", str(paths[3]),
+            "--target-layers", "17:8",
+            "--event-partition", "all",
+            "--output-dir", str(output_dir),
+            "--seed-iters", "8",
+            "--refit-iters", "8",
+            "--bootstrap-replicates", "7",
+        ]
+    )
+
+    assert source.read_bytes() == source_bytes
+    assert {path.name for path in output_dir.iterdir()} == {artifact_name}
+    assert result == 1
+    assert "collision" in capsys.readouterr().err.lower()
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "alias_kind"),
+    (
+        ("helix_recovery_summary.json", "input"),
+        ("manifest.json", "output"),
+        ("grouped_recovery_ratios_protected.png", "output"),
+    ),
+)
+def test_cli_rejects_resolved_symlink_collisions_without_changing_sources(
+    tmp_path, capsys, artifact_name, alias_kind
+):
+    m = load_module()
+    paths = list(_cli_fixture(tmp_path))
+    output_dir = tmp_path / "alias-run"
+    output_dir.mkdir()
+    source_bytes = paths[2].read_bytes()
+    artifact = output_dir / artifact_name
+    if alias_kind == "input":
+        artifact.write_bytes(source_bytes)
+        alias = tmp_path / "nominal-alias.json"
+        alias.symlink_to(artifact)
+        paths[2] = alias
+    else:
+        artifact.symlink_to(paths[2])
+
+    result = m.main(
+        [
+            "--nominal-states", str(paths[0]),
+            "--misaligned-states", str(paths[1]),
+            "--nominal-geometry", str(paths[2]),
+            "--misaligned-geometry", str(paths[3]),
+            "--target-layers", "17:8",
+            "--event-partition", "all",
+            "--output-dir", str(output_dir),
+            "--seed-iters", "8",
+            "--refit-iters", "8",
+            "--bootstrap-replicates", "7",
+        ]
+    )
+
+    assert paths[2].read_bytes() == artifact.read_bytes() == source_bytes
+    assert {path.name for path in output_dir.iterdir()} == {artifact_name}
+    assert (paths[2] if alias_kind == "input" else artifact).is_symlink()
+    assert result == 1
+    assert "collision" in capsys.readouterr().err.lower()
+
+
+@pytest.mark.parametrize("artifact_name", ("manifest.json", "helix_recovery_summary.json"))
+def test_cli_rejects_config_output_collisions_before_writing(tmp_path, capsys, artifact_name):
+    m = load_module()
+    paths = _cli_fixture(tmp_path)
+    output_dir = tmp_path / "config-collision-run"
+    output_dir.mkdir()
+    config_path = output_dir / artifact_name
+    source_bytes = b'[alignment]\ntarget_layers = ["17:8"]\n'
+    config_path.write_bytes(source_bytes)
+
+    result = m.main(
+        [
+            "--config", str(config_path),
+            "--nominal-states", str(paths[0]),
+            "--misaligned-states", str(paths[1]),
+            "--nominal-geometry", str(paths[2]),
+            "--misaligned-geometry", str(paths[3]),
+            "--event-partition", "all",
+            "--output-dir", str(output_dir),
+            "--seed-iters", "8",
+            "--refit-iters", "8",
+            "--bootstrap-replicates", "7",
+        ]
+    )
+
+    assert config_path.read_bytes() == source_bytes
+    assert {path.name for path in output_dir.iterdir()} == {artifact_name}
+    assert result == 1
+    assert "collision" in capsys.readouterr().err.lower()
+
+
+def test_cli_rejects_missing_input_colliding_with_future_manifest(tmp_path, capsys):
+    m = load_module()
+    paths = _cli_fixture(tmp_path)
+    output_dir = tmp_path / "missing-collision-run"
+
+    result = m.main(
+        [
+            "--nominal-states", str(output_dir / "manifest.json"),
+            "--misaligned-states", str(paths[1]),
+            "--nominal-geometry", str(paths[2]),
+            "--misaligned-geometry", str(paths[3]),
+            "--target-layers", "17:8",
+            "--event-partition", "all",
+            "--output-dir", str(output_dir),
+        ]
+    )
+
+    assert not output_dir.exists()
+    assert result == 1
+    assert "collision" in capsys.readouterr().err.lower()
+
+
+@pytest.mark.parametrize(
+    ("target_layers", "event_partition"),
+    (("24:4", "all"), ("17:8", "calibration")),
+    ids=("no-target-probes", "no-selected-events"),
+)
+def test_cli_reports_empty_requested_cohort_as_inconclusive_without_fitting(
+    tmp_path, monkeypatch, target_layers, event_partition
+):
+    m = load_module()
+    paths = _cli_fixture(tmp_path)
+    output_dir = tmp_path / "empty-run"
+
+    def refuse_empty_fit(*_args, **_kwargs):
+        pytest.fail("An empty cohort must not invoke a fit solver")
+
+    monkeypatch.setattr(m, "seed_helices", refuse_empty_fit)
+    monkeypatch.setattr(m, "fit_helices_gauss_newton", refuse_empty_fit)
+    result = m.main(
+        [
+            "--nominal-states", str(paths[0]),
+            "--misaligned-states", str(paths[1]),
+            "--nominal-geometry", str(paths[2]),
+            "--misaligned-geometry", str(paths[3]),
+            "--target-layers", target_layers,
+            "--event-partition", event_partition,
+            "--output-dir", str(output_dir),
+            "--bootstrap-replicates", "7",
+        ]
+    )
+
+    assert result == 0
+    summary = json.loads((output_dir / "helix_recovery_summary.json").read_text())
+    assert summary["cohort_counts"]["frozen_probe_rows"] == 0
+    for exposure in ("protected", "exposed"):
+        groups = summary["exposures"][exposure]["groups"]
+        assert len(groups) == 6
+        for mode in ("interpolation", "forward_extrapolation", "backward_extrapolation"):
+            for component in ("LOC0", "LOC1"):
+                group = groups[f"{target_layers}|{mode}|{component}"]
+                assert group["requested_count"] == group["valid_count"] == 0
+                assert group["recovery_ratio_q"] is None
+                assert group["verdict"] == "inconclusive"
+        assert summary["verdicts"][exposure] == "inconclusive"
+    assert all(
+        stage["valid"] is None and "not run" in stage["reason"]
+        for stage in summary["numerical_validity"].values()
+    )
+    assert json.loads((output_dir / "manifest.json").read_text())["status"] == "completed"
+    with (output_dir / "paired_track_keys.csv").open(newline="") as stream:
+        assert list(csv.DictReader(stream)) == []
 
 
 def test_cli_finalizes_failed_manifest_when_root_loading_raises(tmp_path):
@@ -757,6 +1011,17 @@ def test_freeze_paired_cohort_canonicalizes_order_and_keeps_protected_and_expose
     assert cohort.protected_fit_mask[0, 5].item() is False
     assert cohort.exposed_fit_mask[0, 5].item() is True
     assert cohort.non_target_span_mm.tolist() == [1000.0]
+
+
+def test_freeze_paired_cohort_refuses_different_requested_target_layers():
+    m = load_module()
+    nominal = _inputs(m)
+    misaligned = _inputs(m)
+    nominal.requested_target_layers = ((17, 5),)
+    misaligned.requested_target_layers = ((17, 5), (24, 4))
+
+    with pytest.raises(ValueError, match="requested target layers"):
+        m.freeze_paired_cohort(nominal, misaligned)
 
 
 @pytest.mark.parametrize(
@@ -1152,6 +1417,27 @@ def test_recovery_statistics_keep_a_target_layer_with_no_retained_probe_inconclu
     assert group["intersection_failures"]["nominal_seed"]["rate"] is None
     assert group["verdict"] == "inconclusive"
     assert result["exposures"]["protected"]["verdict"] == "inconclusive"
+
+
+def test_recovery_statistics_cannot_pass_when_a_requested_layer_has_no_input_hits():
+    m = load_module()
+    report = _four_arm_statistics_fixture(m)
+    # These inputs share all observed hits but explicitly request another layer.
+    report.cohort.nominal.requested_target_layers = ((17, 8), (24, 4))
+    report.cohort.misaligned.requested_target_layers = ((17, 8), (24, 4))
+
+    result = m.summarize_four_arm_recovery(report, bootstrap_replicates=7)
+
+    for exposure in ("protected", "exposed"):
+        groups = result["exposures"][exposure]["groups"]
+        for mode in ("interpolation", "forward_extrapolation", "backward_extrapolation"):
+            for component in ("LOC0", "LOC1"):
+                assert groups[f"17:8|{mode}|{component}"]["verdict"] == "passed"
+                key = f"24:4|{mode}|{component}"
+                assert key in groups
+                assert groups[key]["requested_count"] == groups[key]["valid_count"] == 0
+                assert groups[key]["verdict"] == "inconclusive"
+        assert result["exposures"][exposure]["verdict"] == "inconclusive"
 
 
 def test_direction_difference_uses_fitted_tangents_not_subtracted_smt_error_angles():

@@ -40,3 +40,13 @@ python scripts/compare_helix_recovery.py \
 recorded as completed experiments. ROOT, geometry, plotting, numerical, or
 keyboard-interrupt failures return nonzero and finalize the run manifest with
 `status: failed`, retaining any cohort or scientific metrics already computed.
+
+The summary always enumerates every requested target layer, prediction mode,
+and local component. A requested layer with no retained probes is therefore
+reported as `inconclusive`; if the whole selected cohort is empty, no seed or
+refit solver is run and the completed manifest records the same verdict.
+
+Before creating the output directory or manifest, the CLI rejects any resolved
+path collision between source inputs (including an explicit configuration) and
+its fixed output artifacts. Such an invalid invocation writes nothing, so it
+cannot overwrite a source ROOT, geometry, or configuration file.

@@ -87,6 +87,9 @@ class RecoveryHitInputs:
     sensor_idx: torch.Tensor
     target_mask: torch.Tensor
     path_length: torch.Tensor
+    # None preserves programmatic callers that infer targets from their hits.
+    # ROOT callers retain the explicit request even when selection removes a layer.
+    requested_target_layers: tuple[tuple[int, int], ...] | None = None
 
 
 @dataclass
@@ -301,6 +304,7 @@ def _load_recovery_branch(
             [(key[0], key[1]) in target_layers for key in keys], dtype=torch.bool
         ),
         path_length=torch.tensor(flat["pathLength"][keep], dtype=torch.float64),
+        requested_target_layers=target_layers,
     )
 
 
@@ -372,8 +376,6 @@ def load_paired_recovery_inputs(
     selected &= np.asarray(
         [(identity.event_nr, identity.track_nr) in selected_tracks for identity in nominal.identities]
     )
-    if not selected.any():
-        raise ValueError("No paired measured states remain after partition and track filtering.")
     mask = torch.tensor(selected, dtype=torch.bool)
     return _select_recovery_hits(nominal, mask), _select_recovery_hits(misaligned, mask)
 
@@ -481,6 +483,10 @@ def _canonicalize(inputs: RecoveryHitInputs) -> RecoveryHitInputs:
 def _require_paired_contract(
     nominal: RecoveryHitInputs, misaligned: RecoveryHitInputs
 ) -> None:
+    if nominal.requested_target_layers != misaligned.requested_target_layers:
+        raise ValueError(
+            "paired inputs have different requested target layers; refusing to pair states."
+        )
     if nominal.identities != misaligned.identities:
         raise ValueError("paired inputs have different hit identities; refusing to shrink an arm.")
     if not torch.equal(nominal.target_mask, misaligned.target_mask):
@@ -553,10 +559,10 @@ def freeze_paired_cohort(
                     _probe_mode(float(nominal.path_length[probe]), non_target_paths),
                 )
             )
-    if not selected:
+    if not selected and nominal.requested_target_layers is None:
         raise ValueError("No paired target probes satisfy the frozen cohort requirements.")
 
-    max_hits = max(len(indices) for indices, _probe, _span, _mode in selected)
+    max_hits = max((len(indices) for indices, _probe, _span, _mode in selected), default=0)
     n_rows = len(selected)
     row_indices = torch.zeros((n_rows, max_hits), dtype=torch.long)
     hit_mask = torch.zeros((n_rows, max_hits), dtype=torch.bool)
@@ -694,6 +700,8 @@ def run_four_arm_recovery(
     ):
         raise ValueError("exposures must be a non-empty unique selection of protected/exposed.")
     arms: dict[tuple[str, str], RecoveryArm] = {}
+    if not cohort.n_rows:
+        return FourArmRecovery(cohort=cohort, arms=arms)
     for branch, fit_geometry in (
         ("nominal", nominal_geometry),
         ("misaligned", misaligned_geometry),
@@ -924,8 +932,10 @@ def _intersection_failures(
     count = int(requested.sum())
     for branch in ("nominal", "misaligned"):
         for stage in ("seed", "refit"):
-            valid = values[f"{branch}_{stage}_valid"].astype(bool)
-            failures = int((requested & ~valid).sum())
+            failures = (
+                int((requested & ~values[f"{branch}_{stage}_valid"].astype(bool)).sum())
+                if count else 0
+            )
             result[f"{branch}_{stage}"] = {
                 "count": failures,
                 "rate": float(failures / count) if count else None,
@@ -1143,6 +1153,50 @@ def summarize_four_arm_recovery(
     ):
         raise ValueError("exposures must be a non-empty unique selection of protected/exposed.")
     cohort = report.cohort
+    target_layers = cohort.nominal.requested_target_layers
+    if target_layers is None:
+        target_layers = {
+            (identity.volume_id, identity.layer_id)
+            for identity, is_target in zip(
+                cohort.nominal.identities, cohort.nominal.target_mask.detach().cpu().tolist()
+            )
+            if is_target
+        }
+    if not target_layers:
+        raise ValueError("Frozen recovery cohort has no requested target layers.")
+    result = {
+        "bootstrap": {"replicates": bootstrap_replicates, "seed": bootstrap_seed},
+        "minimum_valid_components": MIN_VALID_COMPONENTS,
+        "absolute_detector_thresholds_diagnostic_only": ABSOLUTE_DETECTOR_THRESHOLDS,
+    }
+    if not cohort.n_rows:
+        empty = np.array([], dtype=bool)
+        result["numerical_validity"] = {
+            f"{branch}|{exposure}|{stage}": {
+                "valid": None,
+                "reason": "no frozen probe rows; stage not run",
+            }
+            for exposure in exposures
+            for branch in ("nominal", "misaligned")
+            for stage in ("seed", "refit")
+        }
+        result["exposures"] = {
+            exposure: {
+                "verdict": "inconclusive",
+                "groups": {
+                    f"{volume}:{layer}|{mode}|{name}": _group_statistics(
+                        empty, empty, {}, component, np.array([], dtype=np.int64),
+                        np.random.default_rng(bootstrap_seed), bootstrap_replicates,
+                    )
+                    for volume, layer in sorted(target_layers)
+                    for mode in RECOVERY_PREDICTION_MODES
+                    for component, name in enumerate(("LOC0", "LOC1"))
+                },
+            }
+            for exposure in exposures
+        }
+        result["per_row"] = []
+        return result
     columns = _probe_columns(cohort)
     row_indices = cohort.row_indices[torch.arange(cohort.n_rows), columns]
     identities = [cohort.nominal.identities[int(index)] for index in row_indices.tolist()]
@@ -1164,15 +1218,6 @@ def summarize_four_arm_recovery(
             )
     exposure_values = {exposure: _probe_observables(report, exposure) for exposure in exposures}
     exposure_report: dict[str, dict[str, object]] = {}
-    target_layers = {
-        (identity.volume_id, identity.layer_id)
-        for identity, is_target in zip(
-            cohort.nominal.identities, cohort.nominal.target_mask.detach().cpu().tolist()
-        )
-        if is_target
-    }
-    if not target_layers:
-        raise ValueError("Frozen recovery cohort has no target-layer identities.")
     for exposure in exposures:
         # Separate named streams make an exposure bitwise invariant to whether
         # the other exposure was requested or evaluated first.
@@ -1207,9 +1252,7 @@ def summarize_four_arm_recovery(
         )
         exposure_report[exposure] = {"verdict": verdict, "groups": groups}
     return {
-        "bootstrap": {"replicates": bootstrap_replicates, "seed": bootstrap_seed},
-        "minimum_valid_components": MIN_VALID_COMPONENTS,
-        "absolute_detector_thresholds_diagnostic_only": ABSOLUTE_DETECTOR_THRESHOLDS,
+        **result,
         "numerical_validity": numerical,
         "exposures": exposure_report,
         "per_row": _per_row_table(report, exposure_values),
@@ -1499,7 +1542,6 @@ def main(argv: list[str] | None = None) -> int:
 
     exposures = _selected_exposures(args.exposure)
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     outputs = _output_paths(output_dir, exposures)
     inputs = {
         "nominal_trackstates": args.nominal_states,
@@ -1507,6 +1549,20 @@ def main(argv: list[str] | None = None) -> int:
         "nominal_geometry": args.nominal_geometry,
         "misaligned_geometry": args.misaligned_geometry,
     }
+    manifest_path = output_dir / "manifest.json"
+    resolved_outputs = {
+        path.resolve(): name for name, path in {**outputs, "manifest": manifest_path}.items()
+    }
+    for name, path in {**inputs, "configuration": config.source_path}.items():
+        resolved = Path(path).resolve()
+        if resolved in resolved_outputs:
+            print(
+                f"Helix recovery input/output path collision: {name} and "
+                f"{resolved_outputs[resolved]} both resolve to {resolved}",
+                file=sys.stderr,
+            )
+            return 1
+    output_dir.mkdir(parents=True, exist_ok=True)
     use_cuda = bool(args.gpu and torch.cuda.is_available())
     if args.gpu and not use_cuda:
         print("[warn] --gpu requested but CUDA is unavailable; using CPU float64.", file=sys.stderr)
@@ -1514,7 +1570,6 @@ def main(argv: list[str] | None = None) -> int:
     dtype = torch.float32 if use_cuda else torch.float64
     effective = _effective_experiment_config(args, device=device, dtype=dtype)
     command = [sys.executable, str(Path(__file__).resolve()), *raw_arguments]
-    manifest_path = output_dir / "manifest.json"
     available_metrics: dict[str, object] = {"effective_experiment_config": effective}
     try:
         manifest_path = write_experiment_manifest(
