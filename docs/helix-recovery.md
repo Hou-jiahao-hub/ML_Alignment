@@ -4,36 +4,36 @@ Run this diagnostic in the conda `pytorch` environment. Input and target-layer
 defaults come from the project configuration, including the target-derived ROOT
 and geometry filenames. Use a fresh output directory for every retained run.
 
-Quick smoke run:
+Quick smoke run over the lowest 25 unique event numbers:
 
 ```bash
 python scripts/compare_helix_recovery.py \
-  --event-partition train \
-  --max-tracks 25 \
+  --event-partition all \
+  --max-events 25 \
   --seed-iters 20 \
   --refit-iters 10 \
   --bootstrap-replicates 100 \
-  --output-dir data/experiments/helix_recovery/Vol17_Lay8__Vol24_Lay4/smoke
+  --output-dir data/experiments/helix_recovery/Vol17_Lay8__Vol24_Lay4/smoke-25-events
 ```
 
-Calibration run for inspecting the frozen diagnostic and its independent
-protected/exposed verdicts:
+The retained comparison uses one deterministic 20,000-event cohort. Hash-based
+train/calibration/validation partitions are disabled: after full nominal versus
+misaligned pairing, the loader keeps every track and hit belonging to the lowest
+20,000 unique `event_nr` values. The manifest records the available and selected
+unique-event counts.
+
+Full four-arm validation:
 
 ```bash
 python scripts/compare_helix_recovery.py \
-  --event-partition calibration \
+  --event-partition all \
+  --max-events 20000 \
   --exposure both \
-  --output-dir data/experiments/helix_recovery/Vol17_Lay8__Vol24_Lay4/calibration
-```
-
-Validation run with the production defaults (200 seed iterations, 60 refit
-iterations, and 2000 event-cluster bootstrap replicates):
-
-```bash
-python scripts/compare_helix_recovery.py \
-  --event-partition validation \
-  --exposure both \
-  --output-dir data/experiments/helix_recovery/Vol17_Lay8__Vol24_Lay4/validation
+  --seed-iters 200 \
+  --refit-iters 60 \
+  --bootstrap-replicates 2000 \
+  --bootstrap-seed 6006 \
+  --output-dir data/experiments/helix_recovery/Vol17_Lay8__Vol24_Lay4/validation-20000-events
 ```
 
 `failed` and `inconclusive` scientific verdicts still exit successfully and are

@@ -44,11 +44,6 @@ except ImportError:  # Direct script execution and importlib-based tests.
     )
 
 try:
-    from .event_split import DEFAULT_SPLIT_SEED, PARTITIONS, event_partition_mask
-except ImportError:  # Direct script execution and importlib-based tests.
-    from event_split import DEFAULT_SPLIT_SEED, PARTITIONS, event_partition_mask
-
-try:
     from .experiment_manifest import finalize_experiment_manifest, write_experiment_manifest
     from .project_config import ProjectConfig, absolute_project_path, load_project_config
 except ImportError:  # Direct script execution and importlib-based tests.
@@ -90,6 +85,8 @@ class RecoveryHitInputs:
     # None preserves programmatic callers that infer targets from their hits.
     # ROOT callers retain the explicit request even when selection removes a layer.
     requested_target_layers: tuple[tuple[int, int], ...] | None = None
+    available_unique_events: int | None = None
+    selected_unique_events: int | None = None
 
 
 @dataclass
@@ -332,15 +329,18 @@ def load_paired_recovery_inputs(
     misaligned_geometry: str | Path,
     *,
     target_layers: tuple[tuple[int, int], ...],
-    event_partition: str = "validation",
-    event_split_seed: int = DEFAULT_SPLIT_SEED,
+    event_partition: str = "all",
+    max_events: int = 0,
     max_tracks: int = 0,
 ) -> tuple[RecoveryHitInputs, RecoveryHitInputs]:
-    """Load, validate, partition, and deterministically cap a paired ROOT cohort."""
-    if event_partition not in (*PARTITIONS, "all"):
-        raise ValueError(f"Unknown event partition {event_partition!r}.")
-    if max_tracks < 0:
-        raise ValueError("max_tracks must be non-negative.")
+    """Load, validate, and deterministically cap a paired ROOT cohort by event."""
+    if event_partition != "all":
+        raise ValueError(
+            "hash partition selection is disabled; use event_partition='all' "
+            "with max_events instead."
+        )
+    if max_events < 0 or max_tracks < 0:
+        raise ValueError("max_events and max_tracks must be non-negative.")
     target_layers = tuple((int(volume), int(layer)) for volume, layer in target_layers)
     if not target_layers or len(set(target_layers)) != len(target_layers):
         raise ValueError("target_layers must be non-empty and unique.")
@@ -364,9 +364,10 @@ def load_paired_recovery_inputs(
     _require_paired_contract(nominal, misaligned)
 
     events = np.asarray([identity.event_nr for identity in nominal.identities], dtype=np.int64)
-    selected = np.ones(len(events), dtype=bool)
-    if event_partition != "all":
-        selected &= event_partition_mask(events, event_partition, event_split_seed)
+    available_events = sorted(set(events.tolist()))
+    retained_events = available_events[:max_events] if max_events else available_events
+    selected_event_set = set(retained_events)
+    selected = np.asarray([int(event) in selected_event_set for event in events], dtype=bool)
     tracks = sorted(
         {(identity.event_nr, identity.track_nr) for identity, use in zip(nominal.identities, selected) if use}
     )
@@ -377,7 +378,17 @@ def load_paired_recovery_inputs(
         [(identity.event_nr, identity.track_nr) in selected_tracks for identity in nominal.identities]
     )
     mask = torch.tensor(selected, dtype=torch.bool)
-    return _select_recovery_hits(nominal, mask), _select_recovery_hits(misaligned, mask)
+    selected_event_count = len(
+        {identity.event_nr for identity, use in zip(nominal.identities, selected) if use}
+    )
+    metadata = {
+        "available_unique_events": len(available_events),
+        "selected_unique_events": selected_event_count,
+    }
+    return (
+        replace(_select_recovery_hits(nominal, mask), **metadata),
+        replace(_select_recovery_hits(misaligned, mask), **metadata),
+    )
 
 
 def build_hit_identities(
@@ -1307,9 +1318,13 @@ def build_argument_parser(config: ProjectConfig | None = None) -> argparse.Argum
     parser.add_argument("--misaligned-geometry", type=absolute_project_path, default=defaults["misaligned_geometry"])
     parser.add_argument("--target-layers", type=_parse_cli_layers, default=config.target_layers)
     parser.add_argument(
-        "--event-partition", choices=(*PARTITIONS, "all"), default="validation"
+        "--event-partition", choices=("all",), default="all",
+        help="Legacy compatibility flag; hash partitions are disabled.",
     )
-    parser.add_argument("--event-split-seed", type=int, default=DEFAULT_SPLIT_SEED)
+    parser.add_argument(
+        "--max-events", type=int, default=20000,
+        help="Keep the lowest N unique event_nr values after full pairing; 0 keeps all.",
+    )
     parser.add_argument("--exposure", choices=("both", "protected", "exposed"), default="both")
     parser.add_argument("--max-tracks", type=int, default=0)
     parser.add_argument("--output-dir", type=absolute_project_path, default=defaults["output_dir"])
@@ -1466,8 +1481,8 @@ def _effective_experiment_config(args, *, device: torch.device, dtype: torch.dty
         "nominal_geometry": args.nominal_geometry,
         "misaligned_geometry": args.misaligned_geometry,
         "target_layers": [f"{volume}:{layer}" for volume, layer in args.target_layers],
-        "event_partition": args.event_partition,
-        "event_split_seed": args.event_split_seed,
+        "event_selection": "lowest_unique_event_nr",
+        "max_events": args.max_events,
         "exposures": list(_selected_exposures(args.exposure)),
         "max_tracks": args.max_tracks,
         "seed_iterations": args.seed_iters,
@@ -1484,6 +1499,8 @@ def _cohort_counts(nominal: RecoveryHitInputs, cohort: PairedRecoveryCohort) -> 
     tracks = {(identity.event_nr, identity.track_nr) for identity in nominal.identities}
     return {
         "paired_measured_hits": len(nominal.identities),
+        "available_unique_events": nominal.available_unique_events,
+        "selected_unique_events": nominal.selected_unique_events,
         "paired_unique_tracks": len(tracks),
         "paired_target_hits": int(nominal.target_mask.sum()),
         "frozen_probe_rows": cohort.n_rows,
@@ -1535,8 +1552,8 @@ def main(argv: list[str] | None = None) -> int:
     requested_config, _unknown = config_probe.parse_known_args(raw_arguments)
     config = load_project_config(requested_config.config)
     args = build_argument_parser(config).parse_args(raw_arguments)
-    if args.max_tracks < 0:
-        raise ValueError("--max-tracks must be non-negative")
+    if args.max_events < 0 or args.max_tracks < 0:
+        raise ValueError("--max-events and --max-tracks must be non-negative")
     if args.seed_iters < 1 or args.refit_iters < 1 or args.bootstrap_replicates < 1:
         raise ValueError("iteration and bootstrap budgets must be positive")
 
@@ -1608,7 +1625,7 @@ def main(argv: list[str] | None = None) -> int:
             args.misaligned_geometry,
             target_layers=args.target_layers,
             event_partition=args.event_partition,
-            event_split_seed=args.event_split_seed,
+            max_events=args.max_events,
             max_tracks=args.max_tracks,
         )
         cohort = freeze_paired_cohort(nominal, misaligned)

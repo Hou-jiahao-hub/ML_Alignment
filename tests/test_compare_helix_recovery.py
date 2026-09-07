@@ -187,7 +187,7 @@ def _cli_fixture(tmp_path, *, additional_layer_event=None):
     return nominal_states, misaligned_states, nominal_geometry, misaligned_geometry
 
 
-def test_paired_root_loader_preserves_state_ordinal_then_partitions_and_caps_tracks(tmp_path):
+def test_paired_root_loader_preserves_state_ordinal_then_caps_tracks(tmp_path):
     m = load_module()
     nominal_states, misaligned_states, nominal_geometry, misaligned_geometry, _tracks = (
         _loader_fixture(tmp_path)
@@ -199,17 +199,60 @@ def test_paired_root_loader_preserves_state_ordinal_then_partitions_and_caps_tra
         nominal_geometry,
         misaligned_geometry,
         target_layers=((17, 8),),
-        event_partition="validation",
-        event_split_seed=6006,
-        max_tracks=1,
+        event_partition="all",
+        max_events=2,
+        max_tracks=2,
     )
 
-    assert [(item.event_nr, item.track_nr) for item in nominal.identities] == [(5, 10), (5, 10)]
-    assert [item.occurrence for item in nominal.identities] == [0, 1]
+    assert [(item.event_nr, item.track_nr) for item in nominal.identities] == [
+        (2, 30), (2, 30), (5, 10), (5, 10)
+    ]
+    assert [item.occurrence for item in nominal.identities] == [0, 1, 0, 1]
     assert nominal.identities == misaligned.identities
-    assert nominal.target_mask.tolist() == [False, True]
-    assert nominal.sensor_idx.tolist() == [0, 1]
-    assert misaligned.sensor_idx.tolist() == [1, 0]
+    assert nominal.target_mask.tolist() == [False, True, False, True]
+    assert nominal.sensor_idx.tolist() == [0, 1, 0, 1]
+    assert misaligned.sensor_idx.tolist() == [1, 0, 1, 0]
+
+
+def test_paired_root_loader_selects_complete_lowest_unique_events_without_hashing(tmp_path):
+    m = load_module()
+    nominal_states, misaligned_states, nominal_geometry, misaligned_geometry, _tracks = (
+        _loader_fixture(tmp_path)
+    )
+
+    nominal, misaligned = m.load_paired_recovery_inputs(
+        nominal_states,
+        misaligned_states,
+        nominal_geometry,
+        misaligned_geometry,
+        target_layers=((17, 8),),
+        event_partition="all",
+        max_events=1,
+    )
+
+    assert {identity.event_nr for identity in nominal.identities} == {2}
+    assert nominal.identities == misaligned.identities
+    assert nominal.available_unique_events == 2
+    assert nominal.selected_unique_events == 1
+    assert len(nominal.identities) == 2
+
+
+def test_paired_root_loader_rejects_hash_partitions(tmp_path):
+    m = load_module()
+    nominal_states, misaligned_states, nominal_geometry, misaligned_geometry, _tracks = (
+        _loader_fixture(tmp_path)
+    )
+
+    with pytest.raises(ValueError, match="hash partition"):
+        m.load_paired_recovery_inputs(
+            nominal_states,
+            misaligned_states,
+            nominal_geometry,
+            misaligned_geometry,
+            target_layers=((17, 8),),
+            event_partition="validation",
+            max_events=1,
+        )
 
 
 def test_paired_root_loader_occurrence_is_original_jagged_state_ordinal(tmp_path):
@@ -239,8 +282,8 @@ def test_paired_root_loader_refuses_measurement_mismatch_before_partition_filter
     nominal_states, misaligned_states, nominal_geometry, misaligned_geometry, tracks = (
         _loader_fixture(tmp_path)
     )
-    # The mismatch is in calibration event 2 while validation is requested.
-    _write_trackstates(misaligned_states, tracks, local_x_override=(2, 1, 999.0))
+    # The mismatch is in event 5, outside the one-event selection window.
+    _write_trackstates(misaligned_states, tracks, local_x_override=(0, 0, 999.0))
 
     with pytest.raises(ValueError, match="measurement coordinates"):
         m.load_paired_recovery_inputs(
@@ -249,7 +292,8 @@ def test_paired_root_loader_refuses_measurement_mismatch_before_partition_filter
             nominal_geometry,
             misaligned_geometry,
             target_layers=((17, 8),),
-            event_partition="validation",
+            event_partition="all",
+            max_events=1,
         )
 
 
@@ -302,8 +346,8 @@ def test_cli_defaults_and_help_follow_project_layout():
     help_text = parser.format_help()
 
     assert args.target_layers == config.target_layers
-    assert args.event_partition == "validation"
-    assert args.event_split_seed == 6006
+    assert args.event_partition == "all"
+    assert args.max_events == 20000
     assert args.exposure == "both"
     assert args.max_tracks == 0
     assert args.seed_iters == 200
@@ -327,7 +371,7 @@ def test_cli_defaults_and_help_follow_project_layout():
         "--misaligned-geometry",
         "--target-layers",
         "--event-partition",
-        "--event-split-seed",
+        "--max-events",
         "--exposure",
         "--max-tracks",
         "--output-dir",
@@ -416,12 +460,12 @@ def test_cli_writes_selected_exposure_artifacts_and_completed_manifest(tmp_path)
 
 
 @pytest.mark.parametrize(
-    ("additional_layer_event", "event_partition", "max_tracks"),
-    ((None, "all", 0), (2, "validation", 0), (6, "all", 1)),
-    ids=("absent-from-root", "removed-by-partition", "removed-by-track-cap"),
+    ("additional_layer_event", "max_events", "max_tracks"),
+    ((None, 0, 0), (6, 1, 0), (6, 0, 1)),
+    ids=("absent-from-root", "removed-by-event-cap", "removed-by-track-cap"),
 )
 def test_cli_keeps_requested_layers_missing_after_input_selection_inconclusive(
-    tmp_path, additional_layer_event, event_partition, max_tracks
+    tmp_path, additional_layer_event, max_events, max_tracks
 ):
     m = load_module()
     paths = _cli_fixture(tmp_path, additional_layer_event=additional_layer_event)
@@ -433,7 +477,8 @@ def test_cli_keeps_requested_layers_missing_after_input_selection_inconclusive(
             "--nominal-geometry", str(paths[2]),
             "--misaligned-geometry", str(paths[3]),
             "--target-layers", "17:8,24:4",
-            "--event-partition", event_partition,
+            "--event-partition", "all",
+            "--max-events", str(max_events),
             "--max-tracks", str(max_tracks),
             "--output-dir", str(output_dir),
             "--seed-iters", "8",
@@ -649,13 +694,8 @@ def test_cli_rejects_missing_input_colliding_with_future_manifest(tmp_path, caps
     assert "collision" in capsys.readouterr().err.lower()
 
 
-@pytest.mark.parametrize(
-    ("target_layers", "event_partition"),
-    (("24:4", "all"), ("17:8", "calibration")),
-    ids=("no-target-probes", "no-selected-events"),
-)
 def test_cli_reports_empty_requested_cohort_as_inconclusive_without_fitting(
-    tmp_path, monkeypatch, target_layers, event_partition
+    tmp_path, monkeypatch
 ):
     m = load_module()
     paths = _cli_fixture(tmp_path)
@@ -672,8 +712,8 @@ def test_cli_reports_empty_requested_cohort_as_inconclusive_without_fitting(
             "--misaligned-states", str(paths[1]),
             "--nominal-geometry", str(paths[2]),
             "--misaligned-geometry", str(paths[3]),
-            "--target-layers", target_layers,
-            "--event-partition", event_partition,
+            "--target-layers", "24:4",
+            "--event-partition", "all",
             "--output-dir", str(output_dir),
             "--bootstrap-replicates", "7",
         ]
@@ -687,7 +727,7 @@ def test_cli_reports_empty_requested_cohort_as_inconclusive_without_fitting(
         assert len(groups) == 6
         for mode in ("interpolation", "forward_extrapolation", "backward_extrapolation"):
             for component in ("LOC0", "LOC1"):
-                group = groups[f"{target_layers}|{mode}|{component}"]
+                group = groups[f"24:4|{mode}|{component}"]
                 assert group["requested_count"] == group["valid_count"] == 0
                 assert group["recovery_ratio_q"] is None
                 assert group["verdict"] == "inconclusive"
@@ -898,6 +938,8 @@ def test_cli_fit_failure_preserves_already_available_cohort_counts(tmp_path, mon
     assert manifest["status"] == "failed"
     assert manifest["metrics"]["failure_reason"] == "RuntimeError: fit failed"
     assert manifest["metrics"]["cohort_counts"] == {
+        "available_unique_events": 1,
+        "selected_unique_events": 1,
         "paired_measured_hits": 11,
         "paired_unique_tracks": 1,
         "paired_target_hits": 1,
