@@ -167,6 +167,10 @@ def test_alignment_summary_keeps_stage_metrics_without_large_tensor_payloads(tmp
     assert summary["fisher_summary"] == {
         "evaluations": 2,
         "accepted_steps": 1,
+        "rejected_steps": 1,
+        "damping_retries": 0,
+        "lstsq_fallbacks": 0,
+        "clipped_steps": 0,
         "finite_condition_max": 10.0,
         "regularization_max": 0.5,
     }
@@ -695,3 +699,224 @@ def test_unknown_joint_refit_solver_is_rejected():
 
     with pytest.raises(ValueError, match="Unknown joint measurement refit solver"):
         m.fit_helices_to_measurements(batches, geometry, seed, solver="lbfgs")
+
+
+def test_block_lm_free_dof_mask_freezes_only_outward_pointing_bounds():
+    m = load_ml_alignment_autograd_module()
+    lower = torch.tensor([-1.0, -1.0, -1.0, -1.0, -1.0])
+    upper = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0])
+    #        at upper    at upper    at lower    at lower    interior
+    values = torch.tensor([1.0, 1.0, -1.0, -1.0, 0.25])
+    #        g<0 outward g>0 inward  g>0 outward g<0 inward  any
+    gradient = torch.tensor([-3.0, 3.0, 3.0, -3.0, 7.0])
+
+    free = m._block_lm_free_dof_mask(values, gradient, lower, upper)
+
+    assert free.tolist() == [False, True, False, True, True]
+
+
+def test_block_lm_free_dof_mask_keeps_a_vanishing_gradient_free():
+    m = load_ml_alignment_autograd_module()
+    lower = torch.tensor([-1.0, -1.0])
+    upper = torch.tensor([1.0, 1.0])
+    values = torch.tensor([1.0, -1.0])
+
+    free = m._block_lm_free_dof_mask(values, torch.zeros(2), lower, upper)
+
+    assert free.tolist() == [True, True]
+
+
+def test_block_lm_decrement_matches_the_closed_form_on_a_full_rank_block():
+    m = load_ml_alignment_autograd_module()
+    fisher = torch.diag(torch.tensor([4.0, 1.0], dtype=torch.float64))
+    gradient = torch.tensor([2.0, 2.0], dtype=torch.float64)
+
+    report = m._block_lm_decrement(fisher, gradient, torch.tensor([True, True]), 1e-4)
+
+    assert report["lambda2"] == pytest.approx(5.0)  # 4/4 + 4/1
+    assert report["n_free"] == 2
+    assert report["rank_deficient"] is False
+    assert report["lambda2_is_lower_bound"] is False
+    assert report["null_gradient_max"] == 0.0
+
+
+def test_block_lm_decrement_drops_floor_supported_directions_and_says_so():
+    m = load_ml_alignment_autograd_module()
+    fisher = torch.diag(torch.tensor([4.0, 1e-9], dtype=torch.float64))
+    free = torch.tensor([True, True])
+
+    quiet = m._block_lm_decrement(fisher, torch.tensor([2.0, 0.0], dtype=torch.float64), free, 1e-4)
+    loud = m._block_lm_decrement(fisher, torch.tensor([2.0, 1.0], dtype=torch.float64), free, 1e-4)
+
+    # The weak direction is dropped from both sums, so neither may be read as
+    # convergence evidence -- but only the second still has gradient sitting in it.
+    assert quiet["lambda2"] == pytest.approx(1.0)
+    assert loud["lambda2"] == pytest.approx(1.0)
+    assert quiet["rank_deficient"] is True and loud["rank_deficient"] is True
+    assert quiet["lambda2_is_lower_bound"] is True
+    assert quiet["null_gradient_max"] == pytest.approx(0.0)
+    assert loud["null_gradient_max"] == pytest.approx(1.0)
+
+
+def test_block_lm_decrement_never_exceeds_a_regularized_solve():
+    """Regularizing before solving can only shrink the decrement, which is why
+    the stationarity check refuses to do it."""
+    m = load_ml_alignment_autograd_module()
+    fisher = torch.tensor([[4.0, 1.0], [1.0, 2.0]], dtype=torch.float64)
+    gradient = torch.tensor([3.0, -1.0], dtype=torch.float64)
+    free = torch.tensor([True, True])
+
+    exact = m._block_lm_decrement(fisher, gradient, free, 0.0)["lambda2"]
+    damped = float(
+        gradient
+        @ torch.linalg.solve(fisher + 1e-3 * torch.eye(2, dtype=torch.float64), gradient)
+    )
+
+    assert exact == pytest.approx(float(gradient @ torch.linalg.solve(fisher, gradient)))
+    assert damped < exact
+
+
+def test_block_lm_decrement_reports_a_kkt_point_when_the_free_set_is_empty():
+    m = load_ml_alignment_autograd_module()
+    fisher = torch.diag(torch.tensor([4.0, 1.0], dtype=torch.float64))
+    gradient = torch.tensor([2.0, 2.0], dtype=torch.float64)
+
+    report = m._block_lm_decrement(fisher, gradient, torch.tensor([False, False]), 1e-4)
+
+    assert report["lambda2"] == 0.0
+    assert report["n_free"] == 0
+    assert report["rank_deficient"] is False
+    assert report["null_gradient_max"] == 0.0
+
+
+def test_block_lm_fixed_chi2_scores_a_candidate_on_the_original_component_set():
+    m = load_ml_alignment_autograd_module()
+    covariance = torch.full((3, 2), 0.01, dtype=torch.float64)
+    fixed_mask = torch.tensor([[True, True], [True, False], [True, False]])
+    current = torch.tensor([[0.1, 0.1], [0.1, 9.0], [3.0, 9.0]], dtype=torch.float64)
+    # The candidate improves two components and abandons the hardest one.
+    candidate = torch.tensor([[0.05, 0.05], [0.05, 9.0], [3.0, 9.0]], dtype=torch.float64)
+    candidate_mask = torch.tensor([[True, True], [True, False], [False, False]])
+
+    before = float(m._block_lm_fixed_chi2(current, covariance, fixed_mask))
+    after = float(m._block_lm_fixed_chi2(candidate, covariance, fixed_mask))
+
+    assert before == pytest.approx((0.01 + 0.01 + 0.01 + 9.0) / 0.01)
+    assert after == pytest.approx((0.0025 + 0.0025 + 0.0025 + 9.0) / 0.01)
+    assert after < before
+    # The mean over each side's own mask is the trap: dropping the 3.0 residual
+    # makes the candidate look better than it is.
+    stale = float(
+        (current.square() / covariance)[fixed_mask].mean()
+    )
+    misleading = float(
+        (candidate.square() / covariance)[candidate_mask].mean()
+    )
+    assert misleading < stale / 100.0
+
+
+def _block_lm_translation_case(m):
+    """The two-plane analytic block-LM problem, shared with test_joint_alignment.
+
+    Normal along x, local axes (y, z), target centre offset by 0.4 mm in y, and
+    twelve straight zero-curvature tracks, so the loc0 residual is exactly
+    ``0.4 + tx`` with unit derivative.  With sigma = 0.1 over m = 12 rows that
+    fixes ``H = m / sigma^2 = 1200`` and ``lambda2 = 1200 e^2`` in closed form.
+    """
+    module_path = Path(__file__).resolve().parent / "test_joint_alignment.py"
+    spec = importlib.util.spec_from_file_location("test_joint_alignment", module_path)
+    joint_tests = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = joint_tests
+    spec.loader.exec_module(joint_tests)
+    return joint_tests._block_lm_translation_problem(m)
+
+
+def test_block_lm_audit_reports_the_closed_form_curvature_and_convergence():
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, tracks = _block_lm_translation_case(m)
+    config = m.AlignmentRunConfig(
+        track_mode="free", joint_solver="block-lm", lm_max_iters=8,
+        lambda_l2=0.0, make_plot=False,
+    )
+
+    result = m.run_block_lm_alignment(batches, geometry, config, (0,), tracks)
+    summary = result["block_lm_summary"]
+
+    assert summary["arm"] == "audit-only"
+    assert summary["claim_scope"] == "convergence-contract-only"
+    assert summary["stationary_threshold"] == m.BLOCK_LM_DECREMENT_STATIONARY
+    # H = m / sigma^2 = 12 / 0.01, exactly, and the block is full rank.
+    assert summary["rank"]["min_eigenvalue_min"] == pytest.approx(1200.0)
+    assert summary["rank"]["floor_limited_blocks"] == 0
+    assert summary["status_counts"]["converged"] == 1
+    assert summary["converged_detail"] == {"interior": 1, "boundary": 0}
+    assert summary["decrement_per_component"]["non_stationary_block_fraction"] == 0.0
+    # The step cap binds while the 0.4 mm offset is walked down; that is a trust
+    # region, not a constraint boundary, so no DOF is frozen.
+    assert summary["trust_region"]["clipped_steps"] == 3
+    assert summary["boundary"]["frozen_dof_total"] == 0
+
+
+def test_block_lm_audit_separates_budget_exhaustion_from_convergence():
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, _truth, seed = build_synthetic_joint_case(m)
+    config = m.AlignmentRunConfig(
+        track_mode="free", joint_solver="block-lm", lm_max_iters=12,
+        lambda_l2=0.0, make_plot=False,
+    )
+
+    result = m.run_block_lm_alignment(batches, geometry, config, (0, 1, 5), seed)
+    summary = result["block_lm_summary"]
+
+    # The production arm reports stopped_early = False and calls it a day; the
+    # audit says the block never reached a stationary point at all.
+    assert result["stopped_early"] is False
+    assert result["stop_reason"] == "iteration_budget"
+    assert summary["status_counts"]["converged"] == 0
+    assert summary["status_counts"]["budget_exhausted"] == 1
+    assert summary["decrement_per_component"]["non_stationary_block_fraction"] == 1.0
+    assert summary["decrement_per_component"]["max"] > m.BLOCK_LM_DECREMENT_STATIONARY
+
+
+def test_block_lm_audit_records_the_fixed_set_alongside_the_moving_mask():
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, tracks = _block_lm_translation_case(m)
+    config = m.AlignmentRunConfig(
+        track_mode="free", joint_solver="block-lm", lm_max_iters=4,
+        lambda_l2=0.0, make_plot=False,
+    )
+
+    result = m.run_block_lm_alignment(batches, geometry, config, (0,), tracks)
+
+    assert result["fisher_diagnostics"]
+    for entry in result["fisher_diagnostics"]:
+        assert entry["n_components_fixed"] == 24
+        assert entry["component_loss"] is False
+        # No component is lost here, so the two calibers must agree exactly: the
+        # audit adds a reading, it does not redefine the objective.
+        assert entry["chi2_fixed_after"] / entry["n_components_fixed"] == pytest.approx(
+            entry["loss_after"]
+        )
+        assert entry["chi2_fixed_before"] / entry["n_components_fixed"] == pytest.approx(
+            entry["loss_before"]
+        )
+
+
+def test_block_lm_audit_summary_survives_the_json_round_trip():
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, tracks = _block_lm_translation_case(m)
+    config = m.AlignmentRunConfig(
+        track_mode="free", joint_solver="block-lm", lm_max_iters=4,
+        lambda_l2=0.0, make_plot=False,
+    )
+    result = m.run_block_lm_alignment(batches, geometry, config, (0,), tracks)
+
+    written = json.loads(
+        json.dumps(m._json_ready(result["block_lm_summary"]), allow_nan=False)
+    )
+
+    assert written["arm"] == "audit-only"
+    assert set(written["status_counts"]) == set(m.BLOCK_LM_TERMINAL_STATUSES)
+    # Per-sensor detail stays in memory only.
+    assert "blocks" not in written
