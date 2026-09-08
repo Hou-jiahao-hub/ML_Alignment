@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import importlib.util
+import io
 import json
 import sys
 from dataclasses import replace
@@ -187,6 +188,66 @@ def _cli_fixture(tmp_path, *, additional_layer_event=None):
     return nominal_states, misaligned_states, nominal_geometry, misaligned_geometry
 
 
+def test_recovery_root_opener_uses_memmap_for_existing_local_file(tmp_path, monkeypatch):
+    m = load_module()
+    local_path = tmp_path / "states.root"
+    local_path.touch()
+    sentinel = object()
+    calls = []
+
+    def open_root(path, **options):
+        calls.append((path, options))
+        return sentinel
+
+    monkeypatch.setattr(m.uproot, "open", open_root)
+
+    assert m._open_recovery_root(local_path) is sentinel
+    assert calls == [(local_path, {"handler": m.uproot.MemmapSource})]
+
+
+@pytest.mark.parametrize("source", ("https://example.invalid/states.root", io.BytesIO(b"root")))
+def test_recovery_root_opener_preserves_default_source_for_nonlocal_inputs(source, monkeypatch):
+    m = load_module()
+    sentinel = object()
+    calls = []
+
+    def open_root(path, **options):
+        calls.append((path, options))
+        return sentinel
+
+    monkeypatch.setattr(m.uproot, "open", open_root)
+
+    assert m._open_recovery_root(source) is sentinel
+    assert len(calls) == 1
+    assert calls[0][0] is source
+    assert calls[0][1] == {}
+
+
+def test_paired_root_loader_opens_both_branches_through_shared_helper(tmp_path, monkeypatch):
+    m = load_module()
+    nominal_states, misaligned_states, nominal_geometry, misaligned_geometry, _tracks = (
+        _loader_fixture(tmp_path)
+    )
+    original_open = m.uproot.open
+    opened = []
+
+    def open_recovery_root(path):
+        opened.append(path)
+        return original_open(path, handler=m.uproot.MemmapSource)
+
+    monkeypatch.setattr(m, "_open_recovery_root", open_recovery_root, raising=False)
+
+    m.load_paired_recovery_inputs(
+        nominal_states,
+        misaligned_states,
+        nominal_geometry,
+        misaligned_geometry,
+        target_layers=((17, 8),),
+    )
+
+    assert opened == [nominal_states, misaligned_states]
+
+
 def test_paired_root_loader_preserves_state_ordinal_then_caps_tracks(tmp_path):
     m = load_module()
     nominal_states, misaligned_states, nominal_geometry, misaligned_geometry, _tracks = (
@@ -255,7 +316,7 @@ def test_paired_root_loader_rejects_hash_partitions(tmp_path):
         )
 
 
-def test_paired_root_loader_occurrence_is_original_jagged_state_ordinal(tmp_path):
+def test_paired_root_loader_occurrence_is_measured_state_ordinal(tmp_path):
     m = load_module()
     nominal_states, misaligned_states, nominal_geometry, misaligned_geometry, _tracks = (
         _loader_fixture(tmp_path)
@@ -274,7 +335,34 @@ def test_paired_root_loader_occurrence_is_original_jagged_state_ordinal(tmp_path
         identity for identity in nominal.identities
         if (identity.event_nr, identity.track_nr) == (5, 20)
     ]
-    assert [identity.occurrence for identity in duplicate_states] == [0, 2]
+    assert [identity.occurrence for identity in duplicate_states] == [0, 1]
+
+
+def test_paired_root_loader_ignores_branch_local_nonmeasurement_state_positions(tmp_path):
+    m = load_module()
+    nominal_states, misaligned_states, nominal_geometry, misaligned_geometry, tracks = (
+        _loader_fixture(tmp_path)
+    )
+    shifted = list(tracks)
+    event, track, states = shifted[0]
+    shifted[0] = (event, track, [states[1], states[0], states[2]])
+    _write_trackstates(misaligned_states, shifted)
+
+    nominal, misaligned = m.load_paired_recovery_inputs(
+        nominal_states,
+        misaligned_states,
+        nominal_geometry,
+        misaligned_geometry,
+        target_layers=((17, 8),),
+        event_partition="all",
+    )
+
+    assert nominal.identities == misaligned.identities
+    shifted_track = [
+        identity for identity in nominal.identities
+        if (identity.event_nr, identity.track_nr) == (5, 20)
+    ]
+    assert [identity.occurrence for identity in shifted_track] == [0, 1]
 
 
 def test_paired_root_loader_refuses_measurement_mismatch_before_partition_filtering(tmp_path):

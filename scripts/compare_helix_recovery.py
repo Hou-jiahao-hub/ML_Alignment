@@ -189,14 +189,20 @@ def _flatten_jagged(array) -> np.ndarray:
     return ak.to_numpy(ak.flatten(array, axis=None))
 
 
+def _open_recovery_root(path):
+    """Open regular local files without routing reads through fsspec asyncio."""
+    if isinstance(path, (str, Path)) and Path(path).is_file():
+        return uproot.open(path, handler=uproot.MemmapSource)
+    return uproot.open(path)
+
+
 def _load_recovery_branch(
     path: str | Path,
     geometry: NominalGeometry,
     target_layers: tuple[tuple[int, int], ...],
 ) -> RecoveryHitInputs:
-    """Load one branch while retaining each measurement's source state ordinal."""
-    path = Path(path)
-    with uproot.open(path) as root_file:
+    """Load one branch with an ordinal over measured states within each track."""
+    with _open_recovery_root(path) as root_file:
         if "trackstates" not in root_file:
             raise ValueError(f"ROOT file {path} has no 'trackstates' tree.")
         tree = root_file["trackstates"]
@@ -224,13 +230,16 @@ def _load_recovery_branch(
     )
     flat["event_nr"] = np.repeat(events, counts)
     flat["track_nr"] = np.repeat(tracks, counts)
-    flat["occurrence"] = np.concatenate(
-        [np.arange(int(count), dtype=np.int64) for count in counts]
-    ) if len(counts) else np.asarray([], dtype=np.int64)
 
     measured = np.isfinite(flat["l_x_hit"])
     if not measured.any():
         raise ValueError("No measured states with finite l_x_hit are available.")
+    measured_counts = ak.to_numpy(
+        ak.sum(np.isfinite(arrays["l_x_hit"]), axis=1)
+    )
+    measured_occurrence = np.concatenate(
+        [np.arange(int(count), dtype=np.int64) for count in measured_counts]
+    )
     module = flat["module_id"].astype(np.int64)
     if (measured & (module <= 0)).any():
         raise ValueError("Measured states must have positive module IDs.")
@@ -271,7 +280,7 @@ def _load_recovery_branch(
     volume_tensor = torch.tensor(flat["volume_id"][keep], dtype=torch.long)
     layer_tensor = torch.tensor(flat["layer_id"][keep], dtype=torch.long)
     module_tensor = torch.tensor(module[keep], dtype=torch.long)
-    occurrence_tensor = torch.tensor(flat["occurrence"][keep], dtype=torch.long)
+    occurrence_tensor = torch.tensor(measured_occurrence, dtype=torch.long)
     measured_y = np.where(loc1, flat["l_y_hit"][keep], 0.0)
     variance_y = np.where(loc1, np.square(flat["err_y_hit"][keep]), 1.0)
     return RecoveryHitInputs(
@@ -399,12 +408,12 @@ def build_hit_identities(
     module_id: torch.Tensor,
     occurrence: torch.Tensor | None = None,
 ) -> tuple[HitIdentity, ...]:
-    """Build identities without inventing a branch-local duplicate ordering.
+    """Build identities with a caller-supplied repeated-state occurrence.
 
-    A repeated ``(event, track, volume, layer, module)`` requires an explicit
-    occurrence from a shared state ordering established before the two branches
-    are split.  Source order is not such an ordering: ROOT branches may present
-    repeated states in a different order, which would silently swap a pair.
+    The ROOT loader numbers only measured states, so branch-local predicted,
+    filtered, or hole states cannot shift an otherwise identical measurement.
+    The paired contract separately requires identical measurement coordinates
+    and uncertainties, preventing reordered measured states from pairing silently.
     """
     values = (event_nr, track_nr, volume_id, layer_id, module_id)
     if any(value.ndim != 1 for value in values):

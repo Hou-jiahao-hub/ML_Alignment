@@ -197,12 +197,13 @@ parameters. Passing a single such matrix, rather than a batch, still raises.
 `compare_helix_recovery.py` tests whether the shared standalone helix machinery
 actually removes a branch-dependent geometry effect. It loads nominal and
 misaligned `trackstates` together with uproot and assigns every measured hit its
-original per-track jagged state ordinal. Before event splitting or track limits,
-the loader requires identical event/track/state identities, measurements,
-measurement uncertainties, target membership, and LOC availability. It never
-intersects mismatched files. SMT local/global positions, directions, and sensor
-indices remain branch-local; both fitted branches are evaluated on nominal
-surfaces for the final paired comparison.
+ordinal among measured states in that track. Predicted, filtered, and hole-state
+positions therefore cannot shift an otherwise identical measurement identity.
+Before event splitting or track limits, the loader requires identical
+event/track/state identities, measurements, measurement uncertainties, target
+membership, and LOC availability. It never intersects mismatched files. SMT
+local/global positions, directions, and sensor indices remain branch-local; both
+fitted branches are evaluated on nominal surfaces for the final paired comparison.
 
 Each retained target hit becomes one frozen probe row. The protected exposure
 fits only non-target measurements, while the exposed exposure additionally fits
