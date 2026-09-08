@@ -173,6 +173,7 @@ def main():
     }
     invalidated = False
     failures = []
+    undefined = []
 
     for volume, layer in layers:
         name = f"{volume}:{layer}"
@@ -204,18 +205,38 @@ def main():
         header = f"  {'dof':<6}{'err_rms(base)':>16}{'err_rms(cand)':>16}{'ratio':>10}{'95% CI':>22}{'':>8}"
         print(header)
         for column, dof in enumerate(DOF_NAMES):
-            interval = validation.paired_bootstrap_ci(
-                errors["baseline"], errors["candidate"],
-                ratio_statistic(column), rng, resamples=args.resamples,
+            finite_inputs = bool(
+                np.isfinite(errors["baseline"][:, column]).all()
+                and np.isfinite(errors["candidate"][:, column]).all()
+            )
+            interval = (
+                validation.paired_bootstrap_ci(
+                    errors["baseline"], errors["candidate"],
+                    ratio_statistic(column), rng, resamples=args.resamples,
+                )
+                if finite_inputs
+                else {
+                    "point": float("nan"),
+                    "low": float("nan"),
+                    "high": float("nan"),
+                    "n_finite_resamples": 0,
+                }
             )
             base = _rms(errors["baseline"][:, column])
             cand = _rms(errors["candidate"][:, column])
             high = interval["high"]
-            # 基线误差为零（或非有限）时比值没有定义，这不算失败，也不算通过。
-            undefined = not np.isfinite(high)
-            passed = bool(np.isfinite(high) and high <= NON_INFERIORITY_RATIO)
-            verdict = "n/a" if undefined else ("PASS" if passed else "FAIL")
-            if not undefined and not passed:
+            metric_undefined = bool(
+                not finite_inputs
+                or not all(
+                    np.isfinite(interval[key]) for key in ("point", "low", "high")
+                )
+                or interval.get("n_finite_resamples") != args.resamples
+            )
+            passed = bool(not metric_undefined and high <= NON_INFERIORITY_RATIO)
+            verdict = "n/a" if metric_undefined else ("PASS" if passed else "FAIL")
+            if metric_undefined:
+                undefined.append(f"{name}.{dof}")
+            elif not passed:
                 failures.append(f"{name}.{dof} (CI 上界 {high:.4f})")
             confidence = f"[{interval['low']:.4f}, {high:.4f}]"
             print(f"  {dof:<6}{base:>16.6g}{cand:>16.6g}{interval['point']:>10.4f}"
@@ -235,6 +256,9 @@ def main():
     if invalidated:
         report["verdict"] = "invalidated"
         print("结论：核对块 DIFFER，本次比较作废。两臂的 sensor 集合必须逐位相同。")
+    elif undefined:
+        report["verdict"] = "invalidated"
+        print("结论：存在未定义或非有限的非劣性指标，本次比较作废 —— " + "; ".join(undefined))
     elif failures:
         report["verdict"] = "failed"
         print("结论：非劣性未通过 —— " + "; ".join(failures))
@@ -242,6 +266,7 @@ def main():
         report["verdict"] = "passed"
         print(f"结论：所有 DOF 的比值 95% CI 上界 <= {NON_INFERIORITY_RATIO}，非劣性通过。")
     report["failures"] = failures
+    report["undefined"] = undefined
     print("宣称边界：两臂几何等价时只能宣称收敛契约得到验证，不得宣称物理精度提升；")
     print("          本判据不解释也不修正已知的 9.9 倍 truth 距离偏差。")
     print(P1_PRIME_NOTE)
@@ -249,7 +274,10 @@ def main():
     if args.json:
         destination = Path(args.json)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        destination.write_text(
+            json.dumps(autograd._json_ready(report), indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
         print(f"判定结果已写入 {destination}")
     return 0 if report["verdict"] == "passed" else 1
 

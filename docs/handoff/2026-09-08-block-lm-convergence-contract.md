@@ -4,18 +4,17 @@
 **分支**：`feat/full-event-calibration`
 **上游**：`docs/handoff/2026-09-07-alignment-methodology-roadmap.md` §L1
 **性质**：数值契约修复。**不是物理改动。**
-**状态**：代码与合成回归完成；真实数据两臂**尚未运行**。
+**状态**：预注册 v2 代码与合成回归完成；新的 B 臂 commit 待冻结，真实数据两臂**尚未运行**。
 
 ---
 
 ## 执行摘要
 
-**结果**：三个 commit（`e9c63b2` A 臂只加观测、`428ef57` B 臂契约修复、`fc89641` 预注册
-与离线验证脚本）。四个已知缺陷（全局 damping、拒绝后不重试、比较分量不固定、无驻点
-判据）全部修复，`484 passed, 3 skipped`，A 臂对合成问题的求解输出与 `37ed4f5`
-逐位相同。合成层的主/次判据、证伪构造（秩亏、求交失败、边界 KKT、block 解耦）均已
-写成回归并通过。新增 `scripts/analysis/compare_truth_rms.py` 并在合成几何上验证了
-通过/失败/作废三条分支。
+**结果**：v1 由三个 commit 构成（`e9c63b2` A 臂只加观测、`428ef57` B 臂契约修复、
+`fc89641` 预注册与离线验证脚本）。后续评审发现四条遗漏：未定义 truth 比值会误通过、
+有 hit 但全部求交失败的 sensor 会被排除、damping 经多次减半后八级重试达不到预注册的
+绝对尺度、`lstsq` fallback 没有粘滞为秩亏。v2 已分别补上先红后绿的回归并修复；A 臂
+仍固定为 `e9c63b2`，新的 B 臂应在本次修改提交后冻结，不能继续引用 `428ef57` 为最终 B。
 
 **遇到的问题**：详见 §13——既有测试的全等断言随新增诊断字段被打破、既有容差假设与
 新驻点契约冲突、damping 汇总统计口径选错导致断言失败、`block_lm_blocks` 的索引假设、
@@ -47,7 +46,7 @@
 
 ---
 
-## 1. 两个 commit
+## 1. 两阶段 commit 与 v2 评审修复
 
 按 roadmap L1「建议分两阶段实施」执行。最终代码里**没有 legacy 开关** —— A 臂的读数
 来自 stage-1 commit 本身，不需要在产品代码里留一条旧路径。
@@ -55,7 +54,8 @@
 | commit | 内容 | 验收 |
 |---|---|---|
 | `e9c63b2` | **A 臂**：只加观测量 | 合成两例 `predicted_deltas` 与 `history` 与 `37ed4f5` **逐位相同** |
-| `428ef57` | **B 臂**：契约修复 | 主/次判据回归全绿 |
+| `428ef57` | **原 v1 B 臂**：契约修复 | 被后续评审发现四条漏报／fail-open 路径，不再作为最终 B |
+| 待冻结 | **v2 B 臂**：评审加固 | 四条新增回归先红后绿；真实实验只允许引用冻结后的新 commit |
 
 A 臂的逐位验证做法：把两个合成 case 的 `predicted_deltas` 和 `history` 序列化成 JSON，
 在 `git stash` 前后各跑一次 `diff`。结果 `BIT-IDENTICAL`。
@@ -79,7 +79,7 @@ A 臂的逐位验证做法：把两个合成 case 的 `predicted_deltas` 和 `hi
 ## 3. 冻结的常量（`scripts/ml_alignment_autograd.py`）
 
 ```
-BLOCK_LM_PREREGISTRATION_VERSION = 1
+BLOCK_LM_PREREGISTRATION_VERSION = 2
 BLOCK_LM_DECREMENT_STATIONARY    = 1.0e-6     # 每 component
 BLOCK_LM_MAX_DAMPING_RETRIES     = 8
 BLOCK_LM_MAX_DAMPING             = 1.0e12
@@ -98,10 +98,14 @@ BLOCK_LM_BOUND_ATOL              = 1.0e-12
 正是本次要消灭的失效模式。所以这里的驻点判据一律不加任何正则，改用谱分解：弱于
 Fisher floor 的方向从求和里剔除，剩下的值标记为 `lambda2_is_lower_bound`。
 
-`BLOCK_LM_MAX_DAMPING_RETRIES = 8` 的理由：λ 从 `1e-3` 起 8 级到 `1e5`，此时步长约为
-GN 步的 `1e-8` 倍、方向趋近最速下降，对光滑目标必然下降（除非梯度已消失，那由驻点
-判据先拦下）。8 级后仍不降 ⇒ 光滑性假设被证伪（`intersect_plane` 的有效性分支与
-`|s| ≤ 1200 mm` 截断），值得单独报告而非继续烧预算。
+`BLOCK_LM_MAX_DAMPING_RETRIES = 8` 的理由：重试阶梯以不低于生产初值 `1e-3` 的尺度为锚，
+即使该 sensor 的 λ 曾因接受步反复减半，第一次重试也至少回到 `1e-2`，第八级达到 `1e5`。
+此时步长约为 GN 步的 `1e-8` 倍、方向趋近最速下降，对光滑目标必然下降（除非梯度已
+消失，那由驻点判据先拦下）。8 级后仍不降 ⇒ 光滑性假设被证伪（`intersect_plane` 的
+有效性分支与 `|s| ≤ 1200 mm` 截断），值得单独报告而非继续烧预算。
+
+有目标 hit 但当前全部求交失败的 sensor 直接报告 `intersection_failed`；只有确实没有
+目标 hit 的 sensor 才是内部 `no_data`，后者不进入四类终态分母。
 
 ---
 
@@ -257,7 +261,8 @@ CI，**上界 ≤ 1.01** 为非劣性通过。复用 `validate_helix_model.paire
 那个失效模式（50 行健康数据被丢掉，RMSE 从 0.8427「改善」到 0.4921）。现在 `expected`
 是全集，差异交给 `parity()` 报。
 
-三条分支都已用合成几何验证：通过 → exit 0；非劣性失败 → exit 1；集合不同 → 作废 + exit 1。
+四条分支均 fail closed：通过 → exit 0；非劣性失败 → exit 1；集合不同 → 作废 + exit 1；
+任一输入误差或 bootstrap CI 非有限、基线 RMS 为零、有限重采样数不足 → 作废 + exit 1。
 
 ---
 
@@ -266,8 +271,9 @@ CI，**上界 ≤ 1.01** 为非劣性通过。复用 `validate_helix_model.paire
 1. 在 `docs/history/ml_optimization_log.md` 写预注册条目（**跑任何真实数据之前**）；
 2. 跑真实 train **A 臂**：`git checkout e9c63b2`，`experiment_manifest` finalize，
    存 `summary_A.json`；核对 `predicted_deltas` 与既有基线逐位相同；
-3. 跑真实 train **B 臂**（当前 HEAD）。必须冻结：同一 train event-key hash、同一
-   refitted track 参数文件及哈希、同一目标 sensor / active DOF / measurement /
+3. 将 v2 修复提交并记录 commit 后，跑真实 train **B 臂**。不得再用 `428ef57` 充当最终
+   B。必须冻结：同一 train event-key hash、同一 refitted track 参数文件及哈希、同一
+   目标 sensor / active DOF / measurement /
    covariance / 初始几何、同一求交容差 / Fisher floor / 步长上限 / 硬边界。
    **不跑 calibration，不跑 validation，不跑 surface polish。**
 4. `compare_truth_rms.py` 比 A vs B；
@@ -350,6 +356,22 @@ parity 核对完全不触发——差点重犯 damping-v2 §4.1 记录过的错�
 改动，先查样本量"——这次是脚本自己先犯了一次，靠对着三条分支（通过/失败/作废）实测
 才抓出来。
 
+**问题 8：未定义的 truth RMS 比值被整体判为 `passed`。** 基线 RMS 为零或 CI 非有限时，
+单项虽显示 `n/a`，却没有进入 failures，顶层因而走到 passed。v2 将非有限输入、非有限
+point/CI、有限 bootstrap 数不足全部列为 `undefined`，整体 `invalidated` 并返回非零。
+
+**问题 9：有 hit 但全部求交失败的 sensor 被记为 `no_data`。** 该路径的
+`n_components_end` 从未赋值，终态函数把它与真正没有 hit 混为一类，并从统计分母排除。
+v2 将前者明确标为 `intersection_failed`；`no_data` 只保留给完全没有目标 hit 的 sensor。
+
+**问题 10：八级 damping 阶梯可能达不到论证中的 `1e5`。** 每次接受会将逐 sensor λ
+减半，长期运行后可能降到 `1e-12`；原实现从该值只乘八次十，最高仅 `1e-4`。v2 的重试
+编号同时锚定生产初值，因此无论携带 λ 多小，第八级均能达到 `1e5`。
+
+**问题 11：`lstsq` fallback 只被计数，没有进入秩亏终态。** 这与 §4 的预注册优先级
+矛盾，并可能在最后谱看似满秩时被报成 converged。v2 将任何历史 fallback 作为粘滞的
+`rank_deficient` 证据。
+
 ---
 
 ## 13. 环境
@@ -359,7 +381,7 @@ parity 核对完全不触发——差点重犯 damping-v2 §4.1 记录过的错�
 ```bash
 LD_LIBRARY_PATH=$HOME/miniconda3/envs/pytorch/lib \
   ~/miniconda3/envs/pytorch/bin/python -m pytest tests -q
-# 484 passed, 3 skipped, 11 deselected
+# 488 passed, 3 skipped, 11 deselected
 ```
 
 3 个 skip 是既有的环境跳过（AlignDerivLib pybind 扩展未构建、ACTS bindings 不可用）。

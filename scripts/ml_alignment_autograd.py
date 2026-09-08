@@ -134,7 +134,11 @@ LM_MAX_STEP_R = 5e-3
 #: validation verdicts, neither of which changes here.
 #: v1: the L1 audit -- per-sensor damping, retry after rejection, fixed
 #: comparison set, and a stationarity/KKT stopping test.
-BLOCK_LM_PREREGISTRATION_VERSION = 1
+#: v2: review hardening -- undefined truth comparisons fail closed, sensors
+#: with hits but no valid intersections remain visible, the retry ladder keeps
+#: its absolute scale after accepted-step damping reductions, and any least-
+#: squares fallback is sticky rank-deficiency evidence.
+BLOCK_LM_PREREGISTRATION_VERSION = 2
 
 #: Stationarity threshold for one sensor block, normalized by component count:
 #: a block is stationary when ``lambda2 / n_components <=`` this value, where
@@ -1089,6 +1093,21 @@ def _block_lm_fixed_chi2(residuals, covariance, fixed_mask):
     return torch.sum(torch.where(fixed_mask, weighted, torch.zeros_like(weighted)))
 
 
+def _block_lm_retry_damping(damping, initial_damping, retry_number):
+    """Raise damping on a retry without losing the pre-registered absolute ladder.
+
+    Accepted steps may have halved a sensor's damping as far as
+    ``BLOCK_LM_MIN_DAMPING``.  The retry number therefore anchors the ladder at
+    the production initial damping instead of merely multiplying that tiny
+    carried value eight times.
+    """
+    anchor = max(float(initial_damping), LM_INITIAL_DAMPING)
+    return min(
+        max(float(damping) * 10.0, anchor * (10.0 ** int(retry_number))),
+        BLOCK_LM_MAX_DAMPING,
+    )
+
+
 def _block_lm_free_dof_mask(values, gradient, lower, upper, atol=BLOCK_LM_BOUND_ATOL):
     """Active-set mask for the box constraints: which DOFs may still move.
 
@@ -1270,7 +1289,7 @@ def _block_lm_block_status(record):
         return BLOCK_LM_STATUS_NO_DATA
     if record.get("had_component_loss") or record.get("had_invalid_rejection"):
         return BLOCK_LM_STATUS_INTERSECTION_FAILED
-    if record.get("rank_deficient"):
+    if record.get("rank_deficient") or record.get("lstsq_fallbacks", 0) > 0:
         return BLOCK_LM_STATUS_RANK_DEFICIENT
     if record.get("stationary"):
         return BLOCK_LM_STATUS_CONVERGED
@@ -1580,6 +1599,14 @@ def run_block_lm_alignment(
             # a larger set is a different objective, with more terms in it.
             fixed_mask = component_mask.detach()
             if not fixed_mask.any():
+                # The sensor has target hits (otherwise current_data is None),
+                # but none currently intersect.  This is an intersection
+                # failure, not absence of data, and must remain in the status
+                # denominator.
+                record["n_components_start"] = 0
+                record["n_components_end"] = 0
+                record["had_invalid_rejection"] = True
+                record["retired_at_iteration"] = iteration
                 continue
             n_components = int(fixed_mask.sum())
             if record["n_components_start"] is None:
@@ -1756,8 +1783,10 @@ def run_block_lm_alignment(
                 # Written back, so the raised damping is used by the next solve
                 # whether that is this ladder's retry or the next iteration.
                 record["retries"] += 1
-                damping_by_sensor[sensor_index] = min(
-                    damping * 10.0, BLOCK_LM_MAX_DAMPING
+                damping_by_sensor[sensor_index] = _block_lm_retry_damping(
+                    damping,
+                    initial_damping=config.lm_initial_damping,
+                    retry_number=attempt + 1,
                 )
             if accepted:
                 still_active.append(sensor_index)

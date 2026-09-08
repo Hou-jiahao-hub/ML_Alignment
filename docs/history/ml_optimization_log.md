@@ -2664,3 +2664,33 @@ Fisher floor 撑起的方向本就不是被数据识别的模式。
 - B 驻点更好但 truth 变差 → 保留 baseline，转入 M1 查弱模／正则；
 - 两臂都非驻点 → 继续归因求交 Jacobian、尺度或边界，**禁止直接调大迭代数**；
 - 改善依赖丢 hit → 实验失败，修复接受规则后重新预注册版本。
+
+---
+
+## Iteration 28 — block-LM convergence contract v2 评审加固（预注册）
+
+**性质**：Iteration 27 的代码评审修复；不改变物理模型、输入集合或 truth 的地位。
+**状态**：写在真实 A/B 运行之前；合成回归完成，真实两臂仍待运行。
+
+评审发现 v1 的四条 fail-open／漏报路径，因此
+`BLOCK_LM_PREREGISTRATION_VERSION` 从 1 升为 2：
+
+1. `compare_truth_rms.py` 将未定义 CI 显示为 `n/a`，但顶层仍可能返回 `passed`；v2 对
+   非有限输入、非有限 point/CI、有限 bootstrap 数不足和零基线 RMS 一律 fail closed，
+   报 `invalidated` 并返回非零。
+2. sensor 有目标 hit、但当前所有交点都无效的时候，v1 因 `n_components_end is None`
+   把它归为 `no_data` 并从终态分母排除；v2 将其归为 `intersection_failed`。
+3. 接受步会反复将逐 sensor damping 减半，v1 的八次 ×10 重试可能从 `1e-12` 只爬到
+   `1e-4`，没有达到预注册论证中的 `1e5`；v2 用重试编号锚定生产初值，保持绝对阶梯。
+4. v1 只累计 `lstsq_fallbacks`，终态没有读取；v2 将任一次 fallback 作为粘滞的
+   `rank_deficient` 证据，保持 §4 的优先级。
+
+四条回归均先在 v1 上观察到预期失败，再以最小修改转绿。A 臂继续冻结为 `e9c63b2`；
+`428ef57` 只代表原 v1 B 臂，不得用于正式真实数据对照。真实运行前必须先提交本次 v2、
+记录新的 B commit，并继续遵守 Iteration 27 的输入冻结、双 manifest 和结果解释规则。
+
+验证：conda `pytorch` Python 3.10.20 下，定向套件 `82 passed, 1 deselected`；完整
+`make test` 为 `488 passed, 3 skipped, 11 deselected`。3 个 skip 仍是既有的 ACTS／
+AlignDerivLib 环境跳过。
+
+本轮没有运行真实算法实验，因此没有实验 manifest，也没有新增物理或精度结论。

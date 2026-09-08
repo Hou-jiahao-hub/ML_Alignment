@@ -1044,6 +1044,40 @@ def test_block_lm_retries_with_more_damping_after_a_rejection(monkeypatch):
     assert summary["status_counts"]["converged"] == 1
 
 
+def test_block_lm_retry_ladder_reaches_the_preregistered_absolute_scale(monkeypatch):
+    """Earlier halving must not stop the live solver's retry ladder below 1e5."""
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, tracks = _block_lm_translation_case(m)
+    genuine = m._block_lm_fixed_chi2
+    calls = {"n": 0}
+
+    def reject_first_eight(residuals, covariance, fixed_mask):
+        calls["n"] += 1
+        value = genuine(residuals, covariance, fixed_mask)
+        return value * 1e6 if calls["n"] <= 8 else value
+
+    monkeypatch.setattr(m, "_block_lm_fixed_chi2", reject_first_eight)
+    config = m.AlignmentRunConfig(
+        track_mode="free",
+        joint_solver="block-lm",
+        lm_max_iters=8,
+        lm_initial_damping=m.BLOCK_LM_MIN_DAMPING,
+        lambda_l2=0.0,
+        make_plot=False,
+    )
+
+    result = m.run_block_lm_alignment(batches, geometry, config, (0,), tracks)
+    first_visit = [
+        entry for entry in result["fisher_diagnostics"]
+        if entry["iteration"] == 0
+    ]
+
+    assert [entry["damping"] for entry in first_visit] == pytest.approx(
+        [1e-12, 1e-2, 1e-1, 1.0, 10.0, 100.0, 1e3, 1e4, 1e5]
+    )
+    assert first_visit[-1]["accepted"] is True
+
+
 @pytest.mark.parametrize("active_dof, iters", [((0,), 8), ((0, 1, 5), 20)])
 def test_block_lm_accepted_steps_never_lose_components(active_dof, iters):
     """Secondary criterion: no accepted step may drop a component that was
@@ -1093,6 +1127,22 @@ def test_block_lm_reports_a_structurally_blind_dof_as_rank_deficient():
     # Rank deficiency is reported, not treated as a reason to stop: the
     # well-determined direction is still solved.
     assert result["predicted_deltas"][1, 0] == pytest.approx(-0.4, abs=2e-3)
+
+
+def test_block_lm_lstsq_fallback_is_a_sticky_rank_deficient_terminal_state():
+    """A solve fallback is numerical rank evidence even if the last spectrum looks full rank."""
+    m = load_ml_alignment_autograd_module()
+    record = m._block_lm_new_record(7, m.AlignmentRunConfig())
+    record.update(
+        {
+            "n_components_end": 12,
+            "rank_deficient": False,
+            "stationary": True,
+            "lstsq_fallbacks": 1,
+        }
+    )
+
+    assert m._block_lm_block_status(record) == m.BLOCK_LM_STATUS_RANK_DEFICIENT
 
 
 def test_block_lm_refuses_a_candidate_that_buys_its_improvement_by_losing_a_hit(monkeypatch):
@@ -1195,3 +1245,41 @@ def test_block_lm_blocks_are_decoupled_across_target_sensors():
         corrections.append(result["predicted_deltas"][-1].copy())
 
     np.testing.assert_array_equal(corrections[0], corrections[1])
+
+
+def test_block_lm_reports_hits_with_no_valid_intersection_as_intersection_failed(monkeypatch):
+    """A target sensor with hits must not disappear into the no-data denominator exclusion."""
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, tracks = _analytic_multi_dof_case(m)
+    failed_sensor = len(geometry.centers) - 2
+    geometry.target_mask[failed_sensor] = True
+    batches.is_target[:, failed_sensor] = True
+    batches.fit_mask[:, failed_sensor] = False
+    failed_center = geometry.centers[failed_sensor].double()
+    genuine = m.intersect_plane
+
+    def fail_one_sensor(track_parameters, centers, normals, n_newton=12):
+        path, intersections, valid = genuine(track_parameters, centers, normals, n_newton)
+        if valid.ndim == 1 and torch.allclose(centers[0].double(), failed_center):
+            valid = torch.zeros_like(valid)
+        return path, intersections, valid
+
+    monkeypatch.setattr(m, "intersect_plane", fail_one_sensor)
+    config = m.AlignmentRunConfig(
+        track_mode="free",
+        joint_solver="block-lm",
+        lm_max_iters=20,
+        lambda_l2=0.0,
+        make_plot=False,
+    )
+
+    result = m.run_block_lm_alignment(batches, geometry, config, (0, 1, 5), tracks)
+    summary = result["block_lm_summary"]
+    failed = next(
+        block for block in result["block_lm_blocks"]
+        if block["sensor_index"] == failed_sensor
+    )
+
+    assert failed["status"] == m.BLOCK_LM_STATUS_INTERSECTION_FAILED
+    assert summary["blocks_without_data"] == 0
+    assert summary["status_counts"]["intersection_failed"] == 1
