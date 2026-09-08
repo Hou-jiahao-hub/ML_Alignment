@@ -2557,3 +2557,110 @@ block-LM：`best_iteration=13`，`stopped_early=true`，total loss 915.744 -> 2.
 （`feat: run the mainline on every event and unblock the truncated helix seed`），
 即本条 §5 所列的编排器与 summary 改动。**未回改 `manifest.json`** —— 事后修改运行
 记录等于伪造，缺口以本条说明的方式记录。
+
+---
+
+## Iteration 27 — block-LM 收敛与固定有效集契约（roadmap L1）
+
+**性质**：数值契约修复，**不是物理改动**。新增 `BLOCK_LM_PREREGISTRATION_VERSION = 1`，
+与 `JOINT_REFIT_PREREGISTRATION_VERSION` 及 Gate 4 的 `PREREGISTRATION_VERSION` 刻意
+分开 —— 后两者治理的判据本次一条都没动。
+**状态**：**预注册，写在跑真实数据之前。** 合成层已完成，真实两臂待运行，结果回填本条 §6。
+**交接**：`docs/handoff/2026-09-08-block-lm-convergence-contract.md`
+**上游**：`docs/handoff/2026-09-07-alignment-methodology-roadmap.md` §L1
+
+### 1. 实验问题
+
+在冻结的 train 径迹和原始错位几何上，当前 block-LM 的早停是否满足逐 sensor 驻点／
+边界 KKT 条件？改为逐 sensor damping、拒绝后重试、固定有效集接受之后，几何是否改变？
+
+### 2. 预注册（**写在跑之前，事后不得改**）
+
+**冻结的常量**（`scripts/ml_alignment_autograd.py`）：
+
+```
+BLOCK_LM_DECREMENT_STATIONARY = 1.0e-6     # 每 component，F = 0.5*chi2 gauge
+BLOCK_LM_MAX_DAMPING_RETRIES  = 8
+BLOCK_LM_MAX_DAMPING          = 1.0e12
+BLOCK_LM_MIN_DAMPING          = 1.0e-12
+BLOCK_LM_BOUND_ATOL           = 1.0e-12
+```
+
+`BLOCK_LM_DECREMENT_STATIONARY` 沿用 `NEWTON_DECREMENT_STATIONARY` 的数值与 gauge，
+口径改为每 component（那里是每径迹行）。两者独立冻结，**不得互相调整**。驻点判据
+一律不加正则：`(H + εI)^-1 ≼ H^-1`，加正则只会让 decrement 偏小，把「没收敛」报成
+「收敛」，正是本次要消灭的失效模式。
+
+**两臂**：
+- **A（baseline）**：commit `e9c63b2`。只加观测量，求解过程逐位不变。
+- **B（contract-fixed）**：commit `428ef57`。逐 sensor damping；拒绝后提高 damping 并
+  重试；接受比较使用当前固定有效 component；以驻点／边界 KKT 而非「本轮无接受步」
+  宣告收敛。
+
+**必须冻结**：同一 train event-key hash；同一 refitted track 参数文件及哈希；同一目标
+sensor、active DOF、measurement、covariance、初始几何；同一求交容差、Fisher floor、
+步长上限与硬边界。**不运行 calibration，不运行 validation，不运行 surface polish。**
+
+**预注册主判据**：所有被标记为 `converged` 的**非边界** sensor 均满足
+`lambda2 / n_components <= 1e-6`；合成的「首次拒绝、增大 damping 后可下降」案例继续
+迭代并到达直接解。
+
+**次判据**：真实 train 输入上，候选不得丢失当前有效 component
+（`min_components_delta_accepted >= 0` 且 `min_components_end_minus_start >= 0`）；
+改进臂／基线臂的逐 sensor 几何 truth 误差 RMS 比值，其 paired 95% CI 上界不超过 `1.01`。
+
+**证伪条件**：任一非驻点块仍被报告 `converged`，或 loss 改善依赖有效 component 减少。
+
+**宣称边界**：若生产几何与基线等价，只能宣称「收敛契约得到验证」，**不能宣称精度提升**。
+本条**不解释也不修正已知的 9.9 倍 truth 距离偏差** —— 该偏差的主判据是 truth 距离而非
+chi2，成因在固定径迹的 block-LM 之外。
+
+**truth 的地位**：真实物理场景中不存在 truth。它只在带标注实验里可得，只能用于校准
+完成之后核对模型，**绝不进入求解器的接受或停止判据**。`compare_truth_rms.py` 是唯一
+可以谈 truth 的地方，其输出**不得反过来指导求解器调参**。
+
+### 3. A 臂逐位不变的验证（已完成）
+
+两个合成 case 的 `predicted_deltas` 与 `history` 序列化后，在 `e9c63b2` 与 `37ed4f5`
+之间 `diff`：**完全相同**。
+
+### 4. 合成层判据核对（已完成，全部通过）
+
+主判据 A 的独立重算在**物理单位**下进行（求解器工作在归一化单位）。`lambda2` 对对角
+重标度不变（`g → Sg, H → SHS`），所以这是一条独立路径却必须给出同一个数；测试同时
+断言 `rel=1e-6` 内相等。
+
+主判据 B 用确定性注入而非真实非线性：两平面 fixture 对 `tx` 严格线性，二次目标下任意
+`λ ≥ 0` 的 LM 步都是 GN 步的收缩，**永远不会被拒**，真实非线性构造会退化成永真式。
+断言锚定「重试确实发生在同一 sensor、同一外层迭代」（`attempt == 1`、`damping` 恰好
+×10、随后 `accepted`），而不只是「最后收敛了」。
+
+`test_block_lm_recovers_target_translation` 的容差由 `abs=1e-5` 改为**闭式驻点界**
+`sqrt(24 · 1e-6 · 0.01 / 12) = 1.4142e-4`。**这是修正而非放松**：驻点判据说的是
+「模型还能给的下降 ≤ 1e-6/component」，从未承诺参数精度到 1e-5 mm。实测终点
+`lambda2_per_component = 7.811e-9`，与闭式 `1200·(1.2499e-5)²/24` 精确吻合。推导与
+逐迭代轨迹见交接文档 §7。
+
+`484 passed, 3 skipped`（conda pytorch 3.10.20）。
+
+### 5. 待运行
+
+1. 跑真实 train A 臂（`e9c63b2`），finalize manifest，存 `summary_A.json`，核对
+   `predicted_deltas` 与既有基线逐位相同；
+2. 跑真实 train B 臂（`428ef57`）；
+3. `compare_truth_rms.py` 比 A vs B；
+4. **先核对行数／component 数／sensor 数，再读 loss 和 truth。**
+
+**预期读数**：真实数据上 `rank_deficient` 比例可能很高。这是审计输出，不是 bug ——
+Fisher floor 撑起的方向本就不是被数据识别的模式。
+
+### 6. 结果（待回填）
+
+（尚未运行。）
+
+**结果解释规则（预注册，事后不得改）**：
+- B 通过且 truth 改善 → 进入生产候选，但仍需新的 calibration 选择协议；
+- B 通过且两臂几何等价 → 证明当前结果的数值稳定性，**停止继续改 block-LM**；
+- B 驻点更好但 truth 变差 → 保留 baseline，转入 M1 查弱模／正则；
+- 两臂都非驻点 → 继续归因求交 Jacobian、尺度或边界，**禁止直接调大迭代数**；
+- 改善依赖丢 hit → 实验失败，修复接受规则后重新预注册版本。

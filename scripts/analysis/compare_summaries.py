@@ -73,7 +73,7 @@ def truth_block(left, right, name_l, name_r):
         print(f"  {'dof/量':<20}{name_l:>14}{name_r:>14}{'delta':>14}")
         for dof in ("tx", "ty", "tz", "rx", "ry", "rz"):
             el, er = dl.get(dof, {}), dr.get(dof, {})
-            for metric in ("corr", "recovery", "true_rms", "pred_rms"):
+            for metric in ("corr", "recovery", "true_rms", "pred_rms", "err_rms"):
                 a, b = el.get(metric), er.get(metric)
                 if a is None and b is None:
                     continue

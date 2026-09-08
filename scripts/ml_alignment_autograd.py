@@ -2887,10 +2887,19 @@ def validate_against_truth(transforms_list, predicted_deltas, nominal_json,
                 "recovery": float(recov),
                 "true_rms": float(np.sqrt((t ** 2).mean())),
                 "pred_rms": float(np.sqrt((p ** 2).mean())),
+                # RMS of the residual truth error, the quantity a candidate arm
+                # has to avoid making worse.  ``true_rms`` and ``pred_rms`` are
+                # magnitudes of the injection and of the correction; neither of
+                # them gets smaller when the answer gets better.  Point estimate
+                # only -- the interval comes from a paired bootstrap over
+                # sensors in scripts/analysis/compare_truth_rms.py.
+                "err_rms": float(np.sqrt(((p - t) ** 2).mean())),
+                "n_sensors": int(len(t)),
                 "unit": unit,
             }
             print(f"    {nm}: corr={corr:+.3f}  recovery={recov:+.3f}  "
-                  f"|true|rms={np.sqrt((t**2).mean()):.4f}{unit}  |pred|rms={np.sqrt((p**2).mean()):.4f}{unit}")
+                  f"|true|rms={np.sqrt((t**2).mean()):.4f}{unit}  |pred|rms={np.sqrt((p**2).mean()):.4f}{unit}  "
+                  f"|err|rms={np.sqrt(((p-t)**2).mean()):.4f}{unit}")
         metrics[(vol, lay)] = layer_metrics
     return metrics
 
