@@ -8,6 +8,28 @@
 
 ---
 
+## 执行摘要
+
+**结果**：三个 commit（`e9c63b2` A 臂只加观测、`428ef57` B 臂契约修复、`fc89641` 预注册
+与离线验证脚本）。四个已知缺陷（全局 damping、拒绝后不重试、比较分量不固定、无驻点
+判据）全部修复，`484 passed, 3 skipped`，A 臂对合成问题的求解输出与 `37ed4f5`
+逐位相同。合成层的主/次判据、证伪构造（秩亏、求交失败、边界 KKT、block 解耦）均已
+写成回归并通过。新增 `scripts/analysis/compare_truth_rms.py` 并在合成几何上验证了
+通过/失败/作废三条分支。
+
+**遇到的问题**：详见 §13——既有测试的全等断言随新增诊断字段被打破、既有容差假设与
+新驻点契约冲突、damping 汇总统计口径选错导致断言失败、`block_lm_blocks` 的索引假设、
+合成 fixture 本身不满秩导致主判据测试空转、float32 精度让求交失败的注入测试误伤当前点、
+`compare_truth_rms.py` 的样本核对最初用交集而非全集（差点重犯 damping-v2 记录过的
+"静默丢样本"错误）。全部已解决，见 §13 的具体修法。
+
+**待完成**：真实数据两臂尚未运行，详见 §11——这是本次交付的边界，不是遗漏：roadmap L1
+要求先在合成层把契约钉死，真实数据的两臂对比需要下一轮会话在冻结好 train 输入之后专门
+执行，且预注册明确要求"先写预注册、再跑数据"，本次会话已完成预注册（Iteration 27）
+但尚未执行跑数据这一步。
+
+---
+
 ## 0. 宣称边界（先读这条）
 
 本改动只修正 block-LM 的**收敛与接受契约**。它使 `converged` 成为可证伪的陈述，
@@ -263,7 +285,74 @@ CI，**上界 ≤ 1.01** 为非劣性通过。复用 `validate_helix_model.paire
 
 ---
 
-## 12. 环境
+## 12. 实施过程中的具体问题与解决方法
+
+按遇到的顺序记录，供下次改这段代码时避免重踩。
+
+**问题 1：既有 `fisher_summary` 全等断言被新增诊断字段打破。**
+`test_alignment_summary_keeps_stage_metrics_without_large_tensor_payloads` 对
+`summary["fisher_summary"]` 做的是整字典 `==` 比较。A 臂给 `fisher_summary` 加了
+`rejected_steps` / `damping_retries` / `lstsq_fallbacks` / `clipped_steps` 四个键后，
+这条测试必然失败。
+**解法**：这是预期之内的破坏性变更（新增可观测量），直接把这四个键连同期望值补进测试
+的期望字典，不是放松断言。
+
+**问题 2：`test_block_lm_recovers_target_translation_without_changing_tracks` 的硬编码
+容差与新驻点契约冲突。** 见正文 §7，独立成节是因为它是本次改动里**唯一一处需要论证
+"这不是放松测试"的地方**：新代码在 `lambda2/n <= 1e-6` 处停，旧代码在步长 `< 1e-10`
+处停，前者终点误差天然大于旧断言的 `abs=1e-5`。解法是反推闭式驻点界并核对与实测
+`lambda2_per_component` 精确吻合，而不是简单放宽数字。
+
+**问题 3：`damping.max_damping_reached` 最初记录 `final_damping`（每次访问覆盖），
+断言 `>= 10x lm_initial_damping` 失败——实测 `0.00125 < 0.01`。**
+根因：接受步会把 λ 减半（`max(damping*0.5, MIN)`），所以"最终 λ"看不见中途重试
+到达过的峰值——一次拒绝→重试→接受的完整序列里，最后落盘的是"接受后减半"的值，
+不是"重试时抬到的"那个值。
+**解法**：在 `_block_lm_new_record` 里新增 `max_damping_seen` / `min_damping_seen`
+两个跟踪字段，每次候选评估后用 `max()`/`min()` 更新，汇总时从这两个字段取极值而不是
+从 `final_damping` 取。
+
+**问题 4：`result["block_lm_blocks"][1]["lambda2_is_lower_bound"]` 抛 `IndexError`。**
+秩亏回归测试假设了错误的索引——`_block_lm_translation_problem` 的 fixture 只有一个
+target sensor（`target_mask = [False, True]`），`block_lm_blocks` 里只有一条记录，
+下标该是 `[0]`，不是按 `active_dof=(0, 2)` 里的 `2` 联想出来的 `[1]`。
+**解法**：改用 `block_lm_blocks[0]`，并加一句注释外加 `sensor_index == 1` 的断言，
+防止下次同样的联想错误。
+
+**问题 5：合成 fixture `build_synthetic_joint_case` 不是满秩可解析问题，导致主判据 A
+的多自由度测试空转（`interior` 列表为空）。** 见正文 §8 已有详述——它本身注入了
+`noise=0.02` 且用的是故意错的冻结径迹，是在拟合一个错设模型，300 次迭代 `lambda2/n`
+仍降不到阈值以下。
+**解法**：新增 `_analytic_multi_dof_case`：复用同一套 6 平面几何，把 `noise` 归零、
+径迹换成 `truth`（不再是错误的种子），只往 target 平面注入一个已知偏移。这样
+"该几何的最小二乘解就是那个偏移"是解析可验证的，12 次迭代内即收敛。次判据 A（不丢
+分量的守卫）则刻意保留原来那个"远离最优"的错设 fixture，因为守卫必须在求解器还没
+收敛时也成立，不能只在驻点附近验证。
+
+**问题 6：求交失败注入测试里，float32 精度让当前点也被误伤，测试断言 `intersection_failed`
+失败。** 最初用字面量 `0.4` 判断"平面是否已经移动"（`(centers[..., 1] - 0.4).abs().max()
+> 1e-12`），但 fixture 里几何用 float32 存储，`0.4` 实际读出来是 `0.40000000596...`，
+与字面量 `0.4` 的差已经超过 `1e-12`，导致**求解器还没走任何一步**时这个判断就先触发了，
+把当前点（未移动前）的候选也一起弄脏。
+**解法**：改成从 `geometry.centers[1, 1]` 读出真实的未对齐值作参照，而不是硬编码浮点
+字面量——这类"跟几何本身比较"的测试，比较基准永远该来自同一份几何对象，不能重新键入
+一遍数字。
+
+**问题 7：`compare_truth_rms.py` 最初的 `collect()` 对两臂取交集，静默丢失样本，
+parity 核对完全不触发——差点重犯 damping-v2 §4.1 记录过的错误。**
+用合成几何验证"作废分支"时（一个 arm 故意只给 30/40 个 sensor），核对块最初报告
+`n_sensors=40 OK`，因为 `collect()` 在两臂集合上取了交集，缺失的 10 个 sensor 直接从
+比较里消失，`parity()` 拿到的是"交集之后的样本"而不是"应该存在的样本"，自然查不出
+差异。
+**解法**：把 `collect()` 拆成 `expected`（错位几何∩标称几何解析出的全集）和
+`keys`（进一步与两臂求交，仅用于算指标），`parity()` 传入 `expected` 与两臂各自比对，
+逐臂报告缺了多少、缺了哪些 sensor。这正是文档里反复强调的原则——"任何让结果变好的
+改动，先查样本量"——这次是脚本自己先犯了一次，靠对着三条分支（通过/失败/作废）实测
+才抓出来。
+
+---
+
+## 13. 环境
 
 必须用 conda `pytorch` 3.10.20；系统 `python` 3.9 会假报 35 个失败。
 
