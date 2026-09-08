@@ -505,6 +505,30 @@ def write_difference_histograms(
                 axis.set_ylabel("Surface count")
                 axis.grid(alpha=0.2)
                 axis.legend(loc="upper right")
+
+                aligned_bin_edges = np.histogram_bin_edges(
+                    item.aligned,
+                    bins=50,
+                )
+                detail_axis = axis.inset_axes([0.07, 0.5, 0.42, 0.42])
+                detail_axis.hist(
+                    item.aligned,
+                    bins=aligned_bin_edges,
+                    histtype="step",
+                    linewidth=1.5,
+                    color="tab:green",
+                )
+                detail_axis.axvline(
+                    0.0,
+                    color="0.45",
+                    linestyle="--",
+                    linewidth=0.8,
+                )
+                detail_axis.set_xlim(aligned_bin_edges[0], aligned_bin_edges[-1])
+                detail_axis.set_title("Aligned detail", fontsize=8)
+                detail_axis.tick_params(axis="both", labelsize=7)
+                detail_axis.grid(alpha=0.2)
+                axis.indicate_inset_zoom(detail_axis, edgecolor="0.4", alpha=0.6)
             for axis in list(axes.flat)[len(layer_series) :]:
                 axis.set_visible(False)
 

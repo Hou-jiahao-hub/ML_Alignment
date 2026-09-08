@@ -229,6 +229,52 @@ def test_histogram_writer_creates_one_png_per_layer(tmp_path):
     assert image_path.stat().st_size > 1000
 
 
+def test_histogram_writer_adds_aligned_detail_inset_for_compressed_distribution(
+    monkeypatch, tmp_path
+):
+    m = load_module()
+    import matplotlib.figure
+
+    rows = []
+    for sensor_id, (initial, remaining) in enumerate(
+        zip(np.linspace(-1.0, 1.0, 101), np.linspace(-0.01, 0.01, 101), strict=True),
+        start=1,
+    ):
+        rows.append(
+            {
+                "canonical_id": f"vol=17|lay=8|sen={sensor_id}",
+                "volume_id": 17,
+                "layer_id": 8,
+                "sensor_id": sensor_id,
+                "dof": "tx",
+                "unit": "mm",
+                "misaligned_difference": initial,
+                "misaligned_abs_difference": abs(initial),
+                "aligned_difference": remaining,
+                "aligned_abs_difference": abs(remaining),
+                "recovery_percent": 99.0,
+            }
+        )
+
+    captured_figures = []
+    monkeypatch.setattr(
+        matplotlib.figure.Figure,
+        "savefig",
+        lambda figure, *_args, **_kwargs: captured_figures.append(figure),
+    )
+
+    m.write_difference_histograms(rows, tmp_path, active_dof=(0,))
+
+    assert len(captured_figures) == 1
+    main_axis = captured_figures[0].axes[0]
+    assert len(main_axis.child_axes) == 1
+    detail_axis = main_axis.child_axes[0]
+    assert detail_axis.get_xlim() == pytest.approx((-0.01, 0.01))
+    assert main_axis.get_xlim()[1] - main_axis.get_xlim()[0] > 1.9
+    assert len(detail_axis.patches) == 1
+    assert len(detail_axis.patches[0].get_xy()) > 100
+
+
 def test_histogram_legends_use_upper_right_and_two_line_labels(
     monkeypatch, tmp_path
 ):
