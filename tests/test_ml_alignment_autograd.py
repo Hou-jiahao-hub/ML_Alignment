@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -832,7 +833,7 @@ def _block_lm_translation_case(m):
     return joint_tests._block_lm_translation_problem(m)
 
 
-def test_block_lm_audit_reports_the_closed_form_curvature_and_convergence():
+def test_block_lm_reports_the_closed_form_curvature_and_convergence():
     m = load_ml_alignment_autograd_module()
     batches, geometry, tracks = _block_lm_translation_case(m)
     config = m.AlignmentRunConfig(
@@ -843,7 +844,7 @@ def test_block_lm_audit_reports_the_closed_form_curvature_and_convergence():
     result = m.run_block_lm_alignment(batches, geometry, config, (0,), tracks)
     summary = result["block_lm_summary"]
 
-    assert summary["arm"] == "audit-only"
+    assert summary["arm"] == "contract-fixed"
     assert summary["claim_scope"] == "convergence-contract-only"
     assert summary["stationary_threshold"] == m.BLOCK_LM_DECREMENT_STATIONARY
     # H = m / sigma^2 = 12 / 0.01, exactly, and the block is full rank.
@@ -858,7 +859,7 @@ def test_block_lm_audit_reports_the_closed_form_curvature_and_convergence():
     assert summary["boundary"]["frozen_dof_total"] == 0
 
 
-def test_block_lm_audit_separates_budget_exhaustion_from_convergence():
+def test_block_lm_separates_budget_exhaustion_from_convergence():
     m = load_ml_alignment_autograd_module()
     batches, geometry, _truth, seed = build_synthetic_joint_case(m)
     config = m.AlignmentRunConfig(
@@ -879,7 +880,7 @@ def test_block_lm_audit_separates_budget_exhaustion_from_convergence():
     assert summary["decrement_per_component"]["max"] > m.BLOCK_LM_DECREMENT_STATIONARY
 
 
-def test_block_lm_audit_records_the_fixed_set_alongside_the_moving_mask():
+def test_block_lm_scores_every_candidate_on_the_fixed_component_set():
     m = load_ml_alignment_autograd_module()
     batches, geometry, tracks = _block_lm_translation_case(m)
     config = m.AlignmentRunConfig(
@@ -903,7 +904,7 @@ def test_block_lm_audit_records_the_fixed_set_alongside_the_moving_mask():
         )
 
 
-def test_block_lm_audit_summary_survives_the_json_round_trip():
+def test_block_lm_summary_survives_the_json_round_trip():
     m = load_ml_alignment_autograd_module()
     batches, geometry, tracks = _block_lm_translation_case(m)
     config = m.AlignmentRunConfig(
@@ -916,7 +917,281 @@ def test_block_lm_audit_summary_survives_the_json_round_trip():
         json.dumps(m._json_ready(result["block_lm_summary"]), allow_nan=False)
     )
 
-    assert written["arm"] == "audit-only"
+    assert written["arm"] == "contract-fixed"
     assert set(written["status_counts"]) == set(m.BLOCK_LM_TERMINAL_STATUSES)
     # Per-sensor detail stays in memory only.
     assert "blocks" not in written
+
+
+def _independent_decrement_per_component(m, batches, geometry, tracks, row, sensor, active_dof):
+    """Recompute the stationarity statistic without touching the solver's cache.
+
+    Deliberately in physical units, where the solver works in normalized ones:
+    ``lambda2 = g^T H^-1 g`` is invariant under the diagonal rescaling
+    ``g -> Sg, H -> SHS``, so this is a genuinely separate path that must
+    nonetheless land on the same number.
+    """
+    index = torch.tensor(list(active_dof), dtype=torch.long)
+    _residuals, _covariance, mask, _valid = m._sensor_residual_data(
+        tracks, row, sensor, batches, geometry
+    )
+
+    def standardized(values):
+        candidate = row.scatter(0, index, values)
+        data, variances, _mask, _ok = m._sensor_residual_data(
+            tracks, candidate, sensor, batches, geometry
+        )
+        return (data / variances.clamp_min(m.EPS_COVARIANCE).sqrt())[mask]
+
+    values = row[index].detach().clone().requires_grad_(True)
+    jacobian = torch.autograd.functional.jacobian(standardized, values, vectorize=True)
+    residual = standardized(values).detach()
+    hessian = jacobian.transpose(0, 1) @ jacobian
+    gradient = jacobian.transpose(0, 1) @ residual
+    eigenvalues, eigenvectors = torch.linalg.eigh(hessian)
+    projection = eigenvectors.transpose(0, 1) @ gradient
+    lambda2 = float((projection.square() / eigenvalues).sum())
+    return lambda2 / int(mask.sum())
+
+
+def _analytic_multi_dof_case(m):
+    """Six planes, exact tracks, no noise, and a geometry offset injected into
+    the target plane only -- so the least-squares answer is the offset itself.
+
+    ``build_synthetic_joint_case`` on its own is not analytically solvable: it
+    adds measurement noise and hands the solver deliberately wrong frozen
+    helices, so the block is fitting geometry to a misspecified model and drifts
+    towards its optimum over hundreds of capped steps.  Removing both leaves a
+    genuinely full-rank problem with a known answer.
+    """
+    batches, geometry, truth, _seed = build_synthetic_joint_case(m, noise=0.0)
+    batches.covariances = torch.full_like(batches.covariances, 0.01)
+    # apply_alignment_torch maps local (tx, ty, tz) to global (tz, tx, ty) here,
+    # so a global (y, z) shift is a local (tx, ty) one.
+    geometry.centers[-1, 1] += 0.30
+    geometry.centers[-1, 2] -= 0.20
+    return batches, geometry, truth
+
+
+@pytest.mark.parametrize("active_dof, iters", [((0,), 8), ((0, 1, 5), 20)])
+def test_block_lm_converged_blocks_are_independently_stationary(active_dof, iters):
+    """Primary criterion: every block reported converged must survive a
+    recomputation of the pre-registered stationarity statistic."""
+    m = load_ml_alignment_autograd_module()
+    if active_dof == (0,):
+        batches, geometry, tracks = _block_lm_translation_case(m)
+    else:
+        batches, geometry, tracks = _analytic_multi_dof_case(m)
+    config = m.AlignmentRunConfig(
+        track_mode="free", joint_solver="block-lm", lm_max_iters=iters,
+        lambda_l2=0.0, make_plot=False,
+    )
+
+    result = m.run_block_lm_alignment(batches, geometry, config, active_dof, tracks)
+    deltas = torch.as_tensor(result["predicted_deltas"], dtype=torch.float64)
+
+    interior = [
+        block for block in result["block_lm_blocks"]
+        if block["status"] == m.BLOCK_LM_STATUS_CONVERGED and not block["boundary"]
+    ]
+    assert interior, "no interior converged block: the assertion below would be vacuous"
+    for block in interior:
+        sensor = block["sensor_index"]
+        recomputed = _independent_decrement_per_component(
+            m, batches, geometry, tracks, deltas[sensor], sensor, active_dof
+        )
+        assert recomputed <= m.BLOCK_LM_DECREMENT_STATIONARY
+        assert recomputed == pytest.approx(block["lambda2_per_component"], rel=1e-6)
+
+
+def test_block_lm_retries_with_more_damping_after_a_rejection(monkeypatch):
+    """Primary criterion: a first rejection must raise the damping and try
+    again inside the same block visit, not end the solve."""
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, tracks = _block_lm_translation_case(m)
+    genuine = m._block_lm_fixed_chi2
+    calls = {"n": 0}
+
+    def inflated(residuals, covariance, fixed_mask):
+        calls["n"] += 1
+        value = genuine(residuals, covariance, fixed_mask)
+        return value * 1e6 if calls["n"] == 1 else value
+
+    monkeypatch.setattr(m, "_block_lm_fixed_chi2", inflated)
+    config = m.AlignmentRunConfig(
+        track_mode="free", joint_solver="block-lm", lm_max_iters=8,
+        lambda_l2=0.0, make_plot=False,
+    )
+
+    result = m.run_block_lm_alignment(batches, geometry, config, (0,), tracks)
+    summary = result["block_lm_summary"]
+
+    # The retry actually happened -- not merely "it converged in the end".
+    assert summary["damping"]["retries_total"] >= 1
+    assert summary["damping"]["blocks_with_retry"] == 1
+    assert summary["damping"]["max_damping_reached"] >= 10.0 * config.lm_initial_damping
+    first, second = result["fisher_diagnostics"][0], result["fisher_diagnostics"][1]
+    assert first["accepted"] is False
+    assert first["reject_reason"] == "no_decrease"
+    assert second["sensor_index"] == first["sensor_index"]
+    assert second["iteration"] == first["iteration"]
+    assert second["attempt"] == 1
+    assert second["damping"] == pytest.approx(10.0 * first["damping"])
+    assert second["accepted"] is True
+    # And the solve still reaches the analytic answer.
+    bound = math.sqrt(24 * m.BLOCK_LM_DECREMENT_STATIONARY * 0.01 / 12)
+    assert abs(result["predicted_deltas"][1, 0] + 0.4) <= bound
+    assert summary["status_counts"]["converged"] == 1
+
+
+@pytest.mark.parametrize("active_dof, iters", [((0,), 8), ((0, 1, 5), 20)])
+def test_block_lm_accepted_steps_never_lose_components(active_dof, iters):
+    """Secondary criterion: no accepted step may drop a component that was
+    valid at the point it stepped from."""
+    m = load_ml_alignment_autograd_module()
+    if active_dof == (0,):
+        batches, geometry, tracks = _block_lm_translation_case(m)
+    else:
+        batches, geometry, _truth, tracks = build_synthetic_joint_case(m)
+    # The misspecified fixture is kept here on purpose: the guard has to hold
+    # while the solver is still far from any optimum, not only near one.
+    config = m.AlignmentRunConfig(
+        track_mode="free", joint_solver="block-lm", lm_max_iters=iters,
+        lambda_l2=0.0, make_plot=False,
+    )
+
+    guard = m.run_block_lm_alignment(batches, geometry, config, active_dof, tracks)[
+        "block_lm_summary"
+    ]["component_guard"]
+
+    assert guard["accepted_steps"] > 0
+    assert guard["min_components_delta_accepted"] >= 0
+    assert guard["min_components_end_minus_start"] >= 0
+
+
+def test_block_lm_reports_a_structurally_blind_dof_as_rank_deficient():
+    """DOF 2 is the local normal: R @ (0, 0, tz) is along x, and both local
+    coordinates are independent of the plane's x offset, so that Jacobian column
+    is identically zero.  The block must not be reported as converged."""
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, tracks = _block_lm_translation_case(m)
+    config = m.AlignmentRunConfig(
+        track_mode="free", joint_solver="block-lm", lm_max_iters=8,
+        lambda_l2=0.0, make_plot=False,
+    )
+
+    result = m.run_block_lm_alignment(batches, geometry, config, (0, 2), tracks)
+    summary = result["block_lm_summary"]
+
+    assert summary["status_counts"]["rank_deficient"] == 1
+    assert summary["status_counts"]["converged"] == 0
+    assert summary["rank"]["floor_limited_blocks"] == 1
+    assert summary["rank"]["null_gradient_max"] == pytest.approx(0.0)
+    # block_lm_blocks is ordered by target sensor, and there is exactly one.
+    assert result["block_lm_blocks"][0]["sensor_index"] == 1
+    assert result["block_lm_blocks"][0]["lambda2_is_lower_bound"] is True
+    # Rank deficiency is reported, not treated as a reason to stop: the
+    # well-determined direction is still solved.
+    assert result["predicted_deltas"][1, 0] == pytest.approx(-0.4, abs=2e-3)
+
+
+def test_block_lm_refuses_a_candidate_that_buys_its_improvement_by_losing_a_hit(monkeypatch):
+    """The trap the fixed comparison set exists to close: an outlier hit whose
+    intersection the candidate kills, so the mean over the survivors improves."""
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, tracks = _block_lm_translation_case(m)
+    batches.measured_local[3, 1, 0] += 5.0
+    genuine = m.intersect_plane
+    # Read the unaligned centre off the geometry rather than writing 0.4: the
+    # fixture stores it in float32, so the literal does not compare equal to the
+    # widened value the solver actually sees.
+    nominal_y = float(geometry.centers[1, 1])
+
+    def failing(track_parameters, centers, normals, n_newton=12):
+        path, intersections, valid = genuine(track_parameters, centers, normals, n_newton)
+        # Only the per-sensor path (1-D validity) and only once the plane has
+        # actually moved: the current point keeps the outlier, the candidate
+        # loses it.  That asymmetry is exactly what makes the mean over each
+        # side's own mask look like an improvement.
+        moved = bool((centers[..., 1] - nominal_y).abs().max() > 1e-12)
+        if valid.ndim == 1 and moved:
+            valid = valid.clone()
+            valid[3] = False
+        return path, intersections, valid
+
+    monkeypatch.setattr(m, "intersect_plane", failing)
+    config = m.AlignmentRunConfig(
+        track_mode="free", joint_solver="block-lm", lm_max_iters=4,
+        lambda_l2=0.0, make_plot=False,
+    )
+
+    result = m.run_block_lm_alignment(batches, geometry, config, (0,), tracks)
+    summary = result["block_lm_summary"]
+
+    assert summary["status_counts"]["intersection_failed"] == 1
+    assert summary["status_counts"]["converged"] == 0
+    assert summary["component_guard"]["component_loss_rejections"] == (
+        1 + m.BLOCK_LM_MAX_DAMPING_RETRIES
+    )
+    assert summary["component_guard"]["accepted_steps"] == 0
+    # Not one step was taken, so the geometry is untouched.
+    assert result["predicted_deltas"][1, 0] == 0.0
+    # The old caliber would have taken it: scored on its own mask, the
+    # candidate that drops the 5.0 mm outlier looks strictly better.
+    trap = result["fisher_diagnostics"][0]
+    assert trap["component_loss"] is True
+    assert trap["components_after"] < trap["components_before"]
+
+
+def test_block_lm_calls_a_bound_it_cannot_leave_a_converged_kkt_point():
+    """With the optimum outside the box, the solver settles on the bound.  The
+    projected gradient vanishes there, so this is convergence -- but it is a
+    boundary one, and the summary must keep the two apart."""
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, tracks = _block_lm_translation_case(m)
+    config = m.AlignmentRunConfig(
+        track_mode="free", joint_solver="block-lm", lm_max_iters=12,
+        lambda_l2=0.0, make_plot=False, joint_clamp_t=0.2,
+    )
+
+    result = m.run_block_lm_alignment(batches, geometry, config, (0,), tracks)
+    summary = result["block_lm_summary"]
+
+    assert result["predicted_deltas"][1, 0] == pytest.approx(-0.2)
+    assert summary["status_counts"]["converged"] == 1
+    assert summary["converged_detail"] == {"interior": 0, "boundary": 1}
+    assert summary["boundary"]["free_set_empty_blocks"] == 1
+    assert summary["boundary"]["frozen_dof_total"] == 1
+    # A boundary block contributes lambda2 = 0 by construction, so it must stay
+    # out of the interior decrement quantiles.
+    assert summary["decrement_per_component"]["n_blocks"] == 0
+
+
+def test_block_lm_blocks_are_decoupled_across_target_sensors():
+    """The premise behind retiring a converged block for good.
+
+    ``_sensor_residual_data`` selects hits by sensor id and the helices are
+    frozen, so one block's residuals cannot depend on another block's alignment
+    -- which is why another block moving can never pull a stationary one off its
+    optimum.  Perturbing the second target's measurements must leave the first
+    target's correction bit-for-bit unchanged.
+    """
+    m = load_ml_alignment_autograd_module()
+    config = m.AlignmentRunConfig(
+        track_mode="free", joint_solver="block-lm", lm_max_iters=12,
+        lambda_l2=0.0, make_plot=False,
+    )
+    corrections = []
+    for perturbation in (0.0, 7.0):
+        batches, geometry, truth = _analytic_multi_dof_case(m)
+        # Make the second-to-last plane a target as well, then move only its
+        # measurements.
+        geometry.target_mask[-2] = True
+        batches.is_target[:, -2] = True
+        batches.fit_mask[:, -2] = False
+        batches.measured_local[:, -2, :] += perturbation
+        result = m.run_block_lm_alignment(batches, geometry, config, (0, 1, 5), truth)
+        assert result["block_lm_summary"]["blocks_total"] == 2
+        corrections.append(result["predicted_deltas"][-1].copy())
+
+    np.testing.assert_array_equal(corrections[0], corrections[1])

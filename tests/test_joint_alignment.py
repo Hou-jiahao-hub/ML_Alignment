@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import math
 import sys
 from pathlib import Path
 
@@ -502,7 +503,18 @@ def test_block_lm_recovers_target_translation_without_changing_tracks():
     assert result["solver"] == "block-lm"
     assert result["best_iteration"] >= 0
     assert result["best_total_loss"] < result["initial_total_loss"]
-    assert result["predicted_deltas"][1, 0] == pytest.approx(-0.4, abs=1e-5)
+    # The solver stops at the pre-registered stationary point, not at an
+    # arbitrary parameter precision, so the tolerance is that threshold read
+    # back through this problem's closed form rather than a hand-picked number.
+    # The loc0 residual is exactly ``0.4 + tx`` with unit derivative over m = 12
+    # rows at sigma = 0.1, giving H = m / sigma^2 and lambda2 = m e^2 / sigma^2
+    # across n = 24 components:
+    #     m e^2 / sigma^2 / n <= threshold  =>  |e| <= sqrt(n * threshold * sigma^2 / m)
+    stationary_bound = math.sqrt(24 * m.BLOCK_LM_DECREMENT_STATIONARY * 0.01 / 12)
+    assert stationary_bound == pytest.approx(1.4142e-4, rel=1e-4)
+    assert abs(result["predicted_deltas"][1, 0] + 0.4) <= stationary_bound
+    assert result["block_lm_summary"]["status_counts"]["converged"] == 1
+    assert result["block_lm_summary"]["converged_detail"]["interior"] == 1
     np.testing.assert_array_equal(result["track_params"], tracks.numpy())
     assert result["fisher_diagnostics"]
 

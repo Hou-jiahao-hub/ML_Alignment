@@ -1198,6 +1198,8 @@ def _block_lm_new_record(sensor_index, config):
         "had_component_loss": False,
         "had_invalid_rejection": False,
         "final_damping": float(config.lm_initial_damping),
+        "max_damping_seen": float(config.lm_initial_damping),
+        "min_damping_seen": float(config.lm_initial_damping),
         "exhausted_reason": "outer_iters",
         "retired_at_iteration": None,
         "n_components_start": None,
@@ -1216,114 +1218,36 @@ def _block_lm_new_record(sensor_index, config):
     }
 
 
-def _block_lm_observe(
-    record,
-    diagnostics,
-    iteration,
-    current_values,
-    gradient,
-    fisher,
-    lower,
-    upper,
-    fixed_mask,
-    residual_vector,
-    candidate_residuals,
-    candidate_covariance,
-    candidate_mask,
-    sensor_invalid,
-    accepted,
-    step_clipped,
-    lstsq_fallback,
-    eigen_floor_ratio,
-    max_invalid_fraction,
-    damping,
+def _block_lm_linearized_block(
+    tracks, current, sensor_index, batches, geometry, active_index, physical_scales, fixed_mask
 ):
-    """Record what the convergence contract sees at one block visit.
+    """One Gauss-Newton linearisation of a sensor block on a fixed component set.
 
-    Observation only: it writes into ``record`` and ``diagnostics`` and returns
-    nothing the solve reads back.  Any failure inside is swallowed, because an
-    audit that can change the arm it is auditing is worthless.
+    ``standardized`` returns ``r / sigma`` restricted to ``fixed_mask``, so
+    ``r^T r`` is the chi2 of that set, ``gradient`` is grad F and ``fisher`` is
+    the Gauss-Newton Hessian, both in the ``F = 0.5 * chi2`` gauge and scaled to
+    dimensionless units by ``physical_scales``.
+
+    Damping does not enter here, which is what makes retrying a rejected step
+    cheap: the whole ladder reuses one Jacobian.
     """
-    n_components = int(fixed_mask.sum())
-    record["evaluations"] += 1
-    if record["n_components_start"] is None:
-        record["n_components_start"] = n_components
-    record["n_components_end"] = n_components
-    record["final_damping"] = float(damping)
-    record["clipped_steps"] += int(bool(step_clipped))
-    record["lstsq_fallbacks"] += int(bool(lstsq_fallback))
-    try:
-        free_mask = _block_lm_free_dof_mask(current_values, gradient, lower, upper)
-        report = _block_lm_decrement(fisher, gradient, free_mask, eigen_floor_ratio)
-        n_free = report["n_free"]
-        per_component = report["lambda2"] / n_components if n_components else float("nan")
-        record.update({
-            "lambda2": report["lambda2"],
-            "lambda2_per_component": per_component,
-            "lambda2_is_lower_bound": report["lambda2_is_lower_bound"],
-            "n_free": n_free,
-            "frozen_dof": int(gradient.numel()) - n_free,
-            "boundary": n_free < int(gradient.numel()),
-            "rank_deficient": report["rank_deficient"],
-            # A free set emptied by the box constraints is a KKT point of the
-            # constrained problem, which is convergence just as much as a
-            # vanishing interior decrement is.
-            "stationary": n_free == 0 or per_component <= BLOCK_LM_DECREMENT_STATIONARY,
-            "min_eigenvalue_free": report["min_eigenvalue_free"],
-            "null_gradient_max": report["null_gradient_max"],
-        })
-        diagnostics.update({
-            "lambda2": report["lambda2"],
-            "lambda2_per_component": per_component,
-            "lambda2_is_lower_bound": report["lambda2_is_lower_bound"],
-            "n_free": n_free,
-            "rank_deficient": report["rank_deficient"],
-            "null_gradient_max": report["null_gradient_max"],
-        })
-    except (RuntimeError, torch.linalg.LinAlgError, ValueError):
-        record["lambda2"] = float("nan")
-        record["lambda2_per_component"] = float("nan")
-        record["stationary"] = False
-        diagnostics["lambda2"] = float("nan")
 
-    # What the fixed comparison set says, alongside the moving-mask decision the
-    # production arm actually made.
-    chi2_before = float(residual_vector.square().sum().detach().cpu())
-    chi2_after = float(
-        _block_lm_fixed_chi2(candidate_residuals, candidate_covariance, fixed_mask)
-        .detach()
-        .cpu()
-    )
-    lost = bool((fixed_mask & ~candidate_mask).any())
-    invalid_ok = sensor_invalid <= max_invalid_fraction
-    n_candidate = int((candidate_mask & fixed_mask).sum())
-    reject_reason = None
-    if not accepted:
-        reject_reason = (
-            "component_loss" if lost
-            else "invalid_fraction" if not invalid_ok
-            else "no_decrease"
+    def standardized(active_values):
+        row = current.scatter(0, active_index, active_values)
+        values, variances, _mask, _intersection_valid = _sensor_residual_data(
+            tracks, row, sensor_index, batches, geometry
         )
-    record["chi2_fixed"] = chi2_after
-    if lost:
-        record["component_loss_rejections"] += 1
-        record["had_component_loss"] = True
-    if not invalid_ok:
-        record["invalid_fraction_rejections"] += 1
-        record["had_invalid_rejection"] = True
-    if accepted:
-        record["accepted_steps"] += 1
-        record["accepted_component_deltas"].append(int(candidate_mask.sum()) - n_components)
-    diagnostics.update({
-        "chi2_fixed_before": chi2_before,
-        "chi2_fixed_after": chi2_after,
-        "n_components_fixed": n_components,
-        "components_before": n_components,
-        "components_after": n_candidate,
-        "component_loss": lost,
-        "reject_reason": reject_reason,
-        "sensor_invalid_fraction": float(sensor_invalid),
-    })
+        return (values / variances.clamp_min(EPS_COVARIANCE).sqrt())[fixed_mask]
+
+    active_values = current[active_index].detach().requires_grad_(True)
+    residual_vector = standardized(active_values).detach()
+    jacobian = torch.autograd.functional.jacobian(
+        standardized, active_values, vectorize=True
+    ).detach()
+    normalized_jacobian = jacobian * physical_scales
+    fisher = normalized_jacobian.transpose(0, 1) @ normalized_jacobian
+    gradient = normalized_jacobian.transpose(0, 1) @ residual_vector
+    return residual_vector, fisher, gradient
 
 
 def _block_lm_finalize_record(record):
@@ -1388,7 +1312,8 @@ def _block_lm_run_summary(blocks, arm, stop_reason, config):
         value for item in with_data for value in item["accepted_component_deltas"]
     ]
     span_deltas = [item["n_components_end"] - item["n_components_start"] for item in with_data]
-    dampings = [item["final_damping"] for item in with_data]
+    damping_high = [item["max_damping_seen"] for item in with_data]
+    damping_low = [item["min_damping_seen"] for item in with_data]
     eigenvalues = [
         item["min_eigenvalue_free"]
         for item in with_data
@@ -1472,8 +1397,12 @@ def _block_lm_run_summary(blocks, arm, stop_reason, config):
         "damping": {
             "blocks_with_retry": sum(1 for item in with_data if item["retries"] > 0),
             "retries_total": sum(item["retries"] for item in with_data),
-            "max_damping_reached": max(dampings) if dampings else float(config.lm_initial_damping),
-            "min_damping_reached": min(dampings) if dampings else float(config.lm_initial_damping),
+            "max_damping_reached": (
+                max(damping_high) if damping_high else float(config.lm_initial_damping)
+            ),
+            "min_damping_reached": (
+                min(damping_low) if damping_low else float(config.lm_initial_damping)
+            ),
         },
         "trust_region": {
             "clipped_steps": clipped,
@@ -1555,16 +1484,29 @@ def run_block_lm_alignment(
 ):
     """Fit target geometry with fixed non-target-refitted helices using block LM.
 
-    This is the L1 audit arm: the solve is bit-for-bit the production one, and
-    everything added here only observes it.  Each block visit also records what
-    the convergence contract *would* say -- the free-set Newton decrement, the
-    box-constraint KKT state, the candidate scored on the current component set,
-    the rank diagnostics and the rejection reason -- so that "the run stopped
-    early" can be separated into converged, budget exhausted, rank deficient and
-    intersection failed before any acceptance rule is changed.
+    Each target sensor is its own block: ``_sensor_residual_data`` selects hits
+    by sensor id alone and the helices are frozen, so a block's residuals depend
+    only on its own alignment row.  The blocks are therefore exactly decoupled,
+    which is why one that reaches a stationary point can be retired for good.
 
-    The audit is fail-safe by construction: an observation that raises is
-    dropped, never allowed to alter the solve.
+    A block stops for one of four reasons, reported rather than collapsed into a
+    flag: it is stationary (a free-set Newton decrement per component under
+    ``BLOCK_LM_DECREMENT_STATIONARY``, or a KKT point of the box constraints),
+    the iteration or damping budget ran out, the Fisher matrix is rank deficient
+    so the decrement is only a lower bound, or no damping keeps the candidate's
+    intersections alive.
+
+    A candidate is accepted only if it lowers the chi2 **on the component set
+    the current point has**, and only if it keeps every one of those components.
+    Scoring each side on its own mask is what lets a step that kills the hardest
+    intersections buy a lower mean with less information.  One consequence worth
+    knowing: since accepted candidates may add components, the fixed set grows,
+    and ``history`` compares objectives with different numbers of terms in them.
+    It is not guaranteed monotone, and a rise in it is not by itself a bug.
+
+    This fixes the convergence contract.  It is not a physics change: if the
+    geometry it produces matches the baseline, the claim is that the contract
+    holds, not that accuracy improved.
     """
     use_cuda = bool(config.gpu and torch.cuda.is_available())
     device = torch.device("cuda" if use_cuda else "cpu")
@@ -1599,7 +1541,6 @@ def run_block_lm_alignment(
     checkpoint_history = [(-1, best_loss)]
     invalid_history = [initial_invalid]
     fisher_diagnostics = []
-    damping = float(config.lm_initial_damping)
     stopped_early = False
     target_sensors = torch.nonzero(geometry.target_mask, as_tuple=False).flatten().tolist()
     per_dof_limit = torch.tensor(
@@ -1613,11 +1554,18 @@ def run_block_lm_alignment(
         dtype=dtype,
     )
     audit = {index: _block_lm_new_record(index, config) for index in target_sensors}
+    # One damping per sensor, carried across outer iterations.  A shared scalar
+    # lets a sensor that accepted a step halve the damping of a sensor that did
+    # not, which is the opposite of what a trust region is for.
+    damping_by_sensor = {index: float(config.lm_initial_damping) for index in target_sensors}
+    active_sensors = list(target_sensors)
     stop_reason = "iteration_budget"
     for iteration in range(config.lm_max_iters):
-        accepted_any = False
-        largest_step = 0.0
-        for sensor_index in target_sensors:
+        if not active_sensors:
+            stop_reason = "all_blocks_terminal"
+            break
+        still_active = []
+        for sensor_index in active_sensors:
             record = audit[sensor_index]
             current = alignment[sensor_index].detach()
             current_data = _sensor_residual_data(
@@ -1625,102 +1573,202 @@ def run_block_lm_alignment(
             )
             if current_data is None:
                 continue
-            residuals, covariance, component_mask, _valid = current_data
+            residuals, covariance, component_mask, current_valid = current_data
+            # The comparison set for this visit.  Because an accepted candidate
+            # must keep every component the current point has, this can only
+            # grow -- which is also why ``history`` is not guaranteed monotone:
+            # a larger set is a different objective, with more terms in it.
             fixed_mask = component_mask.detach()
             if not fixed_mask.any():
                 continue
+            n_components = int(fixed_mask.sum())
+            if record["n_components_start"] is None:
+                record["n_components_start"] = n_components
+            record["n_components_end"] = n_components
+            current_invalid = 1.0 - float(current_valid.float().mean().detach().cpu())
 
-            def standardized(active_values):
-                row = current.scatter(0, active_index, active_values)
-                values, variances, _mask, _intersection_valid = _sensor_residual_data(
-                    tracks, row, sensor_index, batches, geometry
-                )
-                return (values / variances.clamp_min(EPS_COVARIANCE).sqrt())[fixed_mask]
+            residual_vector, fisher, gradient = _block_lm_linearized_block(
+                tracks, current, sensor_index, batches, geometry,
+                active_index, physical_scales, fixed_mask,
+            )
+            chi2_before = float(residual_vector.square().sum().detach().cpu())
 
-            active_values = current[active_index].detach().requires_grad_(True)
-            standardized_residual = standardized(active_values)
-            jacobian = torch.autograd.functional.jacobian(
-                standardized, active_values, vectorize=True
-            ).detach()
-            residual_vector = standardized_residual.detach()
-            normalized_jacobian = jacobian * physical_scales
-            fisher = normalized_jacobian.transpose(0, 1) @ normalized_jacobian
-            gradient = normalized_jacobian.transpose(0, 1) @ residual_vector
-            regularized, diagnostics = regularize_fisher_matrix(
-                fisher,
-                damping=damping,
-                eigen_floor_ratio=config.fisher_eigen_floor,
+            free_mask = _block_lm_free_dof_mask(
+                current[active_index].detach(), gradient, -bound_limit, bound_limit
             )
-            lstsq_fallback = False
-            try:
-                normalized_step = -torch.linalg.solve(regularized, gradient)
-            except RuntimeError:
-                lstsq_fallback = True
-                normalized_step = -torch.linalg.lstsq(regularized, gradient[:, None]).solution[:, 0]
-            physical_step = normalized_step * physical_scales
-            step_clipped = bool((physical_step.abs() > per_dof_limit).any())
-            physical_step = torch.maximum(
-                torch.minimum(physical_step, per_dof_limit), -per_dof_limit
+            report = _block_lm_decrement(
+                fisher, gradient, free_mask, config.fisher_eigen_floor
             )
-            candidate = current.clone()
-            candidate[active_index] += physical_step
-            candidate[:3].clamp_(-config.joint_clamp_t, config.joint_clamp_t)
-            candidate[3:].clamp_(-config.joint_clamp_r, config.joint_clamp_r)
-            candidate_data = _sensor_residual_data(
-                tracks, candidate, sensor_index, batches, geometry
+            n_free = report["n_free"]
+            per_component = (
+                report["lambda2"] / n_components if n_components else float("nan")
             )
-            candidate_residuals, candidate_covariance, candidate_mask, candidate_valid = candidate_data
-            current_weighted = residuals.square() / covariance.clamp_min(EPS_COVARIANCE)
-            candidate_weighted = candidate_residuals.square() / candidate_covariance.clamp_min(EPS_COVARIANCE)
-            current_sensor_loss = current_weighted[component_mask].mean()
-            candidate_sensor_loss = candidate_weighted[candidate_mask].mean()
-            sensor_invalid = 1.0 - float(candidate_valid.float().mean().detach().cpu())
-            accepted = bool(
-                torch.isfinite(candidate_sensor_loss)
-                and sensor_invalid <= config.joint_max_invalid_fraction
-                and candidate_sensor_loss < current_sensor_loss
-            )
-            if accepted:
-                alignment[sensor_index] = candidate
-                accepted_any = True
-                largest_step = max(largest_step, float(physical_step.abs().max().detach().cpu()))
-            diagnostics.update({
-                "iteration": iteration,
-                "sensor_index": int(sensor_index),
-                "accepted": accepted,
-                "attempt": 0,
-                "damping": float(damping),
-                "step_rms": float(torch.sqrt(torch.mean(physical_step.square())).detach().cpu()),
-                "step_max": float(physical_step.abs().max().detach().cpu()),
-                "step_clipped": step_clipped,
-                "lstsq_fallback": lstsq_fallback,
-                "gradient_norm": float(gradient.norm().detach().cpu()),
-                "loss_before": float(current_sensor_loss.detach().cpu()),
-                "loss_after": float(candidate_sensor_loss.detach().cpu()),
+            # An empty free set means every active DOF sits on a bound with its
+            # gradient pointing outwards: the projected gradient vanishes, so
+            # this is a KKT point of the box-constrained problem.
+            stationary = n_free == 0 or per_component <= BLOCK_LM_DECREMENT_STATIONARY
+            record.update({
+                "lambda2": report["lambda2"],
+                "lambda2_per_component": per_component,
+                "lambda2_is_lower_bound": report["lambda2_is_lower_bound"],
+                "n_free": n_free,
+                "frozen_dof": len(active) - n_free,
+                "boundary": n_free < len(active),
+                "rank_deficient": report["rank_deficient"],
+                "stationary": stationary,
+                "min_eigenvalue_free": report["min_eigenvalue_free"],
+                "null_gradient_max": report["null_gradient_max"],
             })
-            _block_lm_observe(
-                record=record,
-                diagnostics=diagnostics,
-                iteration=iteration,
-                current_values=current[active_index].detach(),
-                gradient=gradient,
-                fisher=fisher,
-                lower=-bound_limit,
-                upper=bound_limit,
-                fixed_mask=fixed_mask,
-                residual_vector=residual_vector,
-                candidate_residuals=candidate_residuals,
-                candidate_covariance=candidate_covariance,
-                candidate_mask=candidate_mask,
-                sensor_invalid=sensor_invalid,
-                accepted=accepted,
-                step_clipped=step_clipped,
-                lstsq_fallback=lstsq_fallback,
-                eigen_floor_ratio=config.fisher_eigen_floor,
-                max_invalid_fraction=config.joint_max_invalid_fraction,
-                damping=damping,
-            )
-            fisher_diagnostics.append(diagnostics)
+            if report["rank_deficient"]:
+                # Reported, not retired.  The decrement is a lower bound here,
+                # so it cannot certify convergence -- but stopping these blocks
+                # outright would change the geometry wholesale and make "the
+                # contract was fixed" indistinguishable from "the answer moved".
+                pass
+            elif stationary:
+                record["retired_at_iteration"] = iteration
+                continue
+
+            accepted = False
+            ladder_lost = False
+            ladder_invalid = False
+            for attempt in range(1 + BLOCK_LM_MAX_DAMPING_RETRIES):
+                damping = damping_by_sensor[sensor_index]
+                regularized, diagnostics = regularize_fisher_matrix(
+                    fisher,
+                    damping=damping,
+                    eigen_floor_ratio=config.fisher_eigen_floor,
+                )
+                lstsq_fallback = False
+                try:
+                    normalized_step = -torch.linalg.solve(regularized, gradient)
+                except RuntimeError:
+                    lstsq_fallback = True
+                    normalized_step = -torch.linalg.lstsq(
+                        regularized, gradient[:, None]
+                    ).solution[:, 0]
+                physical_step = normalized_step * physical_scales
+                # The step cap is a trust region, not a feasible-set boundary:
+                # it never enters the KKT test, but a capped step is no longer
+                # the LM step, so it is counted separately.
+                step_clipped = bool((physical_step.abs() > per_dof_limit).any())
+                physical_step = torch.maximum(
+                    torch.minimum(physical_step, per_dof_limit), -per_dof_limit
+                )
+                candidate = current.clone()
+                candidate[active_index] += physical_step
+                candidate[:3].clamp_(-config.joint_clamp_t, config.joint_clamp_t)
+                candidate[3:].clamp_(-config.joint_clamp_r, config.joint_clamp_r)
+                (
+                    candidate_residuals,
+                    candidate_covariance,
+                    candidate_mask,
+                    candidate_valid,
+                ) = _sensor_residual_data(
+                    tracks, candidate, sensor_index, batches, geometry
+                )
+                # Both sides scored on the same set.  Scoring the candidate on
+                # its own mask is how a step that kills the hardest
+                # intersections buys a lower mean with less information.
+                chi2_after = _block_lm_fixed_chi2(
+                    candidate_residuals, candidate_covariance, fixed_mask
+                )
+                lost = bool((fixed_mask & ~candidate_mask).any())
+                sensor_invalid = 1.0 - float(
+                    candidate_valid.float().mean().detach().cpu()
+                )
+                # Anchored on where this sensor already is: the run-level limit
+                # is checked globally at entry, so a sensor that starts out
+                # degraded would otherwise be frozen for reasons that have
+                # nothing to do with the step under test.
+                invalid_ok = sensor_invalid <= max(
+                    current_invalid, config.joint_max_invalid_fraction
+                )
+                ok = bool(
+                    (not lost)
+                    and invalid_ok
+                    and torch.isfinite(chi2_after)
+                    and float(chi2_after) < chi2_before
+                )
+                reject_reason = None
+                if not ok:
+                    reject_reason = (
+                        "component_loss" if lost
+                        else "invalid_fraction" if not invalid_ok
+                        else "no_decrease"
+                    )
+                    ladder_lost = ladder_lost or lost
+                    ladder_invalid = ladder_invalid or not invalid_ok
+                    if lost:
+                        record["component_loss_rejections"] += 1
+                    if not invalid_ok:
+                        record["invalid_fraction_rejections"] += 1
+                record["evaluations"] += 1
+                record["clipped_steps"] += int(step_clipped)
+                record["lstsq_fallbacks"] += int(lstsq_fallback)
+                record["final_damping"] = float(damping)
+                record["max_damping_seen"] = max(record["max_damping_seen"], float(damping))
+                record["min_damping_seen"] = min(record["min_damping_seen"], float(damping))
+                diagnostics.update({
+                    "iteration": iteration,
+                    "sensor_index": int(sensor_index),
+                    "accepted": ok,
+                    "attempt": attempt,
+                    "damping": float(damping),
+                    "step_rms": float(
+                        torch.sqrt(torch.mean(physical_step.square())).detach().cpu()
+                    ),
+                    "step_max": float(physical_step.abs().max().detach().cpu()),
+                    "step_clipped": step_clipped,
+                    "lstsq_fallback": lstsq_fallback,
+                    "gradient_norm": float(gradient.norm().detach().cpu()),
+                    "lambda2": report["lambda2"],
+                    "lambda2_per_component": per_component,
+                    "lambda2_is_lower_bound": report["lambda2_is_lower_bound"],
+                    "n_free": n_free,
+                    "rank_deficient": report["rank_deficient"],
+                    "null_gradient_max": report["null_gradient_max"],
+                    "chi2_fixed_before": chi2_before,
+                    "chi2_fixed_after": float(chi2_after.detach().cpu()),
+                    "n_components_fixed": n_components,
+                    "components_before": n_components,
+                    "components_after": int(candidate_mask.sum()),
+                    "component_loss": lost,
+                    "reject_reason": reject_reason,
+                    "sensor_invalid_fraction": sensor_invalid,
+                    "loss_before": chi2_before / n_components,
+                    "loss_after": float(chi2_after.detach().cpu()) / n_components,
+                })
+                fisher_diagnostics.append(diagnostics)
+                if ok:
+                    alignment[sensor_index] = candidate
+                    record["accepted_steps"] += 1
+                    record["accepted_component_deltas"].append(
+                        int(candidate_mask.sum()) - n_components
+                    )
+                    damping_by_sensor[sensor_index] = max(
+                        damping * 0.5, BLOCK_LM_MIN_DAMPING
+                    )
+                    accepted = True
+                    break
+                if damping >= BLOCK_LM_MAX_DAMPING:
+                    break
+                # Written back, so the raised damping is used by the next solve
+                # whether that is this ladder's retry or the next iteration.
+                record["retries"] += 1
+                damping_by_sensor[sensor_index] = min(
+                    damping * 10.0, BLOCK_LM_MAX_DAMPING
+                )
+            if accepted:
+                still_active.append(sensor_index)
+            else:
+                # No feasible descent step at this point under any damping.
+                record["had_component_loss"] = ladder_lost
+                record["had_invalid_rejection"] = ladder_invalid
+                if not (ladder_lost or ladder_invalid):
+                    record["exhausted_reason"] = "damping_retries"
+                record["retired_at_iteration"] = iteration
+        active_sensors = still_active
         evaluated_loss, invalid_fraction, _residuals, _mask = _target_alignment_evaluation(
             tracks, alignment, batches, geometry
         )
@@ -1731,13 +1779,9 @@ def run_block_lm_alignment(
         if evaluated_value < best_loss:
             best_loss = evaluated_value
             best_iteration = iteration
-        damping = max(damping * 0.5, BLOCK_LM_MIN_DAMPING) if accepted_any else damping * 10.0
-        if not accepted_any or largest_step < 1e-10:
-            stopped_early = True
-            stop_reason = "no_accepted_step"
-            break
+    stopped_early = stop_reason == "all_blocks_terminal"
     blocks = [_block_lm_finalize_record(audit[index]) for index in target_sensors]
-    block_lm_summary = _block_lm_run_summary(blocks, "audit-only", stop_reason, config)
+    block_lm_summary = _block_lm_run_summary(blocks, "contract-fixed", stop_reason, config)
     final_loss, final_invalid, final_residuals, final_mask = _target_alignment_evaluation(
         tracks, alignment, batches, geometry
     )
