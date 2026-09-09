@@ -217,3 +217,99 @@ M  tests/test_compare_geometries.py
 ```
 
 后续实现只应新增本交接所述 loader/performance 改动及其测试；不要顺手提交、清理或覆盖上述文件。
+
+---
+
+## 7. 2026-09-09：修复、可观测性与分层正式实验（已完成）
+
+### 7.1 已实施的修复
+
+本交接原先列出的 ROOT I/O 直接根因已修复：本地普通 ROOT 文件由私有打开辅助函数显式使用
+`uproot.MemmapSource`，而 URI、非本地路径和 file-like 输入仍保持 uproot 的默认处理。这使 nominal
+和 misaligned 文件均在约 1--2 秒内完成 ROOT 打开，随后可以完成展平与严格配对；不再走本机失活的
+`FSSpecSource` asyncio 路径。
+
+此外已完成以下保障，均不改变四臂的 mask、严格配对或 event-cluster bootstrap 契约：
+
+1. `occurrence` 改为每条轨迹内 **measured state** 的 ordinal，避免所有 ROOT state 的 ordinal
+   造成 nominal/misaligned probe identity 错配。
+2. manifest 与 stderr 增加实时阶段报告（ROOT、canonicalize、配对、cohort、每个 arm 的
+   batch/seed/refit、统计、产物）；最近完成阶段会持久化到 `metrics.progress`。
+3. frozen paired cohort 后按 `(target_volume, target_layer, prediction_mode)` 做确定性 SHA-256
+   排序抽样。每层最多 2,000 rows、每个 event/stratum 最多 2 条不同 track、每 track/target-layer
+   最多一个 probe；不足时保留全部而不重复补样。
+4. primary verdict 可由 `--analysis-modes` 限定。未选 mode 仍输出 per-row metrics、groups 和
+   coverage，但不污染主结论。
+
+抽样不是 bootstrap：它固定本次四臂共享的 probe cohort；每个 bootstrap replicate 仍以 event 为
+cluster，抽到某 event 时保留该 event 的全部**已入选** probe rows。
+
+### 7.2 验证
+
+实现后的相关测试与 smoke 均完成：
+
+```text
+python -m pytest tests/test_compare_helix_recovery.py -v  115 passed
+make test                                               519 passed
+100-row/stratum four-arm smoke                          completed
+```
+
+100-row smoke 目录为
+`data/experiments/helix_recovery/Vol17_Lay8__Vol24_Lay4/smoke-sampled-100-20260909`。它只验证产物
+契约；每个 interpolation stratum 仅 100 rows，故 coverage 正确标为 `underpowered`，不能作为
+物理结论。
+
+### 7.3 正式实验与结果
+
+正式实验使用新的目录，未复用或覆盖此前失败的 `full-all-events-20260907`：
+
+```text
+data/experiments/helix_recovery/Vol17_Lay8__Vol24_Lay4/
+  full-sampled-interpolation-2000-20260909-r2
+```
+
+实际命令的关键参数：
+
+```text
+--sample-rows-per-stratum 2000
+--sampling-seed 6006
+--max-probes-per-event-stratum 2
+--analysis-modes interpolation
+--seed-iters 600
+--refit-iters 60
+--bootstrap-replicates 2000
+--bootstrap-seed 6006
+```
+
+运行完成（manifest `completed`，总耗时约 2,297 秒）。frozen cohort 有 4,003 rows：
+
+| stratum | selected rows | coverage |
+|---|---:|---|
+| `17:8 × interpolation` | 2,000 | adequate（LOC0/LOC1 各 2,000） |
+| `24:4 × interpolation` | 2,000 | adequate（LOC0/LOC1 各 2,000） |
+| `17:8 × backward_extrapolation` | 3 | underpowered |
+| 两层的 forward，以及 `24:4 × backward` | 0 | underpowered |
+
+正式 primary analysis 只评价 interpolation。因此，不可从本次结果推断模型在首末 hit 的 forward 或
+backward extrapolation 能力；这些是需要独立 boundary-target ROOT 协议补充的 coverage 缺口。
+
+四臂统计结果如下：
+
+* **Protected（N-P/M-P）为 `passed`。** 两层、LOC0/LOC1 的 2,000 个有效 components 均通过
+  restoration、bias 和 practical-equivalence gates。这支持“排除 target hits 后，未观察到经 ACTS
+  smoothing 传播到整条轨迹的间接污染”。
+* **Exposed（N-E/M-E）为 `failed`。** 两层、LOC0/LOC1 都有 2,000 个有效 components，但均未通过
+  practical-equivalence；例如 recovery ratio Q 分别为 `1.260`、`1.073`（17:8）和 `0.541`、
+  `0.094`（24:4）。因此当前模型不能证明能从直接送入 seed/refit 的 target-hit 错位中自愈。
+
+完整审计产物：`manifest.json`、`helix_recovery_summary.json`、`paired_track_keys.csv`、
+`per_track_stage_metrics.csv` 及六张图均位于上述正式目录。该结论仅覆盖本次的 interpolation cohort；
+不能外推到未覆盖的 extrapolation mode。
+
+### 7.4 运行经验
+
+* ROOT I/O 卡死已与 solver 长耗时区分：在 Memmap 修复后，读取/配对约两分钟完成；正式计算主要耗时
+  是四个 4,003-row、600-iteration seed（每臂约 7--10 分钟）及随后 refit，而非 I/O 死锁。
+* 执行环境回收前台子进程时会留下 `running` manifest。一次受此影响的临时目录
+  `full-sampled-interpolation-2000-20260909` 已保留最后阶段并显式收尾为 `failed`；正式 r2 是唯一
+  应用于本节科学结论的 completed run。

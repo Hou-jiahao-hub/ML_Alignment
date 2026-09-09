@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import sys
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -545,6 +546,106 @@ def test_cli_writes_selected_exposure_artifacts_and_completed_manifest(tmp_path)
     assert all(record["sha256"] for record in manifest["inputs"].values())
     assert manifest["metrics"]["bootstrap"] == {"replicates": 7, "seed": 23}
     assert set(manifest["metrics"]["verdicts"]) == {"protected"}
+
+
+def test_cli_reports_and_persists_completed_stage_progress(tmp_path, capsys):
+    m = load_module()
+    nominal_states, misaligned_states, nominal_geometry, misaligned_geometry = _cli_fixture(tmp_path)
+    output_dir = tmp_path / "progress-run"
+
+    assert m.main(
+        [
+            "--nominal-states", str(nominal_states),
+            "--misaligned-states", str(misaligned_states),
+            "--nominal-geometry", str(nominal_geometry),
+            "--misaligned-geometry", str(misaligned_geometry),
+            "--target-layers", "17:8",
+            "--event-partition", "all",
+            "--exposure", "protected",
+            "--max-tracks", "1",
+            "--seed-iters", "2",
+            "--refit-iters", "2",
+            "--bootstrap-replicates", "2",
+            "--output-dir", str(output_dir),
+        ]
+    ) == 0
+
+    stderr = capsys.readouterr().err
+    for stage in ("manifest", "paired-inputs", "cohort", "arm.nominal.protected.seed", "statistics", "artifacts"):
+        assert f"stage={stage}" in stderr
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    progress = manifest["metrics"]["progress"]
+    assert progress["current_stage"] is None
+    assert progress["last_completed_stage"] == "artifacts"
+    assert progress["elapsed_seconds"] >= 0.0
+
+
+def test_cli_records_sampling_coverage_and_primary_analysis_modes(tmp_path):
+    m = load_module()
+    nominal_states, misaligned_states, nominal_geometry, misaligned_geometry = _cli_fixture(tmp_path)
+    output_dir = tmp_path / "sampled-run"
+
+    assert m.main(
+        [
+            "--nominal-states", str(nominal_states),
+            "--misaligned-states", str(misaligned_states),
+            "--nominal-geometry", str(nominal_geometry),
+            "--misaligned-geometry", str(misaligned_geometry),
+            "--target-layers", "17:8",
+            "--event-partition", "all",
+            "--max-tracks", "1",
+            "--sample-rows-per-stratum", "100",
+            "--sampling-seed", "91",
+            "--max-probes-per-event-stratum", "2",
+            "--analysis-modes", "interpolation",
+            "--seed-iters", "2",
+            "--refit-iters", "2",
+            "--bootstrap-replicates", "2",
+            "--output-dir", str(output_dir),
+        ]
+    ) == 0
+
+    summary = json.loads((output_dir / "helix_recovery_summary.json").read_text())
+    assert summary["analysis_modes"] == ["interpolation"]
+    assert summary["sampling"]["rows_per_stratum"] == 100
+    assert summary["sampling"]["prediction_mode_coverage"][
+        "17:8|forward_extrapolation"
+    ]["coverage_status"] == "underpowered"
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert manifest["metrics"]["sampling"] == summary["sampling"]
+
+
+def test_cli_persists_current_stage_before_fit_failure(tmp_path, monkeypatch, capsys):
+    m = load_module()
+    nominal_states, misaligned_states, nominal_geometry, misaligned_geometry = _cli_fixture(tmp_path)
+    output_dir = tmp_path / "progress-failure-run"
+
+    def interrupt_after_cohort(*_args, **_kwargs):
+        running = json.loads((output_dir / "manifest.json").read_text())
+        progress = running["metrics"]["progress"]
+        assert progress["current_stage"] == "four-arm"
+        assert progress["last_completed_stage"] == "cohort"
+        assert running["metrics"]["cohort_counts"]["frozen_probe_rows"] == 1
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(m, "run_four_arm_recovery", interrupt_after_cohort)
+    assert m.main(
+        [
+            "--nominal-states", str(nominal_states),
+            "--misaligned-states", str(misaligned_states),
+            "--nominal-geometry", str(nominal_geometry),
+            "--misaligned-geometry", str(misaligned_geometry),
+            "--target-layers", "17:8",
+            "--event-partition", "all",
+            "--max-tracks", "1",
+            "--output-dir", str(output_dir),
+        ]
+    ) == 1
+
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert manifest["status"] == "failed"
+    assert manifest["metrics"]["progress"]["current_stage"] == "four-arm"
+    assert "stage=four-arm status=started" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -1307,6 +1408,27 @@ def test_four_arm_runner_reuses_shared_stages_and_evaluates_on_nominal_surfaces(
         assert arm.gauss_newton.intersection_valid.all()
 
 
+def test_four_arm_runner_reports_seed_and_refit_boundaries_for_every_arm():
+    m = load_module()
+    cohort = m.freeze_paired_cohort(_inputs(m), _inputs(m, reverse=True))
+    events = []
+
+    m.run_four_arm_recovery(
+        cohort,
+        nominal_geometry=_geometry(m),
+        misaligned_geometry=_geometry(m),
+        seed_iterations=2,
+        refit_iterations=2,
+        progress=lambda stage, status, _details: events.append((stage, status)),
+    )
+
+    for branch in ("nominal", "misaligned"):
+        for exposure in ("protected", "exposed"):
+            for stage in ("seed", "refit"):
+                assert (f"arm.{branch}.{exposure}.{stage}", "started") in events
+                assert (f"arm.{branch}.{exposure}.{stage}", "completed") in events
+
+
 def test_four_arm_runner_does_not_execute_an_unrequested_broken_exposure(monkeypatch):
     m = load_module()
     cohort = m.freeze_paired_cohort(_inputs(m), _inputs(m))
@@ -1544,6 +1666,47 @@ def test_recovery_statistics_report_an_absent_prediction_mode_as_an_underpowered
     assert group["valid_count"] == 0
     assert group["verdict"] == "inconclusive"
     assert result["exposures"]["protected"]["verdict"] == "inconclusive"
+
+
+def test_sampled_cohort_is_deterministic_and_caps_each_event_stratum():
+    m = load_module()
+    cohort = _four_arm_statistics_fixture(m, n_rows=12, modes=("interpolation",)).cohort
+
+    first, first_metadata = m._sample_paired_cohort(
+        cohort, rows_per_stratum=20, seed=91, max_probes_per_event_stratum=1
+    )
+    second, second_metadata = m._sample_paired_cohort(
+        cohort, rows_per_stratum=20, seed=91, max_probes_per_event_stratum=1
+    )
+
+    assert first.row_indices.tolist() == second.row_indices.tolist()
+    assert first_metadata == second_metadata
+    assert first.n_rows == 4
+    probe_columns = m._probe_columns(first)
+    selected_events = [
+        first.nominal.identities[int(first.row_indices[row, column])].event_nr
+        for row, column in enumerate(probe_columns.tolist())
+    ]
+    assert max(Counter(selected_events).values()) == 1
+    coverage = first_metadata["17:8|interpolation"]
+    assert coverage["candidate_rows"] == 12
+    assert coverage["selected_rows"] == 4
+    assert coverage["coverage_status"] == "underpowered"
+
+
+def test_analysis_modes_exclude_diagnostic_extrapolation_from_primary_verdict():
+    m = load_module()
+
+    result = m.summarize_four_arm_recovery(
+        _four_arm_statistics_fixture(m, modes=("interpolation",)),
+        analysis_modes=("interpolation",),
+    )
+
+    assert result["analysis_modes"] == ["interpolation"]
+    assert result["exposures"]["protected"]["verdict"] == "passed"
+    assert result["exposures"]["protected"]["groups"][
+        "17:8|forward_extrapolation|LOC0"
+    ]["verdict"] == "inconclusive"
 
 
 def test_recovery_statistics_leave_zero_denominator_ratios_undefined():

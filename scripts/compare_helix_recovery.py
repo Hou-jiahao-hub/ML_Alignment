@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import sys
 import tempfile
+import time
 from collections import Counter
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 import awkward as ak
 import numpy as np
@@ -44,10 +48,18 @@ except ImportError:  # Direct script execution and importlib-based tests.
     )
 
 try:
-    from .experiment_manifest import finalize_experiment_manifest, write_experiment_manifest
+    from .experiment_manifest import (
+        finalize_experiment_manifest,
+        update_running_experiment_manifest,
+        write_experiment_manifest,
+    )
     from .project_config import ProjectConfig, absolute_project_path, load_project_config
 except ImportError:  # Direct script execution and importlib-based tests.
-    from experiment_manifest import finalize_experiment_manifest, write_experiment_manifest
+    from experiment_manifest import (
+        finalize_experiment_manifest,
+        update_running_experiment_manifest,
+        write_experiment_manifest,
+    )
     from project_config import ProjectConfig, absolute_project_path, load_project_config
 
 
@@ -196,12 +208,26 @@ def _open_recovery_root(path):
     return uproot.open(path)
 
 
+ProgressCallback = Callable[[str, str, dict[str, object]], None]
+
+
+def _emit_progress(
+    progress: ProgressCallback | None, stage: str, status: str, **details: object
+) -> None:
+    if progress is not None:
+        progress(stage, status, details)
+
+
 def _load_recovery_branch(
     path: str | Path,
     geometry: NominalGeometry,
     target_layers: tuple[tuple[int, int], ...],
+    *,
+    progress: ProgressCallback | None = None,
+    branch: str = "branch",
 ) -> RecoveryHitInputs:
     """Load one branch with an ordinal over measured states within each track."""
+    _emit_progress(progress, f"root.{branch}", "started", path=str(path))
     with _open_recovery_root(path) as root_file:
         if "trackstates" not in root_file:
             raise ValueError(f"ROOT file {path} has no 'trackstates' tree.")
@@ -216,6 +242,8 @@ def _load_recovery_branch(
         events = ak.to_numpy(tree["event_nr"].array(library="ak"))
         tracks = ak.to_numpy(tree["track_nr"].array(library="ak"))
 
+    _emit_progress(progress, f"root.{branch}", "completed", entries=int(len(events)))
+    _emit_progress(progress, f"flatten.{branch}", "started")
     counts = ak.to_numpy(ak.num(arrays["volume_id"], axis=1))
     if len(events) != len(counts) or len(tracks) != len(counts):
         raise ValueError("event_nr/track_nr entries do not align with jagged state entries.")
@@ -283,7 +311,7 @@ def _load_recovery_branch(
     occurrence_tensor = torch.tensor(measured_occurrence, dtype=torch.long)
     measured_y = np.where(loc1, flat["l_y_hit"][keep], 0.0)
     variance_y = np.where(loc1, np.square(flat["err_y_hit"][keep]), 1.0)
-    return RecoveryHitInputs(
+    result = RecoveryHitInputs(
         identities=build_hit_identities(
             event_tensor,
             track_tensor,
@@ -312,6 +340,10 @@ def _load_recovery_branch(
         path_length=torch.tensor(flat["pathLength"][keep], dtype=torch.float64),
         requested_target_layers=target_layers,
     )
+    _emit_progress(
+        progress, f"flatten.{branch}", "completed", measured_hits=len(result.identities)
+    )
+    return result
 
 
 def _select_recovery_hits(inputs: RecoveryHitInputs, selected: torch.Tensor) -> RecoveryHitInputs:
@@ -341,6 +373,7 @@ def load_paired_recovery_inputs(
     event_partition: str = "all",
     max_events: int = 0,
     max_tracks: int = 0,
+    progress: ProgressCallback | None = None,
 ) -> tuple[RecoveryHitInputs, RecoveryHitInputs]:
     """Load, validate, and deterministically cap a paired ROOT cohort by event."""
     if event_partition != "all":
@@ -353,8 +386,12 @@ def load_paired_recovery_inputs(
     target_layers = tuple((int(volume), int(layer)) for volume, layer in target_layers)
     if not target_layers or len(set(target_layers)) != len(target_layers):
         raise ValueError("target_layers must be non-empty and unique.")
+    _emit_progress(progress, "geometry.nominal", "started", path=str(nominal_geometry))
     nominal_geometry_data = load_nominal_geometry(nominal_geometry)
+    _emit_progress(progress, "geometry.nominal", "completed", surfaces=len(nominal_geometry_data.id_to_idx))
+    _emit_progress(progress, "geometry.misaligned", "started", path=str(misaligned_geometry))
     misaligned_geometry_data = load_nominal_geometry(misaligned_geometry)
+    _emit_progress(progress, "geometry.misaligned", "completed", surfaces=len(misaligned_geometry_data.id_to_idx))
     nominal_keys = set(nominal_geometry_data.id_to_idx)
     misaligned_keys = set(misaligned_geometry_data.id_to_idx)
     if misaligned_keys != nominal_keys:
@@ -362,16 +399,21 @@ def load_paired_recovery_inputs(
             extras = sorted(misaligned_keys - nominal_keys)[:5]
             raise ValueError(f"Misaligned geometry contains surfaces absent from nominal: {extras}.")
         misaligned_geometry_data = load_working_geometry(misaligned_geometry, nominal_geometry)
-    nominal = _canonicalize(
-        _load_recovery_branch(nominal_states, nominal_geometry_data, target_layers)
-    )
-    misaligned = _canonicalize(
-        _load_recovery_branch(
-            misaligned_states, misaligned_geometry_data, target_layers
-        )
-    )
+    _emit_progress(progress, "canonicalize.nominal", "started")
+    nominal = _canonicalize(_load_recovery_branch(
+        nominal_states, nominal_geometry_data, target_layers, progress=progress, branch="nominal"
+    ))
+    _emit_progress(progress, "canonicalize.nominal", "completed", measured_hits=len(nominal.identities))
+    _emit_progress(progress, "canonicalize.misaligned", "started")
+    misaligned = _canonicalize(_load_recovery_branch(
+        misaligned_states, misaligned_geometry_data, target_layers, progress=progress, branch="misaligned"
+    ))
+    _emit_progress(progress, "canonicalize.misaligned", "completed", measured_hits=len(misaligned.identities))
+    _emit_progress(progress, "paired-contract", "started")
     _require_paired_contract(nominal, misaligned)
+    _emit_progress(progress, "paired-contract", "completed", measured_hits=len(nominal.identities))
 
+    _emit_progress(progress, "selection", "started", max_events=max_events, max_tracks=max_tracks)
     events = np.asarray([identity.event_nr for identity in nominal.identities], dtype=np.int64)
     available_events = sorted(set(events.tolist()))
     retained_events = available_events[:max_events] if max_events else available_events
@@ -394,10 +436,12 @@ def load_paired_recovery_inputs(
         "available_unique_events": len(available_events),
         "selected_unique_events": selected_event_count,
     }
-    return (
+    result = (
         replace(_select_recovery_hits(nominal, mask), **metadata),
         replace(_select_recovery_hits(misaligned, mask), **metadata),
     )
+    _emit_progress(progress, "selection", "completed", selected_hits=len(result[0].identities), **metadata)
+    return result
 
 
 def build_hit_identities(
@@ -618,6 +662,131 @@ def freeze_paired_cohort(
     )
 
 
+def _slice_paired_cohort(cohort: PairedRecoveryCohort, rows: list[int]) -> PairedRecoveryCohort:
+    """Return the selected frozen rows without changing either paired input."""
+    index = torch.tensor(rows, dtype=torch.long)
+    return replace(
+        cohort,
+        row_indices=cohort.row_indices[index],
+        hit_mask=cohort.hit_mask[index],
+        probe_mask=cohort.probe_mask[index],
+        protected_fit_mask=cohort.protected_fit_mask[index],
+        exposed_fit_mask=cohort.exposed_fit_mask[index],
+        non_target_span_mm=cohort.non_target_span_mm[index],
+        probe_mode=tuple(cohort.probe_mode[row] for row in rows),
+    )
+
+
+def _sampling_key(seed: int, identity: HitIdentity) -> bytes:
+    text = ":".join(str(value) for value in (
+        seed,
+        identity.event_nr,
+        identity.track_nr,
+        identity.volume_id,
+        identity.layer_id,
+        identity.module_id,
+        identity.occurrence,
+    ))
+    return hashlib.sha256(text.encode("utf-8")).digest()
+
+
+def _sample_paired_cohort(
+    cohort: PairedRecoveryCohort,
+    *,
+    rows_per_stratum: int,
+    seed: int,
+    max_probes_per_event_stratum: int,
+) -> tuple[PairedRecoveryCohort, dict[str, dict[str, object]]]:
+    """Deterministically cap frozen probe rows while preserving paired masks."""
+    if rows_per_stratum < 0:
+        raise ValueError("rows_per_stratum must be non-negative.")
+    if max_probes_per_event_stratum < 1:
+        raise ValueError("max_probes_per_event_stratum must be positive.")
+    if not cohort.n_rows:
+        requested_layers = cohort.nominal.requested_target_layers or ()
+        return cohort, {
+            f"{volume}:{layer}|{mode}": {
+                "candidate_rows": 0,
+                "selected_rows": 0,
+                "candidate_events": 0,
+                "selected_events": 0,
+                "candidate_tracks": 0,
+                "selected_tracks": 0,
+                "candidate_available_LOC0": 0,
+                "candidate_available_LOC1": 0,
+                "selected_available_LOC0": 0,
+                "selected_available_LOC1": 0,
+                "coverage_status": "underpowered",
+            }
+            for volume, layer in requested_layers
+            for mode in RECOVERY_PREDICTION_MODES
+        }
+    probe_columns = cohort.probe_mask.to(torch.int64).argmax(dim=1)
+    probes = [
+        cohort.nominal.identities[int(cohort.row_indices[row, column])]
+        for row, column in enumerate(probe_columns.tolist())
+    ]
+    requested_layers = cohort.nominal.requested_target_layers or tuple(sorted({
+        (identity.volume_id, identity.layer_id) for identity in probes
+    }))
+    candidates: dict[tuple[int, int, str], list[int]] = {
+        (volume, layer, mode): []
+        for volume, layer in requested_layers
+        for mode in RECOVERY_PREDICTION_MODES
+    }
+    for row, (identity, mode) in enumerate(zip(probes, cohort.probe_mode)):
+        candidates.setdefault((identity.volume_id, identity.layer_id, mode), []).append(row)
+
+    selected_rows: list[int] = []
+    coverage: dict[str, dict[str, object]] = {}
+    for stratum in sorted(candidates):
+        rows = candidates[stratum]
+        if rows_per_stratum == 0:
+            selected = list(rows)
+        else:
+            selected = []
+            event_counts: Counter[int] = Counter()
+            seen_track_layers: set[tuple[int, int, int, int]] = set()
+            for row in sorted(rows, key=lambda item: _sampling_key(seed, probes[item])):
+                identity = probes[row]
+                event = identity.event_nr
+                track_layer = (identity.event_nr, identity.track_nr, identity.volume_id, identity.layer_id)
+                if event_counts[event] >= max_probes_per_event_stratum or track_layer in seen_track_layers:
+                    continue
+                selected.append(row)
+                event_counts[event] += 1
+                seen_track_layers.add(track_layer)
+                if len(selected) == rows_per_stratum:
+                    break
+        selected_rows.extend(selected)
+        candidate_component = cohort.nominal.component_mask[
+            cohort.row_indices[rows, probe_columns[rows]] if rows else torch.tensor([], dtype=torch.long)
+        ] if rows else torch.zeros((0, 2), dtype=torch.bool)
+        selected_component = cohort.nominal.component_mask[
+            cohort.row_indices[selected, probe_columns[selected]] if selected else torch.tensor([], dtype=torch.long)
+        ] if selected else torch.zeros((0, 2), dtype=torch.bool)
+        name = f"{stratum[0]}:{stratum[1]}|{stratum[2]}"
+        coverage[name] = {
+            "candidate_rows": len(rows),
+            "selected_rows": len(selected),
+            "candidate_events": len({probes[row].event_nr for row in rows}),
+            "selected_events": len({probes[row].event_nr for row in selected}),
+            "candidate_tracks": len({(probes[row].event_nr, probes[row].track_nr) for row in rows}),
+            "selected_tracks": len({(probes[row].event_nr, probes[row].track_nr) for row in selected}),
+            "candidate_available_LOC0": int(candidate_component[:, 0].sum()),
+            "candidate_available_LOC1": int(candidate_component[:, 1].sum()),
+            "selected_available_LOC0": int(selected_component[:, 0].sum()),
+            "selected_available_LOC1": int(selected_component[:, 1].sum()),
+            "coverage_status": (
+                "adequate"
+                if selected_component.shape[0]
+                and bool((selected_component.sum(dim=0) >= MIN_VALID_COMPONENTS).all())
+                else "underpowered"
+            ),
+        }
+    return _slice_paired_cohort(cohort, sorted(selected_rows)), coverage
+
+
 def _batches_for(
     cohort: PairedRecoveryCohort,
     branch: str,
@@ -711,6 +880,7 @@ def run_four_arm_recovery(
     device: str | torch.device = "cpu",
     dtype: torch.dtype = torch.float64,
     exposures: tuple[str, ...] = ("protected", "exposed"),
+    progress: ProgressCallback | None = None,
 ) -> FourArmRecovery:
     """Run requested exposure arms for both branches with the shared solvers."""
     if seed_iterations < 1 or refit_iterations < 1:
@@ -727,6 +897,8 @@ def run_four_arm_recovery(
         ("misaligned", misaligned_geometry),
     ):
         for exposure in exposures:
+            arm_stage = f"arm.{branch}.{exposure}"
+            _emit_progress(progress, f"{arm_stage}.batch", "started", probe_rows=cohort.n_rows)
             batches = _batches_for(
                 cohort, branch, exposure, sensor_lookup_branch=branch
             )
@@ -742,6 +914,8 @@ def run_four_arm_recovery(
                 component_mask=component_mask,
                 hit_mask=batches.hit_mask.clone(),
             )
+            _emit_progress(progress, f"{arm_stage}.batch", "completed", tracks=batches.fit_mask.shape[0])
+            _emit_progress(progress, f"{arm_stage}.seed", "started", iterations=seed_iterations)
             seeded, seed_diagnostics = seed_helices(
                 batches,
                 n_iter=seed_iterations,
@@ -749,9 +923,13 @@ def run_four_arm_recovery(
                 dtype=dtype,
                 return_diagnostics=True,
             )
+            _emit_progress(progress, f"{arm_stage}.seed", "completed")
+            _emit_progress(progress, f"{arm_stage}.seed-evaluation", "started")
             seed_evaluation = evaluate_helix_on_surfaces(
                 seeded, evaluation_batches, nominal_geometry
             )
+            _emit_progress(progress, f"{arm_stage}.seed-evaluation", "completed")
+            _emit_progress(progress, f"{arm_stage}.refit", "started", iterations=refit_iterations)
             fitted, refit_diagnostics = fit_helices_gauss_newton(
                 batches,
                 fit_geometry,
@@ -760,9 +938,12 @@ def run_four_arm_recovery(
                 device=device,
                 dtype=dtype,
             )
+            _emit_progress(progress, f"{arm_stage}.refit", "completed")
+            _emit_progress(progress, f"{arm_stage}.refit-evaluation", "started")
             fitted_evaluation = evaluate_helix_on_surfaces(
                 fitted, evaluation_batches, nominal_geometry
             )
+            _emit_progress(progress, f"{arm_stage}.refit-evaluation", "completed")
             arms[(branch, exposure)] = RecoveryArm(
                 fit_mask=batches.fit_mask.clone(),
                 acts_smt=acts_smt,
@@ -1159,6 +1340,8 @@ def summarize_four_arm_recovery(
     bootstrap_replicates: int = BOOTSTRAP_REPLICATES,
     bootstrap_seed: int = BOOTSTRAP_SEED,
     exposures: tuple[str, ...] = ("protected", "exposed"),
+    progress: ProgressCallback | None = None,
+    analysis_modes: tuple[str, ...] = RECOVERY_PREDICTION_MODES,
 ) -> dict[str, object]:
     """Compute paired recovery metrics, event-cluster CIs, verdicts, and rows.
 
@@ -1172,6 +1355,10 @@ def summarize_four_arm_recovery(
         exposure not in {"protected", "exposed"} for exposure in exposures
     ):
         raise ValueError("exposures must be a non-empty unique selection of protected/exposed.")
+    if not analysis_modes or len(set(analysis_modes)) != len(analysis_modes) or any(
+        mode not in RECOVERY_PREDICTION_MODES for mode in analysis_modes
+    ):
+        raise ValueError("analysis_modes must be a non-empty unique prediction-mode selection.")
     cohort = report.cohort
     target_layers = cohort.nominal.requested_target_layers
     if target_layers is None:
@@ -1186,6 +1373,7 @@ def summarize_four_arm_recovery(
         raise ValueError("Frozen recovery cohort has no requested target layers.")
     result = {
         "bootstrap": {"replicates": bootstrap_replicates, "seed": bootstrap_seed},
+        "analysis_modes": list(analysis_modes),
         "minimum_valid_components": MIN_VALID_COMPONENTS,
         "absolute_detector_thresholds_diagnostic_only": ABSOLUTE_DETECTOR_THRESHOLDS,
     }
@@ -1239,6 +1427,7 @@ def summarize_four_arm_recovery(
     exposure_values = {exposure: _probe_observables(report, exposure) for exposure in exposures}
     exposure_report: dict[str, dict[str, object]] = {}
     for exposure in exposures:
+        _emit_progress(progress, f"statistics.{exposure}", "started", bootstrap_replicates=bootstrap_replicates)
         # Separate named streams make an exposure bitwise invariant to whether
         # the other exposure was requested or evaluated first.
         exposure_code = 0 if exposure == "protected" else 1
@@ -1251,18 +1440,26 @@ def summarize_four_arm_recovery(
             for mode in RECOVERY_PREDICTION_MODES:
                 in_group = (layer_ids[:, 0] == volume) & (layer_ids[:, 1] == layer) & (modes == mode)
                 for component, name in enumerate(("LOC0", "LOC1")):
+                    group_stage = f"statistics.{exposure}.{volume}:{layer}.{mode}.{name}"
+                    _emit_progress(progress, group_stage, "started")
                     requested = in_group & availability[:, component]
                     shared = in_group & _shared_component_mask(availability[:, component], values, component)
                     groups[f"{volume}:{layer}|{mode}|{name}"] = _group_statistics(
                         requested, shared, values, component, event_ids, rng,
                         bootstrap_replicates,
                     )
+                    _emit_progress(progress, group_stage, "completed")
         numerical_ok = all(
             bool(numerical[f"{branch}|{exposure}|{stage}"]["valid"])
             for branch in ("nominal", "misaligned")
             for stage in ("seed", "refit")
         )
-        group_verdicts = [entry["verdict"] for entry in groups.values()]
+        group_verdicts = [
+            groups[f"{volume}:{layer}|{mode}|{name}"]["verdict"]
+            for volume, layer in sorted(target_layers)
+            for mode in analysis_modes
+            for name in ("LOC0", "LOC1")
+        ]
         verdict = (
             "failed"
             if not numerical_ok or "failed" in group_verdicts
@@ -1271,6 +1468,7 @@ def summarize_four_arm_recovery(
             else "passed"
         )
         exposure_report[exposure] = {"verdict": verdict, "groups": groups}
+        _emit_progress(progress, f"statistics.{exposure}", "completed", groups=len(groups), verdict=verdict)
     return {
         **result,
         "numerical_validity": numerical,
@@ -1295,6 +1493,17 @@ def _parse_cli_layers(value: str) -> tuple[tuple[int, int], ...]:
     if not layers or len(set(layers)) != len(layers):
         raise argparse.ArgumentTypeError("target layers must be non-empty and unique")
     return tuple(layers)
+
+
+def _parse_prediction_modes(value: str) -> tuple[str, ...]:
+    modes = tuple(item.strip() for item in value.split(",") if item.strip())
+    if not modes or len(set(modes)) != len(modes) or any(
+        mode not in RECOVERY_PREDICTION_MODES for mode in modes
+    ):
+        raise argparse.ArgumentTypeError(
+            "analysis modes must be unique comma-separated recovery prediction modes"
+        )
+    return modes
 
 
 def _default_cli_paths(config: ProjectConfig) -> dict[str, str]:
@@ -1341,6 +1550,14 @@ def build_argument_parser(config: ProjectConfig | None = None) -> argparse.Argum
     parser.add_argument("--refit-iters", type=int, default=60)
     parser.add_argument("--bootstrap-replicates", type=int, default=BOOTSTRAP_REPLICATES)
     parser.add_argument("--bootstrap-seed", type=int, default=BOOTSTRAP_SEED)
+    parser.add_argument("--sample-rows-per-stratum", type=int, default=0)
+    parser.add_argument("--sampling-seed", type=int, default=BOOTSTRAP_SEED)
+    parser.add_argument("--max-probes-per-event-stratum", type=int, default=2)
+    parser.add_argument(
+        "--analysis-modes",
+        type=_parse_prediction_modes,
+        default=RECOVERY_PREDICTION_MODES,
+    )
     parser.add_argument("--gpu", action="store_true")
     parser.add_argument("--config", help="Path to a TOML project configuration override.")
     return parser
@@ -1498,6 +1715,12 @@ def _effective_experiment_config(args, *, device: torch.device, dtype: torch.dty
         "refit_iterations": args.refit_iters,
         "bootstrap_replicates": args.bootstrap_replicates,
         "bootstrap_seed": args.bootstrap_seed,
+        "sampling": {
+            "rows_per_stratum": args.sample_rows_per_stratum,
+            "seed": args.sampling_seed,
+            "max_probes_per_event_stratum": args.max_probes_per_event_stratum,
+        },
+        "analysis_modes": list(args.analysis_modes),
         "gpu_requested": bool(args.gpu),
         "device": str(device),
         "dtype": str(dtype).removeprefix("torch."),
@@ -1531,6 +1754,68 @@ def _failure_reason(error: BaseException) -> str:
     return f"{type(error).__name__}: {detail}" if detail else type(error).__name__
 
 
+class _ProgressReporter:
+    """Print and persist the latest long-running stage without changing results."""
+
+    def __init__(self) -> None:
+        self._started = time.monotonic()
+        self._manifest_path: Path | None = None
+        self.current_stage: str | None = None
+        self.last_completed_stage: str | None = None
+
+    def attach(self, manifest_path: Path) -> None:
+        self._manifest_path = Path(manifest_path)
+
+    def _progress_record(self, stage: str, status: str, details: dict[str, object]) -> dict[str, object]:
+        if status == "started":
+            self.current_stage = stage
+        elif status == "completed":
+            self.current_stage = None
+            self.last_completed_stage = stage
+        return {
+            "current_stage": self.current_stage,
+            "last_completed_stage": self.last_completed_stage,
+            "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "elapsed_seconds": round(time.monotonic() - self._started, 3),
+            "details": details,
+        }
+
+    def __call__(
+        self,
+        stage: str,
+        status: str,
+        details: dict[str, object] | None = None,
+        **extra_details: object,
+    ) -> None:
+        details = {**(details or {}), **extra_details}
+        record = self._progress_record(stage, status, details)
+        detail_text = json.dumps(details, sort_keys=True, default=str)
+        print(
+            "[helix-recovery] "
+            f"timestamp={record['updated_at']} elapsed_seconds={record['elapsed_seconds']:.3f} "
+            f"stage={stage} status={status} details={detail_text}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if self._manifest_path is None:
+            return
+        try:
+            update_running_experiment_manifest(
+                self._manifest_path, metrics={"progress": record}
+            )
+        except Exception as error:
+            print(
+                f"[helix-recovery] could not persist progress: {_failure_reason(error)}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def merge_metrics(self, metrics: dict[str, object]) -> None:
+        if self._manifest_path is None:
+            return
+        update_running_experiment_manifest(self._manifest_path, metrics=metrics)
+
+
 def _finalize_started_failure(
     manifest_path: Path,
     *,
@@ -1561,8 +1846,10 @@ def main(argv: list[str] | None = None) -> int:
     requested_config, _unknown = config_probe.parse_known_args(raw_arguments)
     config = load_project_config(requested_config.config)
     args = build_argument_parser(config).parse_args(raw_arguments)
-    if args.max_events < 0 or args.max_tracks < 0:
-        raise ValueError("--max-events and --max-tracks must be non-negative")
+    if args.max_events < 0 or args.max_tracks < 0 or args.sample_rows_per_stratum < 0:
+        raise ValueError("event, track, and sample-row limits must be non-negative")
+    if args.max_probes_per_event_stratum < 1:
+        raise ValueError("--max-probes-per-event-stratum must be positive")
     if args.seed_iters < 1 or args.refit_iters < 1 or args.bootstrap_replicates < 1:
         raise ValueError("iteration and bootstrap budgets must be positive")
 
@@ -1604,6 +1891,8 @@ def main(argv: list[str] | None = None) -> int:
     effective = _effective_experiment_config(args, device=device, dtype=dtype)
     command = [sys.executable, str(Path(__file__).resolve()), *raw_arguments]
     available_metrics: dict[str, object] = {"effective_experiment_config": effective}
+    progress = _ProgressReporter()
+    progress("manifest", "started", output_dir=str(output_dir))
     try:
         manifest_path = write_experiment_manifest(
             output_dir,
@@ -1616,6 +1905,8 @@ def main(argv: list[str] | None = None) -> int:
             status="running",
             allow_missing_inputs=True,
         )
+        progress.attach(manifest_path)
+        progress("manifest", "completed")
     except (Exception, KeyboardInterrupt) as error:
         _finalize_started_failure(
             manifest_path,
@@ -1627,6 +1918,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
+        progress("paired-inputs", "started")
         nominal, misaligned = load_paired_recovery_inputs(
             args.nominal_states,
             args.misaligned_states,
@@ -1636,16 +1928,44 @@ def main(argv: list[str] | None = None) -> int:
             event_partition=args.event_partition,
             max_events=args.max_events,
             max_tracks=args.max_tracks,
+            progress=progress,
         )
+        progress("paired-inputs", "completed", paired_measured_hits=len(nominal.identities))
+        progress("cohort", "started")
         cohort = freeze_paired_cohort(nominal, misaligned)
+        progress(
+            "sampling",
+            "started",
+            rows_per_stratum=args.sample_rows_per_stratum,
+            max_probes_per_event_stratum=args.max_probes_per_event_stratum,
+        )
+        cohort, coverage = _sample_paired_cohort(
+            cohort,
+            rows_per_stratum=args.sample_rows_per_stratum,
+            seed=args.sampling_seed,
+            max_probes_per_event_stratum=args.max_probes_per_event_stratum,
+        )
+        sampling = {
+            "rows_per_stratum": args.sample_rows_per_stratum,
+            "seed": args.sampling_seed,
+            "max_probes_per_event_stratum": args.max_probes_per_event_stratum,
+            "prediction_mode_coverage": coverage,
+        }
+        progress("sampling", "completed", selected_probe_rows=cohort.n_rows)
         counts = _cohort_counts(nominal, cohort)
         available_metrics["cohort_counts"] = counts
+        available_metrics["sampling"] = sampling
+        progress.merge_metrics({"cohort_counts": counts, "sampling": sampling})
+        progress("cohort", "completed", **counts)
+        progress("fit-geometries", "started")
         nominal_geometry = load_nominal_geometry(args.nominal_geometry)
         misaligned_geometry = load_nominal_geometry(args.misaligned_geometry)
         if set(misaligned_geometry.id_to_idx) != set(nominal_geometry.id_to_idx):
             misaligned_geometry = load_working_geometry(
                 args.misaligned_geometry, args.nominal_geometry
             )
+        progress("fit-geometries", "completed", nominal_surfaces=len(nominal_geometry.id_to_idx))
+        progress("four-arm", "started", probe_rows=cohort.n_rows)
         report = run_four_arm_recovery(
             cohort,
             nominal_geometry=nominal_geometry,
@@ -1655,13 +1975,19 @@ def main(argv: list[str] | None = None) -> int:
             device=device,
             dtype=dtype,
             exposures=exposures,
+            progress=progress,
         )
+        progress("four-arm", "completed", arms=len(report.arms))
+        progress("statistics", "started", bootstrap_replicates=args.bootstrap_replicates)
         statistics = summarize_four_arm_recovery(
             report,
             bootstrap_replicates=args.bootstrap_replicates,
             bootstrap_seed=args.bootstrap_seed,
             exposures=exposures,
+            progress=progress,
+            analysis_modes=args.analysis_modes,
         )
+        progress("statistics", "completed")
         verdicts = {
             exposure: statistics["exposures"][exposure]["verdict"]
             for exposure in exposures
@@ -1672,6 +1998,7 @@ def main(argv: list[str] | None = None) -> int:
                 "bootstrap": statistics["bootstrap"],
                 "verdicts": verdicts,
                 "numerical_validity": statistics["numerical_validity"],
+                "sampling": sampling,
             }
         )
         summary = {
@@ -1679,6 +2006,8 @@ def main(argv: list[str] | None = None) -> int:
             "effective_experiment_config": effective,
             "cohort_counts": counts,
             "bootstrap": statistics["bootstrap"],
+            "analysis_modes": statistics["analysis_modes"],
+            "sampling": sampling,
             "minimum_valid_components": statistics["minimum_valid_components"],
             "absolute_detector_thresholds_diagnostic_only": statistics[
                 "absolute_detector_thresholds_diagnostic_only"
@@ -1697,6 +2026,7 @@ def main(argv: list[str] | None = None) -> int:
             }
             for row in statistics["per_row"]
         ]
+        progress("artifacts", "started")
         _atomic_write_csv(
             outputs["paired_track_keys"],
             keys,
@@ -1705,6 +2035,7 @@ def main(argv: list[str] | None = None) -> int:
         _atomic_write_csv(outputs["per_track_stage_metrics"], statistics["per_row"])
         _atomic_write_json(outputs["summary"], summary)
         plot_outputs = write_diagnostic_plots(output_dir, statistics, exposures)
+        progress("artifacts", "completed", outputs=len(outputs) + len(plot_outputs))
         finalize_experiment_manifest(
             manifest_path,
             status="completed",
@@ -1712,6 +2043,11 @@ def main(argv: list[str] | None = None) -> int:
             metrics=available_metrics,
         )
     except (Exception, KeyboardInterrupt) as error:
+        print(
+            f"[helix-recovery] failed_stage={progress.current_stage!r} error={_failure_reason(error)}",
+            file=sys.stderr,
+            flush=True,
+        )
         _finalize_started_failure(
             Path(manifest_path),
             command=command,

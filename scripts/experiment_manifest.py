@@ -249,6 +249,27 @@ def finalize_experiment_manifest(
     return _atomic_write_json(destination, manifest)
 
 
+def update_running_experiment_manifest(
+    manifest_path: str | Path,
+    *,
+    metrics: Mapping[str, Any],
+) -> Path:
+    """Atomically merge live metrics into a manifest that is still running.
+
+    Long-running callers use this for diagnostic progress without recomputing
+    immutable input hashes or changing the terminal lifecycle fields.
+    """
+    destination = Path(manifest_path).resolve()
+    with destination.open("r", encoding="utf-8") as stream:
+        manifest = json.load(stream)
+    if manifest.get("status") != "running":
+        raise ValueError(f"cannot update non-running manifest: {destination}")
+    updated_metrics = dict(manifest.get("metrics", {}))
+    updated_metrics.update(metrics)
+    manifest["metrics"] = updated_metrics
+    return _atomic_write_json(destination, manifest)
+
+
 def _key_value_pairs(values: Sequence[str]) -> dict[str, str]:
     result = {}
     for value in values:
