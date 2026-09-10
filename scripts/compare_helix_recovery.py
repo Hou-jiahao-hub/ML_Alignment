@@ -1299,6 +1299,7 @@ def _group_statistics(
 def _per_row_table(report: FourArmRecovery, values_by_exposure: dict[str, dict[str, np.ndarray]]) -> list[dict]:
     cohort = report.cohort
     columns = _probe_columns(cohort).detach().cpu().tolist()
+    reference_values = next(iter(values_by_exposure.values()))
     rows: list[dict] = []
     for row, column in enumerate(columns):
         identity = cohort.nominal.identities[int(cohort.row_indices[row, column])]
@@ -1314,6 +1315,10 @@ def _per_row_table(report: FourArmRecovery, values_by_exposure: dict[str, dict[s
         for component, name in enumerate(("LOC0", "LOC1")):
             available = bool(cohort.nominal.component_mask[cohort.row_indices[row, column], component])
             record[f"requested_{name}"] = available
+            record[f"nominal_acts_smt_{name}_mm"] = (
+                _json_number(reference_values["nominal_acts_local"][row, component])
+                if available else None
+            )
             for exposure, values in values_by_exposure.items():
                 shared = _shared_component_mask(
                     np.array([available]),
@@ -1614,6 +1619,11 @@ def _plot_paths(output_dir: Path, exposures: tuple[str, ...]) -> dict[str, Path]
         result[f"grouped_recovery_ratios_{exposure}"] = (
             output_dir / f"grouped_recovery_ratios_{exposure}.png"
         )
+    if "protected" in exposures:
+        result["nominal_refit_to_nominal_acts_smt_residual_distribution_protected"] = (
+            output_dir
+            / "nominal_refit_to_nominal_acts_smt_residual_distribution_protected.png"
+        )
     return result
 
 
@@ -1628,6 +1638,128 @@ def _save_figure_atomic(figure, path: Path) -> None:
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
+
+
+def _primary_grouped_recovery_series(
+    statistics: dict[str, object], exposure: str
+) -> tuple[list[str], list[float]]:
+    analysis_modes = set(statistics["analysis_modes"])
+    groups = statistics["exposures"][exposure]["groups"]
+    labels = [
+        name
+        for name, group in groups.items()
+        if name.split("|")[1] in analysis_modes
+        and group["recovery_ratio_q"] is not None
+    ]
+    return labels, [groups[name]["recovery_ratio_q"] for name in labels]
+
+
+def _nominal_protected_residual_groups(
+    statistics: dict[str, object],
+) -> dict[str, np.ndarray]:
+    analysis_modes = set(statistics["analysis_modes"])
+    rows = statistics["per_row"]
+    layers = {
+        (int(row["volume_id"]), int(row["layer_id"]))
+        for row in rows
+        if row["prediction_mode"] in analysis_modes
+    }
+    protected = statistics.get("exposures", {}).get("protected", {}).get("groups", {})
+    for name in protected:
+        volume_layer, mode, _component = name.split("|")
+        if mode in analysis_modes:
+            volume, layer = map(int, volume_layer.split(":"))
+            layers.add((volume, layer))
+
+    result: dict[str, np.ndarray] = {}
+    for volume, layer in sorted(layers):
+        for component in ("LOC0", "LOC1"):
+            values = [
+                float(row[f"protected_nominal_refit_{component}_mm"])
+                - float(row[f"nominal_acts_smt_{component}_mm"])
+                for row in rows
+                if int(row["volume_id"]) == volume
+                and int(row["layer_id"]) == layer
+                and row["prediction_mode"] in analysis_modes
+                and bool(row.get(f"shared_valid_protected_{component}", False))
+            ]
+            result[f"{volume}:{layer}|{component}"] = np.asarray(values, dtype=np.float64)
+    return result
+
+
+def write_grouped_recovery_plot(
+    output_dir: Path,
+    statistics: dict[str, object],
+    exposure: str,
+) -> Path:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    path = output_dir / f"grouped_recovery_ratios_{exposure}.png"
+    labels, ratios = _primary_grouped_recovery_series(statistics, exposure)
+    figure, axis = plt.subplots(figsize=(max(7.0, len(labels) * 0.45), 4.8))
+    try:
+        axis.bar(range(len(labels)), ratios)
+        axis.axhline(1.0, color="black", linestyle="--", linewidth=0.8)
+        axis.set_xticks(range(len(labels)), labels, rotation=75, ha="right")
+        axis.set(ylabel="recovery ratio Q", title=f"{exposure}: grouped recovery")
+        _save_figure_atomic(figure, path)
+    finally:
+        plt.close(figure)
+    return path
+
+
+def write_nominal_holdout_residual_plot(
+    output_dir: Path,
+    statistics: dict[str, object],
+) -> Path:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    path = output_dir / "nominal_refit_to_nominal_acts_smt_residual_distribution_protected.png"
+    groups = _nominal_protected_residual_groups(statistics)
+    layers = sorted(
+        {name.split("|")[0] for name in groups},
+        key=lambda value: tuple(map(int, value.split(":"))),
+    )
+    n_rows = max(len(layers), 1)
+    figure, axes = plt.subplots(n_rows, 2, figsize=(10.0, 3.6 * n_rows), squeeze=False)
+    try:
+        for row_index in range(n_rows):
+            for component_index, component in enumerate(("LOC0", "LOC1")):
+                axis = axes[row_index, component_index]
+                if row_index >= len(layers):
+                    axis.set_axis_off()
+                    continue
+                layer = layers[row_index]
+                values = groups[f"{layer}|{component}"]
+                if values.size:
+                    axis.hist(values, bins=min(40, max(5, values.size)), alpha=0.75)
+                    rmse = float(np.sqrt(np.mean(np.square(values))))
+                    annotation = f"n={values.size}\nRMSE={rmse:.4g} mm"
+                else:
+                    annotation = "n=0"
+                axis.axvline(0.0, color="black", linewidth=0.8)
+                axis.text(
+                    0.97, 0.95, annotation,
+                    transform=axis.transAxes, ha="right", va="top",
+                )
+                axis.set(
+                    xlabel=r"$N^P_{refit} - A^N_{SMT}$ [mm]",
+                    ylabel="components",
+                    title=f"{layer} {component}",
+                )
+        modes = ", ".join(statistics["analysis_modes"])
+        figure.suptitle(f"nominal protected holdout residuals ({modes})")
+        figure.tight_layout()
+        _save_figure_atomic(figure, path)
+    finally:
+        plt.close(figure)
+    return path
 
 
 def write_diagnostic_plots(
@@ -1678,18 +1810,9 @@ def write_diagnostic_plots(
             plt.close(figure)
             figures.remove(figure)
 
-            groups = statistics["exposures"][exposure]["groups"]
-            labels = [name for name, group in groups.items() if group["recovery_ratio_q"] is not None]
-            ratios = [groups[name]["recovery_ratio_q"] for name in labels]
-            figure, axis = plt.subplots(figsize=(max(7.0, len(labels) * 0.45), 4.8))
-            figures.append(figure)
-            axis.bar(range(len(labels)), ratios)
-            axis.axhline(1.0, color="black", linestyle="--", linewidth=0.8)
-            axis.set_xticks(range(len(labels)), labels, rotation=75, ha="right")
-            axis.set(ylabel="recovery ratio Q", title=f"{exposure}: grouped recovery")
-            _save_figure_atomic(figure, paths[f"grouped_recovery_ratios_{exposure}"])
-            plt.close(figure)
-            figures.remove(figure)
+            write_grouped_recovery_plot(output_dir, statistics, exposure)
+        if "protected" in exposures:
+            write_nominal_holdout_residual_plot(output_dir, statistics)
     finally:
         for figure in figures:
             plt.close(figure)

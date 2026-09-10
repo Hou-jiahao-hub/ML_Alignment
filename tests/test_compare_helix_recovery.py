@@ -505,6 +505,7 @@ def test_cli_writes_selected_exposure_artifacts_and_completed_manifest(tmp_path)
         "seed_vs_refit_paired_difference_protected.png",
         "refit_difference_distribution_protected.png",
         "grouped_recovery_ratios_protected.png",
+        "nominal_refit_to_nominal_acts_smt_residual_distribution_protected.png",
         "manifest.json",
     }
     def reject_nonfinite(value):
@@ -531,6 +532,8 @@ def test_cli_writes_selected_exposure_artifacts_and_completed_manifest(tmp_path)
         metric_rows = list(csv.DictReader(stream))
     assert len(metric_rows) == 1
     assert "protected_nominal_seed_LOC0_mm" in metric_rows[0]
+    assert "nominal_acts_smt_LOC0_mm" in metric_rows[0]
+    assert "nominal_acts_smt_LOC1_mm" in metric_rows[0]
     for png_path in output_dir.glob("*.png"):
         content = png_path.read_bytes()
         assert content.startswith(b"\x89PNG\r\n\x1a\n")
@@ -707,6 +710,7 @@ def test_cli_keeps_requested_layers_missing_after_input_selection_inconclusive(
         "seed_vs_refit_paired_difference_protected.png",
         "refit_difference_distribution_protected.png",
         "grouped_recovery_ratios_protected.png",
+        "nominal_refit_to_nominal_acts_smt_residual_distribution_protected.png",
         "seed_vs_refit_paired_difference_exposed.png",
         "refit_difference_distribution_exposed.png",
         "grouped_recovery_ratios_exposed.png",
@@ -1214,6 +1218,39 @@ def test_diagnostic_plot_writer_closes_figures_when_save_fails(tmp_path, monkeyp
     assert plt.get_fignums() == []
 
 
+def test_plot_paths_only_add_nominal_holdout_distribution_for_protected(tmp_path):
+    m = load_module()
+
+    protected = m._plot_paths(tmp_path, ("protected",))
+    exposed = m._plot_paths(tmp_path, ("exposed",))
+
+    assert protected["nominal_refit_to_nominal_acts_smt_residual_distribution_protected"] == (
+        tmp_path / "nominal_refit_to_nominal_acts_smt_residual_distribution_protected.png"
+    )
+    assert "nominal_refit_to_nominal_acts_smt_residual_distribution_protected" not in exposed
+
+
+def test_nominal_holdout_plot_closes_figure_when_save_fails(tmp_path, monkeypatch):
+    m = load_module()
+    statistics = m.summarize_four_arm_recovery(
+        _four_arm_statistics_fixture(m, n_rows=1, modes=("interpolation",)),
+        bootstrap_replicates=1,
+        exposures=("protected",),
+        analysis_modes=("interpolation",),
+    )
+
+    def fail_save(*_args, **_kwargs):
+        raise RuntimeError("save failed")
+
+    monkeypatch.setattr(m, "_save_figure_atomic", fail_save)
+    with pytest.raises(RuntimeError, match="save failed"):
+        m.write_nominal_holdout_residual_plot(tmp_path, statistics)
+
+    import matplotlib.pyplot as plt
+
+    assert plt.get_fignums() == []
+
+
 def _inputs(module, *, reverse=False, target_at=5):
     path = torch.arange(11, dtype=torch.float64) * 100.0
     order = torch.arange(11)
@@ -1624,6 +1661,95 @@ def test_recovery_statistics_use_one_shared_mask_and_clustered_bootstrap_without
     assert result["exposures"]["protected"]["verdict"] == "passed"
     assert len(result["per_row"]) == 603
     assert result["per_row"][0]["shared_valid_LOC0"] is False
+
+
+def test_per_row_metrics_include_nominal_acts_smt_probe_coordinates():
+    m = load_module()
+    report = _four_arm_statistics_fixture(m, n_rows=1, modes=("interpolation",))
+    report.arms[("nominal", "protected")].acts_smt.local_position[0, 0] = torch.tensor(
+        [2.5, -3.5], dtype=torch.float64
+    )
+
+    result = m.summarize_four_arm_recovery(
+        report, bootstrap_replicates=1, exposures=("protected",)
+    )
+
+    assert result["per_row"][0]["nominal_acts_smt_LOC0_mm"] == pytest.approx(2.5)
+    assert result["per_row"][0]["nominal_acts_smt_LOC1_mm"] == pytest.approx(-3.5)
+
+
+def test_nominal_holdout_residual_groups_use_signed_primary_mode_shared_values():
+    m = load_module()
+    statistics = {
+        "analysis_modes": ["interpolation"],
+        "per_row": [
+            {
+                "volume_id": 17,
+                "layer_id": 8,
+                "prediction_mode": "interpolation",
+                "shared_valid_protected_LOC0": True,
+                "shared_valid_protected_LOC1": False,
+                "protected_nominal_refit_LOC0_mm": 1.5,
+                "protected_nominal_refit_LOC1_mm": 99.0,
+                "nominal_acts_smt_LOC0_mm": 2.0,
+                "nominal_acts_smt_LOC1_mm": 1.0,
+            },
+            {
+                "volume_id": 17,
+                "layer_id": 8,
+                "prediction_mode": "forward_extrapolation",
+                "shared_valid_protected_LOC0": True,
+                "shared_valid_protected_LOC1": True,
+                "protected_nominal_refit_LOC0_mm": 20.0,
+                "protected_nominal_refit_LOC1_mm": 30.0,
+                "nominal_acts_smt_LOC0_mm": 1.0,
+                "nominal_acts_smt_LOC1_mm": 1.0,
+            },
+            {
+                "volume_id": 24,
+                "layer_id": 4,
+                "prediction_mode": "interpolation",
+                "shared_valid_protected_LOC0": False,
+                "shared_valid_protected_LOC1": True,
+                "protected_nominal_refit_LOC0_mm": 99.0,
+                "protected_nominal_refit_LOC1_mm": -1.0,
+                "nominal_acts_smt_LOC0_mm": 1.0,
+                "nominal_acts_smt_LOC1_mm": -0.25,
+            },
+        ],
+    }
+
+    groups = m._nominal_protected_residual_groups(statistics)
+
+    assert list(groups) == ["17:8|LOC0", "17:8|LOC1", "24:4|LOC0", "24:4|LOC1"]
+    assert groups["17:8|LOC0"].tolist() == pytest.approx([-0.5])
+    assert groups["17:8|LOC1"].size == 0
+    assert groups["24:4|LOC0"].size == 0
+    assert groups["24:4|LOC1"].tolist() == pytest.approx([-0.75])
+
+
+@pytest.mark.parametrize("exposure", ("protected", "exposed"))
+def test_grouped_recovery_plot_only_labels_primary_analysis_modes(
+    tmp_path, monkeypatch, exposure
+):
+    m = load_module()
+    statistics = m.summarize_four_arm_recovery(
+        _four_arm_statistics_fixture(m),
+        bootstrap_replicates=1,
+        exposures=(exposure,),
+        analysis_modes=("interpolation",),
+    )
+    grouped_labels = []
+
+    def inspect_figure(figure, path):
+        if path.name == f"grouped_recovery_ratios_{exposure}.png":
+            grouped_labels.extend(label.get_text() for label in figure.axes[0].get_xticklabels())
+
+    monkeypatch.setattr(m, "_save_figure_atomic", inspect_figure)
+
+    m.write_diagnostic_plots(tmp_path, statistics, (exposure,))
+
+    assert grouped_labels == ["17:8|interpolation|LOC0", "17:8|interpolation|LOC1"]
 
 
 def test_recovery_statistics_are_inconclusive_when_a_group_has_fewer_than_200_shared_components():
