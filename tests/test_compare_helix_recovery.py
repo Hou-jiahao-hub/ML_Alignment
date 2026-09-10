@@ -261,7 +261,6 @@ def test_paired_root_loader_preserves_state_ordinal_then_caps_tracks(tmp_path):
         nominal_geometry,
         misaligned_geometry,
         target_layers=((17, 8),),
-        event_partition="all",
         max_events=2,
         max_tracks=2,
     )
@@ -288,7 +287,6 @@ def test_paired_root_loader_selects_complete_lowest_unique_events_without_hashin
         nominal_geometry,
         misaligned_geometry,
         target_layers=((17, 8),),
-        event_partition="all",
         max_events=1,
     )
 
@@ -299,22 +297,13 @@ def test_paired_root_loader_selects_complete_lowest_unique_events_without_hashin
     assert len(nominal.identities) == 2
 
 
-def test_paired_root_loader_rejects_hash_partitions(tmp_path):
+def test_paired_root_loader_has_no_event_partition_api():
     m = load_module()
-    nominal_states, misaligned_states, nominal_geometry, misaligned_geometry, _tracks = (
-        _loader_fixture(tmp_path)
-    )
+    import inspect
 
-    with pytest.raises(ValueError, match="hash partition"):
-        m.load_paired_recovery_inputs(
-            nominal_states,
-            misaligned_states,
-            nominal_geometry,
-            misaligned_geometry,
-            target_layers=((17, 8),),
-            event_partition="validation",
-            max_events=1,
-        )
+    assert "event_partition" not in inspect.signature(
+        m.load_paired_recovery_inputs
+    ).parameters
 
 
 def test_paired_root_loader_occurrence_is_measured_state_ordinal(tmp_path):
@@ -329,7 +318,6 @@ def test_paired_root_loader_occurrence_is_measured_state_ordinal(tmp_path):
         nominal_geometry,
         misaligned_geometry,
         target_layers=((17, 8),),
-        event_partition="all",
     )
 
     duplicate_states = [
@@ -355,7 +343,6 @@ def test_paired_root_loader_ignores_branch_local_nonmeasurement_state_positions(
         nominal_geometry,
         misaligned_geometry,
         target_layers=((17, 8),),
-        event_partition="all",
     )
 
     assert nominal.identities == misaligned.identities
@@ -381,7 +368,6 @@ def test_paired_root_loader_refuses_measurement_mismatch_before_partition_filter
             nominal_geometry,
             misaligned_geometry,
             target_layers=((17, 8),),
-            event_partition="all",
             max_events=1,
         )
 
@@ -404,7 +390,6 @@ def test_paired_root_loader_refuses_swapped_duplicate_surface_measurements(tmp_p
             nominal_geometry,
             misaligned_geometry,
             target_layers=((17, 8),),
-            event_partition="all",
         )
 
 
@@ -422,7 +407,6 @@ def test_paired_root_loader_refuses_cross_branch_variance_mismatch(tmp_path):
             nominal_geometry,
             misaligned_geometry,
             target_layers=((17, 8),),
-            event_partition="all",
         )
 
 
@@ -435,7 +419,7 @@ def test_cli_defaults_and_help_follow_project_layout():
     help_text = parser.format_help()
 
     assert args.target_layers == config.target_layers
-    assert args.event_partition == "all"
+    assert not hasattr(args, "event_partition")
     assert args.max_events == 20000
     assert args.exposure == "both"
     assert args.max_tracks == 0
@@ -459,7 +443,6 @@ def test_cli_defaults_and_help_follow_project_layout():
         "--nominal-geometry",
         "--misaligned-geometry",
         "--target-layers",
-        "--event-partition",
         "--max-events",
         "--exposure",
         "--max-tracks",
@@ -472,6 +455,14 @@ def test_cli_defaults_and_help_follow_project_layout():
         "--config",
     ):
         assert option in help_text
+    assert "--event-partition" not in help_text
+
+
+def test_cli_rejects_removed_event_partition_option():
+    m = load_module()
+
+    with pytest.raises(SystemExit):
+        m.build_argument_parser().parse_args(["--event-partition", "all"])
 
 
 def test_cli_writes_selected_exposure_artifacts_and_completed_manifest(tmp_path):
@@ -486,7 +477,6 @@ def test_cli_writes_selected_exposure_artifacts_and_completed_manifest(tmp_path)
             "--nominal-geometry", str(nominal_geometry),
             "--misaligned-geometry", str(misaligned_geometry),
             "--target-layers", "17:8",
-            "--event-partition", "all",
             "--exposure", "protected",
             "--max-tracks", "1",
             "--output-dir", str(output_dir),
@@ -563,7 +553,6 @@ def test_cli_reports_and_persists_completed_stage_progress(tmp_path, capsys):
             "--nominal-geometry", str(nominal_geometry),
             "--misaligned-geometry", str(misaligned_geometry),
             "--target-layers", "17:8",
-            "--event-partition", "all",
             "--exposure", "protected",
             "--max-tracks", "1",
             "--seed-iters", "2",
@@ -595,7 +584,6 @@ def test_cli_records_sampling_coverage_and_primary_analysis_modes(tmp_path):
             "--nominal-geometry", str(nominal_geometry),
             "--misaligned-geometry", str(misaligned_geometry),
             "--target-layers", "17:8",
-            "--event-partition", "all",
             "--max-tracks", "1",
             "--sample-rows-per-stratum", "100",
             "--sampling-seed", "91",
@@ -639,7 +627,6 @@ def test_cli_persists_current_stage_before_fit_failure(tmp_path, monkeypatch, ca
             "--nominal-geometry", str(nominal_geometry),
             "--misaligned-geometry", str(misaligned_geometry),
             "--target-layers", "17:8",
-            "--event-partition", "all",
             "--max-tracks", "1",
             "--output-dir", str(output_dir),
         ]
@@ -669,7 +656,6 @@ def test_cli_keeps_requested_layers_missing_after_input_selection_inconclusive(
             "--nominal-geometry", str(paths[2]),
             "--misaligned-geometry", str(paths[3]),
             "--target-layers", "17:8,24:4",
-            "--event-partition", "all",
             "--max-events", str(max_events),
             "--max-tracks", str(max_tracks),
             "--output-dir", str(output_dir),
@@ -735,7 +721,6 @@ def test_cli_rejects_input_output_collisions_before_any_artifact_write(
             "--nominal-geometry", str(paths[2]),
             "--misaligned-geometry", str(paths[3]),
             "--target-layers", "17:8",
-            "--event-partition", "all",
             "--output-dir", str(output_dir),
             "--seed-iters", "8",
             "--refit-iters", "8",
@@ -781,7 +766,6 @@ def test_cli_rejects_resolved_symlink_collisions_without_changing_sources(
             "--nominal-geometry", str(paths[2]),
             "--misaligned-geometry", str(paths[3]),
             "--target-layers", "17:8",
-            "--event-partition", "all",
             "--output-dir", str(output_dir),
             "--seed-iters", "8",
             "--refit-iters", "8",
@@ -813,7 +797,6 @@ def test_cli_rejects_config_output_collisions_before_writing(tmp_path, capsys, a
             "--misaligned-states", str(paths[1]),
             "--nominal-geometry", str(paths[2]),
             "--misaligned-geometry", str(paths[3]),
-            "--event-partition", "all",
             "--output-dir", str(output_dir),
             "--seed-iters", "8",
             "--refit-iters", "8",
@@ -854,7 +837,6 @@ def test_cli_checks_every_configuration_source_for_output_collisions(
             "--nominal-geometry", str(paths[2]),
             "--misaligned-geometry", str(paths[3]),
             "--target-layers", "17:8",
-            "--event-partition", "all",
             "--output-dir", str(output_dir),
         ]
     )
@@ -877,7 +859,6 @@ def test_cli_rejects_missing_input_colliding_with_future_manifest(tmp_path, caps
             "--nominal-geometry", str(paths[2]),
             "--misaligned-geometry", str(paths[3]),
             "--target-layers", "17:8",
-            "--event-partition", "all",
             "--output-dir", str(output_dir),
         ]
     )
@@ -906,7 +887,6 @@ def test_cli_reports_empty_requested_cohort_as_inconclusive_without_fitting(
             "--nominal-geometry", str(paths[2]),
             "--misaligned-geometry", str(paths[3]),
             "--target-layers", "24:4",
-            "--event-partition", "all",
             "--output-dir", str(output_dir),
             "--bootstrap-replicates", "7",
         ]
@@ -947,7 +927,6 @@ def test_cli_finalizes_failed_manifest_when_root_loading_raises(tmp_path):
             "--nominal-geometry", str(nominal_geometry),
             "--misaligned-geometry", str(misaligned_geometry),
             "--target-layers", "17:8",
-            "--event-partition", "all",
             "--output-dir", str(output_dir),
             "--seed-iters", "1",
             "--refit-iters", "1",
@@ -986,7 +965,6 @@ def test_cli_replaces_stale_completed_manifest_and_records_missing_input_failure
             "--nominal-geometry", str(nominal_geometry),
             "--misaligned-geometry", str(misaligned_geometry),
             "--target-layers", "17:8",
-            "--event-partition", "all",
             "--output-dir", str(output_dir),
         ]
     )
@@ -1020,7 +998,6 @@ def test_cli_starts_manifest_before_input_hash_and_finalizes_unreadable_failure(
             "--nominal-geometry", str(nominal_geometry),
             "--misaligned-geometry", str(misaligned_geometry),
             "--target-layers", "17:8",
-            "--event-partition", "all",
             "--output-dir", str(output_dir),
         ]
     )
@@ -1050,7 +1027,6 @@ def test_cli_finalizes_failed_manifest_on_keyboard_interrupt_after_start(tmp_pat
             "--nominal-geometry", str(nominal_geometry),
             "--misaligned-geometry", str(misaligned_geometry),
             "--target-layers", "17:8",
-            "--event-partition", "all",
             "--output-dir", str(output_dir),
         ]
     )
@@ -1078,7 +1054,6 @@ def test_cli_late_failure_preserves_available_scientific_metrics(tmp_path, monke
             "--nominal-geometry", str(nominal_geometry),
             "--misaligned-geometry", str(misaligned_geometry),
             "--target-layers", "17:8",
-            "--event-partition", "all",
             "--exposure", "protected",
             "--max-tracks", "1",
             "--output-dir", str(output_dir),
@@ -1121,7 +1096,6 @@ def test_cli_fit_failure_preserves_already_available_cohort_counts(tmp_path, mon
             "--nominal-geometry", str(nominal_geometry),
             "--misaligned-geometry", str(misaligned_geometry),
             "--target-layers", "17:8",
-            "--event-partition", "all",
             "--output-dir", str(output_dir),
         ]
     )

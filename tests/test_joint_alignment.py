@@ -171,28 +171,6 @@ def test_build_track_batches_is_deterministic_and_preserves_1d_mask():
     assert torch.allclose(a.covariances[a.hit_mask][:, 1], torch.ones(6))
 
 
-def test_alignment_inputs_filter_uses_only_requested_event_partition():
-    m = load_module()
-    rows = []
-    for event_nr in (0, 2, 5):
-        rows.append(
-            dict(
-                event_nr=event_nr, track_nr=1, sensor_idx=0, volume_id=10,
-                layer_id=1, module_id=1, g_x_smt=1.0, g_y_smt=0.0,
-                g_z_smt=0.0, l_x_hit=0.0, l_y_filled=0.0,
-                loc1_valid=True, var0=1.0, var1=1.0,
-            )
-        )
-    inputs = _make_inputs(m, pd.DataFrame(rows))
-
-    filtered = m.filter_alignment_inputs_by_event_partition(
-        inputs, "train", split_seed=6006
-    )
-
-    assert filtered.hit_event_ids.tolist() == [0]
-    assert len(filtered.hit_sensor_ids) == 1
-
-
 def _initialization_frame(target_x=200.0, target_measurement=0.0):
     rows = []
     for index, x in enumerate(np.linspace(0.0, 400.0, 9)):

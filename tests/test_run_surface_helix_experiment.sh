@@ -38,11 +38,13 @@ grep -Fq -- "[acts]" "$output"
 [[ "$(grep -Fc -- "--track-mode surface" "$output")" -eq 2 ]]
 [[ "$(grep -Fc -- "--track-mode free" "$output")" -eq 1 ]]
 [[ "$(grep -Fc -- "python calibrate_acceptance.py" "$output")" -eq 1 ]]
-[[ "$(grep -Fc -- "python reconstruction_acceptance.py" "$output")" -eq 5 ]]
-[[ "$(grep -Fc -- "--event-partition train" "$output")" -eq 3 ]]
-[[ "$(grep -Fc -- "--event-partition calibration" "$output")" -eq 4 ]]
-[[ "$(grep -Fc -- "--event-partition validation" "$output")" -eq 1 ]]
-[[ "$(grep -Fc -- "--threshold-profile" "$output")" -eq 5 ]]
+# Fits and scores every event: baseline_input, joint_free, and the two
+# surface-polish rounds -- there is no separate held-out validation call.
+[[ "$(grep -Fc -- "python reconstruction_acceptance.py" "$output")" -eq 4 ]]
+[[ "$(grep -Fc -- "--event-partition" "$output")" -eq 0 ]]
+[[ "$(grep -Fc -- "--event-split-seed" "$output")" -eq 0 ]]
+[[ "$(grep -Fc -- "--split-seed" "$output")" -eq 0 ]]
+[[ "$(grep -Fc -- "--threshold-profile" "$output")" -eq 4 ]]
 if grep -Fq -- "tdd_fresh_surface_warm" "$output"; then
     echo "workflow still runs a surface warm start" >&2
     exit 1
@@ -75,8 +77,7 @@ baseline_accept="$(grep -n -m1 -- "acceptance_tdd_fresh_baseline_input.json" "$o
 joint="$(grep -n -m1 -- "tdd_fresh_joint_free" "$output" | cut -d: -f1)"
 accept="$(grep -n -m1 -- "acceptance_tdd_fresh_joint_free.json" "$output" | cut -d: -f1)"
 polish="$(grep -n -m1 -- "tdd_fresh_surface_polish1" "$output" | cut -d: -f1)"
-validation="$(grep -n -m1 -- "acceptance_tdd_fresh_validation.json" "$output" | cut -d: -f1)"
-(( baseline_accept < joint && joint < accept && accept < polish && polish < validation ))
+(( baseline_accept < joint && joint < accept && accept < polish ))
 
 if grep -Fq -- "--threshold 1.0" "$output"; then
     echo "new workflow still uses the uncalibrated absolute acceptance threshold" >&2
@@ -85,64 +86,5 @@ fi
 
 if bash "$SCRIPT" --dry-run > /dev/null 2>&1; then
     echo "driver accepted a missing --run-tag" >&2
-    exit 1
-fi
-
-# --skip-blind-validation must leave the one-shot validation split untouched.
-skip_output="$(mktemp)"
-trap 'rm -f "$output" "$skip_output"' EXIT
-
-bash "$SCRIPT" \
-    --run-tag tdd_skip \
-    --dry-run \
-    --skip-blind-validation \
-    --input-geom inputs/current.json \
-    --states inputs/states.root \
-    --summary inputs/summary.root \
-    --nominal-states inputs/nominal.root \
-    > "$skip_output" 2>&1
-
-grep -Fq -- "the validation split stays untouched" "$skip_output"
-[[ "$(grep -Fc -- "--event-partition validation" "$skip_output")" -eq 0 ]]
-[[ "$(grep -Fc -- "acceptance_tdd_skip_validation.json" "$skip_output")" -eq 0 ]]
-# every calibration-side acceptance still runs
-[[ "$(grep -Fc -- "--event-partition calibration" "$skip_output")" -eq 4 ]]
-[[ "$(grep -Fc -- "python reconstruction_acceptance.py" "$skip_output")" -eq 4 ]]
-
-# --no-event-split fits and scores every event; no stage may filter by hash.
-full_output="$(mktemp)"
-trap 'rm -f "$output" "$skip_output" "$full_output"' EXIT
-
-bash "$SCRIPT" \
-    --run-tag tdd_full \
-    --dry-run \
-    --no-event-split \
-    --skip-blind-validation \
-    --input-geom inputs/current.json \
-    --states inputs/states.root \
-    --summary inputs/summary.root \
-    --nominal-states inputs/nominal.root \
-    > "$full_output" 2>&1
-
-[[ "$(grep -Fc -- "--event-partition" "$full_output")" -eq 0 ]]
-[[ "$(grep -Fc -- "--event-split-seed" "$full_output")" -eq 0 ]]
-[[ "$(grep -Fc -- "python reconstruction_acceptance.py" "$full_output")" -eq 4 ]]
-[[ "$(grep -Fc -- "--threshold-profile" "$full_output")" -eq 4 ]]
-# thresholds stay hash-calibrated, but only on nominal states that no stage fits
-[[ "$(grep -Fc -- "python calibrate_acceptance.py" "$full_output")" -eq 1 ]]
-[[ "$(grep -Fc -- "--split-seed" "$full_output")" -eq 1 ]]
-
-# Without a split there is no held-out remainder, so a blind validation would
-# re-score the events that selected the geometry.  Refuse it outright.
-if bash "$SCRIPT" \
-    --run-tag tdd_full_bad \
-    --dry-run \
-    --no-event-split \
-    --input-geom inputs/current.json \
-    --states inputs/states.root \
-    --summary inputs/summary.root \
-    --nominal-states inputs/nominal.root \
-    > /dev/null 2>&1; then
-    echo "driver accepted --no-event-split without --skip-blind-validation" >&2
     exit 1
 fi

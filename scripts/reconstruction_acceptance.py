@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -14,15 +15,22 @@ import uproot
 
 try:
     from .alignment_artifact_layout import TARGET_LAYERS, target_layers_spec
-    from .event_split import DEFAULT_SPLIT_SEED, PARTITIONS, event_partition_mask
+    from .event_identity import event_key_hash
     from .project_config import absolute_project_path, add_config_argument
 except ImportError:  # Direct script execution.
     from alignment_artifact_layout import TARGET_LAYERS, target_layers_spec
-    from event_split import DEFAULT_SPLIT_SEED, PARTITIONS, event_partition_mask
+    from event_identity import event_key_hash
     from project_config import absolute_project_path, add_config_argument
 
 
-SCHEMA_VERSION = "2.0"
+SCHEMA_VERSION = "3.0"
+#: Version of the chi2/threshold *algorithm*, independent of the JSON shape
+#: tracked by SCHEMA_VERSION.  Bump this whenever the acceptance computation
+#: itself changes (component formula, variance floor, bootstrap method, ...);
+#: a frozen profile whose selection_version disagrees is stale and must be
+#: regenerated rather than silently reused.
+SELECTION_VERSION = "full_event_bootstrap_v1"
+BOOTSTRAP_BATCH_SIZE = 32
 DEFAULT_THRESHOLD = 1.0
 STRIP_VOLUMES = {23, 24, 25}
 STRIP_LOC1_VARIANCE_FLOOR = 1.2**2
@@ -48,6 +56,41 @@ def parse_layers(value) -> tuple[tuple[int, int], ...]:
     if not parsed:
         raise ValueError("At least one target layer is required.")
     return tuple(parsed)
+
+
+class AcceptanceProfileIdentityError(ValueError):
+    """A threshold profile's recorded identity does not match this run's inputs."""
+
+
+def _verify_profile_identity(profile: dict | None, frame: pd.DataFrame) -> None:
+    """Fail closed before any result if the profile was not built for this run's events.
+
+    Called whenever a profile is supplied at all; there is no longer a
+    diagnostic-vs-partitioned distinction to skip this on.
+    """
+    if profile is None:
+        return
+    if profile.get("selection_version") != SELECTION_VERSION:
+        raise AcceptanceProfileIdentityError(
+            f"threshold profile selection_version {profile.get('selection_version')!r} "
+            f"does not match {SELECTION_VERSION!r}; regenerate the profile"
+        )
+    identity = profile.get("event_identity")
+    if not isinstance(identity, dict) or "event_key_sha256" not in identity:
+        raise AcceptanceProfileIdentityError(
+            "threshold profile has no event_identity.event_key_sha256; regenerate it"
+        )
+    actual_key = event_key_hash(frame["event_nr"].to_numpy())
+    if actual_key != identity["event_key_sha256"]:
+        raise AcceptanceProfileIdentityError(
+            "threshold profile event key does not match this run's events; "
+            "the profile was calibrated on a different event set"
+        )
+    actual_events = int(frame["event_nr"].nunique())
+    if identity.get("nominal_events") != actual_events:
+        raise AcceptanceProfileIdentityError(
+            "threshold profile nominal event count does not match this run's events"
+        )
 
 
 def _invalid_component() -> dict[str, object]:
@@ -127,8 +170,8 @@ def compute_reconstruction_acceptance(
     threshold: float = DEFAULT_THRESHOLD,
     *,
     thresholds: dict | None = None,
-    event_partition: str | None = None,
-    split_seed: int = DEFAULT_SPLIT_SEED,
+    profile: dict | None = None,
+    threshold_profile_sha256: str | None = None,
 ) -> dict:
     """Compute measurement-minus-smoothed-state chi2 for LOC0 and LOC1."""
     missing = sorted(REQUIRED_FIELDS - set(frame.columns))
@@ -136,10 +179,12 @@ def compute_reconstruction_acceptance(
         raise ValueError(f"trackstates are missing required fields: {', '.join(missing)}")
     if not math.isfinite(threshold) or threshold < 0:
         raise ValueError("threshold must be a finite non-negative value")
-    if event_partition is not None:
+    profile_identity_verified = False
+    if profile is not None:
         if "event_nr" not in frame:
-            raise ValueError("trackstates are missing required event partition field: event_nr")
-        frame = frame[event_partition_mask(frame["event_nr"].to_numpy(), event_partition, split_seed)]
+            raise ValueError("trackstates are missing required field for profile identity verification: event_nr")
+        _verify_profile_identity(profile, frame)
+        profile_identity_verified = True
     targets = parse_layers(target_layers)
     layers: dict[str, dict[str, dict[str, object]]] = {}
     failed_layers = []
@@ -189,8 +234,11 @@ def compute_reconstruction_acceptance(
         "schema_version": SCHEMA_VERSION,
         "threshold": threshold,
         "threshold_mode": "per_component" if thresholds is not None else "scalar",
-        "event_partition": event_partition,
-        "split_seed": split_seed if event_partition is not None else None,
+        "profile_identity_verified": profile_identity_verified,
+        # Provenance: which exact profile bytes this result was scored against,
+        # so a later audit of the acceptance JSON alone (without the shell
+        # variable that produced it) can still confirm the pin.
+        "threshold_profile_sha256": threshold_profile_sha256,
         "layers": layers,
         "valid": not any(
             not metric["valid"]
@@ -210,7 +258,12 @@ def compute_reconstruction_acceptance(
     return result
 
 
-def _component_contributions(rows: pd.DataFrame, volume: int, component: str):
+def _component_contributions(
+    rows: pd.DataFrame,
+    volume: int,
+    component: str,
+    event_ids: np.ndarray,
+):
     if component == "LOC0":
         measured, predicted, errors = "l_x_hit", "eLOC0_smt", "err_x_hit"
     else:
@@ -222,9 +275,10 @@ def _component_contributions(rows: pd.DataFrame, volume: int, component: str):
     if component == "LOC1" and volume in STRIP_VOLUMES:
         variance = np.maximum(variance, STRIP_LOC1_VARIANCE_FLOOR)
     if len(selected) == 0 or not np.isfinite(residual).all() or not np.isfinite(variance).all() or (variance <= 0).any():
-        raise ValueError(f"Invalid nominal calibration component {volume}:{component}")
+        raise ValueError(f"Invalid nominal component {volume}:{component}")
     selected["weighted"] = residual**2 / variance
     grouped = selected.groupby("event_nr", sort=True)["weighted"].agg(["sum", "count"])
+    grouped = grouped.reindex(event_ids, fill_value=0)
     return grouped["sum"].to_numpy(dtype=float), grouped["count"].to_numpy(dtype=np.int64)
 
 
@@ -232,64 +286,69 @@ def build_acceptance_baseline(
     frame: pd.DataFrame,
     target_layers=TARGET_LAYERS,
     *,
-    split_seed: int = DEFAULT_SPLIT_SEED,
     bootstrap_seed: int = 6006,
     n_bootstrap: int = 2000,
 ) -> dict:
-    """Build frozen per-component predictive limits from nominal calibration events."""
+    """Build frozen per-component empirical limits from the full nominal sample.
+
+    The bootstrap resamples events from the same full nominal sample it
+    reports on and characterizes that sample's own event-level uncertainty;
+    it is not a prediction about an independent held-out sample.
+    """
     missing = sorted((REQUIRED_FIELDS | {"event_nr"}) - set(frame.columns))
     if missing:
         raise ValueError(f"trackstates are missing required fields: {', '.join(missing)}")
     if n_bootstrap < 1:
         raise ValueError("n_bootstrap must be positive")
-    event_ids = frame["event_nr"].to_numpy(dtype=np.int64)
-    calibration = frame[event_partition_mask(event_ids, "calibration", split_seed)]
-    validation = frame[event_partition_mask(event_ids, "validation", split_seed)]
-    calibration_events = int(calibration["event_nr"].nunique())
-    validation_events = int(validation["event_nr"].nunique())
-    if calibration_events == 0 or validation_events == 0:
-        raise ValueError("Calibration and validation partitions must both contain events")
+    event_values = frame["event_nr"].to_numpy()
+    event_key_hash(event_values)  # Validate before any integer coercion.
+    event_ids = np.unique(event_values.astype(np.int64, copy=False))
+    nominal_events = len(event_ids)
+    if nominal_events == 0:
+        raise ValueError("Nominal events must be non-empty")
     rng = np.random.default_rng(bootstrap_seed)
     layers = {}
     for volume, layer in parse_layers(target_layers):
         key = f"{volume}:{layer}"
-        rows = calibration[(calibration["volume_id"] == volume) & (calibration["layer_id"] == layer)]
-        validation_rows = validation[
-            (validation["volume_id"] == volume) & (validation["layer_id"] == layer)
-        ]
+        rows = frame[(frame["volume_id"] == volume) & (frame["layer_id"] == layer)]
         if rows.empty:
-            raise ValueError(f"Nominal calibration layer {key} is missing")
-        if validation_rows.empty:
-            raise ValueError(f"Nominal validation layer {key} is missing")
+            raise ValueError(f"Nominal layer {key} is missing")
         layer_result = {}
         for component in ("LOC0", "LOC1"):
-            sums, counts = _component_contributions(rows, volume, component)
-            validation_sums, _validation_counts = _component_contributions(
-                validation_rows, volume, component
+            sums, counts = _component_contributions(
+                rows, volume, component, event_ids
             )
-            predictive_sample_events = len(validation_sums)
-            draws = rng.integers(
-                0, len(sums), size=(n_bootstrap, predictive_sample_events)
+            bootstrap_values = np.empty(n_bootstrap, dtype=float)
+            for start in range(0, n_bootstrap, BOOTSTRAP_BATCH_SIZE):
+                stop = min(start + BOOTSTRAP_BATCH_SIZE, n_bootstrap)
+                draws = rng.integers(
+                    0, nominal_events, size=(stop - start, nominal_events)
+                )
+                sampled_sum = sums[draws].sum(axis=1)
+                sampled_count = counts[draws].sum(axis=1)
+                if (sampled_count == 0).any():
+                    raise ValueError(
+                        f"Bootstrap replicate for {key}:{component} has zero components"
+                    )
+                bootstrap_values[start:stop] = sampled_sum / sampled_count
+            upper = float(
+                np.quantile(bootstrap_values, 0.99, method="higher")
             )
-            sampled_sum = sums[draws].sum(axis=1)
-            sampled_count = counts[draws].sum(axis=1)
-            predictive = sampled_sum / sampled_count
-            upper = float(np.quantile(predictive, 0.99, method="higher"))
             layer_result[component] = {
                 "nominal_chi2": float(sums.sum() / counts.sum()),
-                "predictive_upper_99": upper,
+                "bootstrap_upper_99": upper,
                 "threshold": max(DEFAULT_THRESHOLD, upper),
                 "n_components": int(counts.sum()),
-                "predictive_sample_events": predictive_sample_events,
+                "bootstrap_sample_events": nominal_events,
             }
         layers[key] = layer_result
     return {
         "schema_version": SCHEMA_VERSION,
-        "method": "event_bootstrap_predictive_upper_99",
-        "event_split": {
-            "seed": split_seed,
-            "calibration_events": calibration_events,
-            "validation_events": validation_events,
+        "selection_version": SELECTION_VERSION,
+        "method": "event_bootstrap_empirical_upper_99",
+        "event_identity": {
+            "nominal_events": nominal_events,
+            "event_key_sha256": event_key_hash(frame["event_nr"].to_numpy()),
         },
         "bootstrap": {"seed": bootstrap_seed, "replicates": n_bootstrap},
         "layers": layers,
@@ -302,6 +361,11 @@ def load_threshold_profile(path: str | Path, target_layers=TARGET_LAYERS):
     if profile.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(
             f"Unsupported threshold profile schema {profile.get('schema_version')!r}"
+        )
+    if profile.get("selection_version") != SELECTION_VERSION:
+        raise ValueError(
+            f"Unsupported threshold profile selection_version "
+            f"{profile.get('selection_version')!r}"
         )
     thresholds = {}
     for volume, layer in parse_layers(target_layers):
@@ -417,8 +481,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-layers", default=target_layers_spec())
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
     parser.add_argument("--threshold-profile", type=absolute_project_path)
-    parser.add_argument("--event-partition", choices=PARTITIONS)
-    parser.add_argument("--split-seed", type=int, default=DEFAULT_SPLIT_SEED)
+    parser.add_argument("--threshold-profile-sha256", default=None)
     return parser
 
 
@@ -427,7 +490,7 @@ def main(argv=None) -> int:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     try:
-        require_events = bool(args.event_partition or args.threshold_profile)
+        require_events = bool(args.threshold_profile)
         frame = (
             load_reconstruction_frame(args.states, require_event_nr=True)
             if require_events
@@ -435,19 +498,30 @@ def main(argv=None) -> int:
         )
         thresholds = None
         profile = None
-        split_seed = args.split_seed
+        actual_profile_sha256 = None
         if args.threshold_profile:
+            profile_bytes = Path(args.threshold_profile).read_bytes()
+            actual_profile_sha256 = hashlib.sha256(profile_bytes).hexdigest()
+            if args.threshold_profile_sha256 is None:
+                raise ValueError(
+                    "--threshold-profile-sha256 is required when consuming a "
+                    "threshold profile"
+                )
+            if actual_profile_sha256 != args.threshold_profile_sha256:
+                raise ValueError(
+                    "threshold profile file hash mismatch: expected "
+                    f"{args.threshold_profile_sha256}, got {actual_profile_sha256}"
+                )
             profile, thresholds = load_threshold_profile(
                 args.threshold_profile, parse_layers(args.target_layers)
             )
-            split_seed = int(profile.get("event_split", {}).get("seed", split_seed))
         result = compute_reconstruction_acceptance(
             frame,
             parse_layers(args.target_layers),
             args.threshold,
             thresholds=thresholds,
-            event_partition=args.event_partition,
-            split_seed=split_seed,
+            profile=profile,
+            threshold_profile_sha256=actual_profile_sha256,
         )
         result["threshold_profile"] = str(args.threshold_profile) if profile else None
     except Exception as error:
@@ -461,6 +535,8 @@ def main(argv=None) -> int:
             "schema_version": SCHEMA_VERSION,
             "valid": False,
             "passed": False,
+            "profile_identity_verified": False,
+            "threshold_profile_sha256": None,
             "failed_layers": [f"{v}:{l}" for v, l in targets],
             "failed_components": failed_components,
             "acceptance_score": [len(failed_components), None, None],

@@ -370,17 +370,11 @@ def load_paired_recovery_inputs(
     misaligned_geometry: str | Path,
     *,
     target_layers: tuple[tuple[int, int], ...],
-    event_partition: str = "all",
     max_events: int = 0,
     max_tracks: int = 0,
     progress: ProgressCallback | None = None,
 ) -> tuple[RecoveryHitInputs, RecoveryHitInputs]:
     """Load, validate, and deterministically cap a paired ROOT cohort by event."""
-    if event_partition != "all":
-        raise ValueError(
-            "hash partition selection is disabled; use event_partition='all' "
-            "with max_events instead."
-        )
     if max_events < 0 or max_tracks < 0:
         raise ValueError("max_events and max_tracks must be non-negative.")
     target_layers = tuple((int(volume), int(layer)) for volume, layer in target_layers)
@@ -1541,10 +1535,6 @@ def build_argument_parser(config: ProjectConfig | None = None) -> argparse.Argum
     parser.add_argument("--misaligned-geometry", type=absolute_project_path, default=defaults["misaligned_geometry"])
     parser.add_argument("--target-layers", type=_parse_cli_layers, default=config.target_layers)
     parser.add_argument(
-        "--event-partition", choices=("all",), default="all",
-        help="Legacy compatibility flag; hash partitions are disabled.",
-    )
-    parser.add_argument(
         "--max-events", type=int, default=20000,
         help="Keep the lowest N unique event_nr values after full pairing; 0 keeps all.",
     )
@@ -2048,7 +2038,6 @@ def main(argv: list[str] | None = None) -> int:
             args.nominal_geometry,
             args.misaligned_geometry,
             target_layers=args.target_layers,
-            event_partition=args.event_partition,
             max_events=args.max_events,
             max_tracks=args.max_tracks,
             progress=progress,

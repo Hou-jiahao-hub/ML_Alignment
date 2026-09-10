@@ -38,8 +38,6 @@ JOINT_SMT_SEED_ITERS=2000
 JOINT_MEASUREMENT_REFIT_ITERS=200
 LM_MAX_ITERS=60
 MAX_TRACKS=0
-SKIP_BLIND_VALIDATION=0
-NO_EVENT_SPLIT=0
 LAMBDA_L2=1e-5
 ALIGNMENT_DIR="$ALIGNMENT_ROOT"
 SIMULATION_DIR="$SIMULATION_ROOT"
@@ -55,7 +53,7 @@ ACTS_SETUP="$ML_ALIGNMENT_ACTS_SETUP"
 CONDA_SH="$ML_ALIGNMENT_CONDA_SETUP"
 CONDA_ENV="pytorch"
 DRY_RUN=0
-EVENT_SPLIT_SEED=6006
+BOOTSTRAP_SEED=6006
 
 usage() {
     cat <<EOF
@@ -88,18 +86,10 @@ Options:
   --conda-sh PATH            Conda shell hook
   --conda-env NAME           Conda environment name
   --nominal-states PATH      Nominal states used only to freeze acceptance thresholds
-  --event-split-seed N       Stable 80/10/10 event split seed (default: 6006)
+  --bootstrap-seed N         Nominal-states bootstrap seed for the frozen
+                             acceptance threshold (default: 6006)
   --baseline-ratio VALUE     Deprecated; ignored
   --helix-candidates SPEC    Deprecated; ignored
-  --skip-blind-validation    Stop after calibration; leave the one-shot blind
-                             validation split untouched
-  --no-event-split           Fit and score on every event instead of the hash
-                             80/10/10 partitions.  Requires
-                             --skip-blind-validation: with no split the
-                             validation acceptance would re-score the very
-                             events that selected the geometry.  Acceptance
-                             thresholds stay hash-calibrated on nominal states,
-                             which no stage of this run fits.
   --dry-run                  Print both conditional polish candidates
 EOF
 }
@@ -131,9 +121,7 @@ while [[ $# -gt 0 ]]; do
         --acts-setup) ACTS_SETUP="$2"; shift 2 ;;
         --conda-sh) CONDA_SH="$2"; shift 2 ;;
         --conda-env) CONDA_ENV="$2"; shift 2 ;;
-        --event-split-seed) EVENT_SPLIT_SEED="$2"; shift 2 ;;
-        --skip-blind-validation) SKIP_BLIND_VALIDATION=1; shift ;;
-        --no-event-split) NO_EVENT_SPLIT=1; shift ;;
+        --bootstrap-seed) BOOTSTRAP_SEED="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1" ;;
@@ -149,13 +137,10 @@ done
 [[ "$JOINT_MEASUREMENT_REFIT_ITERS" =~ ^[1-9][0-9]*$ ]] || die "--joint-measurement-refit-iters must be positive"
 [[ "$LM_MAX_ITERS" =~ ^[1-9][0-9]*$ ]] || die "--lm-max-iters must be positive"
 [[ "$MAX_TRACKS" =~ ^[0-9]+$ ]] || die "--max-tracks must be non-negative"
-[[ "$EVENT_SPLIT_SEED" =~ ^[0-9]+$ ]] || die "--event-split-seed must be non-negative"
+[[ "$BOOTSTRAP_SEED" =~ ^[0-9]+$ ]] || die "--bootstrap-seed must be non-negative"
 [[ "$TARGET_LAYERS_SPEC" == "$EXPECTED_TARGET_LAYERS" ]] || \
     die "configured target layers must remain $EXPECTED_TARGET_LAYERS"
 [[ "$ACTIVE_DOF" == "0,1,5" ]] || die "this workflow requires active DOF 0,1,5"
-if [[ "$NO_EVENT_SPLIT" -eq 1 && "$SKIP_BLIND_VALIDATION" -eq 0 ]]; then
-    die "--no-event-split requires --skip-blind-validation: without a split the validation acceptance re-scores the events that selected the geometry"
-fi
 
 [[ -z "$NOMINAL_STATES" ]] || echo "note: --nominal-states supplies only the frozen acceptance baseline" >&2
 [[ -z "$BASELINE_RATIO" ]] || echo "deprecated: --baseline-ratio no longer controls the workflow" >&2
@@ -194,11 +179,6 @@ RUN_DIR="$(with_target_dir "$LOG_DIR")/$RUN_TAG"
 [[ -n "$NOMINAL_STATES" ]] || NOMINAL_STATES="$(with_target_dir "$RECONSTRUCTION_DIR/nominal")/trackstates_kf_${TARGET_LAYER_SUFFIX}.root"
 
 print_command() { printf '  '; printf '%q ' "$@"; printf '\n'; }
-
-# Empty under --no-event-split: both solvers then see every event, because
-# ml_alignment_autograd.py only filters when --event-partition is supplied.
-SOLVER_PARTITION_ARGS=(--event-partition train --event-split-seed "$EVENT_SPLIT_SEED")
-[[ "$NO_EVENT_SPLIT" -eq 0 ]] || SOLVER_PARTITION_ARGS=()
 
 run_conda() {
     local log_file="$1"; shift
@@ -310,8 +290,17 @@ CURRENT_STAGE="acceptance_baseline"
 run_conda "$RUN_DIR/acceptance_baseline.log" \
     python calibrate_acceptance.py "${CONFIG_ARGS[@]}" --states "$NOMINAL_STATES" \
     --output "$BASELINE_PROFILE" --target-layers "$TARGET_LAYERS" \
-    --split-seed "$EVENT_SPLIT_SEED" --bootstrap-seed "$EVENT_SPLIT_SEED"
-if [[ "$DRY_RUN" -eq 0 ]]; then require_file "$BASELINE_PROFILE"; fi
+    --bootstrap-seed "$BOOTSTRAP_SEED"
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    require_file "$BASELINE_PROFILE"
+    # Computed once, right after the profile is frozen, and threaded into
+    # every acceptance call below: a profile edited after this point (by any
+    # means, not only the fields _verify_profile_identity already checks)
+    # must fail closed rather than silently score against a changed baseline.
+    PROFILE_SHA256="$(sha256sum "$BASELINE_PROFILE" | cut -d' ' -f1)"
+else
+    PROFILE_SHA256="dry-run-placeholder"
+fi
 
 reconstruct() {
     local label="$1" geometry="$2"
@@ -322,21 +311,19 @@ reconstruct() {
 }
 
 run_acceptance() {
-    local label="$1" states="$2" output="$3" partition="$4"
-    local partition_args=(--event-partition "$partition" --split-seed "$EVENT_SPLIT_SEED")
-    [[ "$NO_EVENT_SPLIT" -eq 0 ]] || partition_args=()
+    local label="$1" states="$2" output="$3"
     if [[ "$DRY_RUN" -eq 1 ]]; then
         run_conda "$RUN_DIR/acceptance_${label}.log" \
             python reconstruction_acceptance.py "${CONFIG_ARGS[@]}" --states "$states" --output "$output" \
             --target-layers "$TARGET_LAYERS" --threshold-profile "$BASELINE_PROFILE" \
-            "${partition_args[@]}"
+            --threshold-profile-sha256 "$PROFILE_SHA256"
         return 0
     fi
     set +e
     run_conda "$RUN_DIR/acceptance_${label}.log" \
         python reconstruction_acceptance.py "${CONFIG_ARGS[@]}" --states "$states" --output "$output" \
         --target-layers "$TARGET_LAYERS" --threshold-profile "$BASELINE_PROFILE" \
-        "${partition_args[@]}"
+        --threshold-profile-sha256 "$PROFILE_SHA256"
     local status="$?"
     set -e
     require_file "$output"
@@ -349,12 +336,12 @@ current_summary="$INPUT_SUMMARY"
 
 # The joint solver runs straight on the supplied misaligned geometry.  Its
 # guard still needs an arm to improve on, so the input geometry is scored once
-# on the calibration split.  Its reconstruction already exists -- it is what
-# --states/--summary point at -- so this costs one acceptance call, not a run.
+# up front.  Its reconstruction already exists -- it is what --states/--summary
+# point at -- so this costs one acceptance call, not a run.
 baseline_label="${RUN_TAG}_baseline_input"
 baseline_acceptance="$(acceptance_path "$baseline_label")"
-CURRENT_STAGE="baseline_calibration_acceptance"
-run_acceptance "$baseline_label" "$current_states" "$baseline_acceptance" calibration || true
+CURRENT_STAGE="baseline_acceptance"
+run_acceptance "$baseline_label" "$current_states" "$baseline_acceptance" || true
 baseline_geom="$current_geom"
 baseline_states="$current_states"
 baseline_summary="$current_summary"
@@ -371,7 +358,6 @@ run_conda "$RUN_DIR/${joint_label}.log" \
     --joint-seed-min-span 300 --joint-smt-seed-iters "$JOINT_SMT_SEED_ITERS" \
     --joint-measurement-refit-iters "$JOINT_MEASUREMENT_REFIT_ITERS" \
     --joint-solver block-lm --lm-max-iters "$LM_MAX_ITERS" \
-    "${SOLVER_PARTITION_ARGS[@]}" \
     --joint-iters "$JOINT_ITERS" --max-tracks "$MAX_TRACKS" \
     --lambda-l2 "$LAMBDA_L2" --nominal-full-geom "$GEOMETRY_ROOT/odd_transforms.json" \
     --output-summary "$joint_solver_summary" --no-plot
@@ -380,7 +366,7 @@ joint_states="$(states_path "$joint_label")"
 joint_summary="$(summary_path "$joint_label")"
 joint_acceptance="$(acceptance_path "$joint_label")"
 CURRENT_STAGE="joint_acceptance"
-run_acceptance "$joint_label" "$joint_states" "$joint_acceptance" calibration || true
+run_acceptance "$joint_label" "$joint_states" "$joint_acceptance" || true
 
 current_geom="$joint_geom"
 current_states="$joint_states"
@@ -420,13 +406,12 @@ for polish_round in 1 2; do
         --input-geom "$current_geom" --states "$current_states" --summary "$current_summary" \
         --output-geom "$candidate_geom" --target-layers "$failed_layers" \
         --active-dof "$ACTIVE_DOF" --alignment-gain 0.2 --epochs "$SURFACE_EPOCHS" \
-        "${SOLVER_PARTITION_ARGS[@]}" \
         --lambda-l2 "$LAMBDA_L2" --iter "polish${polish_round}" --no-plot
     reconstruct "$label" "$candidate_geom"
     candidate_states="$(states_path "$label")"
     candidate_summary="$(summary_path "$label")"
     candidate_acceptance="$(acceptance_path "$label")"
-    run_acceptance "$label" "$candidate_states" "$candidate_acceptance" calibration || true
+    run_acceptance "$label" "$candidate_states" "$candidate_acceptance" || true
     polish_attempts="$polish_round"
     if [[ "$DRY_RUN" -eq 0 ]]; then
         improved="$(python3 -c 'import json,sys; from reconstruction_acceptance import acceptance_score,polish_improves; c=json.load(open(sys.argv[1])); p=json.load(open(sys.argv[2])); print("1" if polish_improves(acceptance_score(c),acceptance_score(p)) else "0")' "$candidate_acceptance" "$current_acceptance")"
@@ -448,16 +433,6 @@ for polish_round in 1 2; do
         fi
     fi
 done
-
-calibration_acceptance="$current_acceptance"
-final_validation_acceptance="$(acceptance_path "${RUN_TAG}_validation")"
-if [[ "$SKIP_BLIND_VALIDATION" -eq 1 ]]; then
-    echo "note: --skip-blind-validation is set; the validation split stays untouched" >&2
-else
-    CURRENT_STAGE="blind_validation"
-    run_acceptance "${RUN_TAG}_validation" "$current_states" "$final_validation_acceptance" validation || true
-    current_acceptance="$final_validation_acceptance"
-fi
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
     require_file "$current_geom"
@@ -483,24 +458,15 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
         --run-tag "$RUN_TAG"
         --joint-summary "$joint_solver_summary"
         --joint-adopted "$joint_adopted"
-        --calibration-acceptance "$calibration_acceptance"
+        --final-acceptance "$current_acceptance"
         --acceptance-baseline "$BASELINE_PROFILE"
         --final-geometry "$current_geom"
         --final-trackstates "$current_states"
         --final-tracksummary "$current_summary"
         --polish-attempts "$polish_attempts"
         --selection-stop-reason "$stop_reason"
-        --event-split-seed "$EVENT_SPLIT_SEED"
         --output "$RUN_DIR/experiment_summary.json"
     )
-    if [[ "$NO_EVENT_SPLIT" -eq 1 ]]; then
-        summary_args+=(--no-event-split)
-    fi
-    if [[ "$SKIP_BLIND_VALIDATION" -eq 1 ]]; then
-        summary_args+=(--skip-blind-validation)
-    else
-        summary_args+=(--final-acceptance "$current_acceptance")
-    fi
     python3 write_experiment_summary.py "${summary_args[@]}"
     manifest_outputs=(
         --output "baseline_input_acceptance=$baseline_acceptance"
@@ -510,7 +476,6 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
         --output "joint_acceptance=$joint_acceptance"
         --output "joint_solver_summary=$joint_solver_summary"
         --output "acceptance_baseline=$BASELINE_PROFILE"
-        --output "calibration_acceptance=$calibration_acceptance"
         --output "final_geometry=$current_geom"
         --output "final_states=$current_states"
         --output "final_summary=$current_summary"
@@ -519,9 +484,6 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
         --output "track_chi2_comparison=$RUN_DIR/track_chi2_ndf_comparison.png"
         --output "geometry_comparison=$RUN_DIR/geometry_comparison"
     )
-    if [[ "$SKIP_BLIND_VALIDATION" -eq 0 ]]; then
-        manifest_outputs+=(--output "validation_acceptance=$final_validation_acceptance")
-    fi
     for ((polish_index=1; polish_index<=polish_attempts; polish_index++)); do
         polish_label="${RUN_TAG}_surface_polish${polish_index}"
         manifest_outputs+=(

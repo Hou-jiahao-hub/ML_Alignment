@@ -23,7 +23,6 @@ from alignment_artifact_layout import (
     target_layers_spec,
 )
 from project_config import absolute_project_path, add_config_argument
-from event_split import DEFAULT_SPLIT_SEED, PARTITIONS, event_partition_mask
 try:
     from .helix_model import (
         CURVATURE_SCALE,
@@ -210,46 +209,6 @@ class AlignmentInputs:
     merged_df: pd.DataFrame | None = field(default=None, repr=False)
 
 
-def filter_alignment_inputs_by_event_partition(
-    inputs: AlignmentInputs,
-    partition: str,
-    split_seed: int = DEFAULT_SPLIT_SEED,
-) -> AlignmentInputs:
-    """Return a hit-level view restricted to one deterministic event partition."""
-    mask_numpy = event_partition_mask(
-        inputs.hit_event_ids.detach().cpu().numpy(), partition, split_seed
-    )
-    mask = torch.as_tensor(mask_numpy, device=inputs.hit_event_ids.device, dtype=torch.bool)
-    if not mask.any():
-        raise ValueError(f"Event partition '{partition}' contains no alignment hits")
-
-    def selected(value):
-        return value[mask.to(value.device)] if value is not None else None
-
-    merged = None
-    if inputs.merged_df is not None:
-        merged = inputs.merged_df.loc[mask_numpy].reset_index(drop=True)
-    return AlignmentInputs(
-        hit_sensor_ids=selected(inputs.hit_sensor_ids),
-        initial_residuals=selected(inputs.initial_residuals),
-        covariances=selected(inputs.covariances),
-        track_params=selected(inputs.track_params),
-        track_chi2_ndf=selected(inputs.track_chi2_ndf),
-        hit_global_positions=selected(inputs.hit_global_positions),
-        hit_directions=selected(inputs.hit_directions),
-        hit_qoverp=selected(inputs.hit_qoverp),
-        hit_volume_ids=selected(inputs.hit_volume_ids),
-        hit_layer_ids=selected(inputs.hit_layer_ids),
-        hit_module_ids=selected(inputs.hit_module_ids),
-        hit_event_ids=selected(inputs.hit_event_ids),
-        hit_track_ids=selected(inputs.hit_track_ids),
-        measured_local=selected(inputs.measured_local),
-        loc1_valid=selected(inputs.loc1_valid),
-        raw_covariances=selected(inputs.raw_covariances),
-        merged_df=merged,
-    )
-
-
 @dataclass
 class TrackBatches:
     measured_local: torch.Tensor
@@ -346,8 +305,6 @@ class AlignmentRunConfig:
     measurement_refit_lr_rho_scaled: float = MEASUREMENT_REFIT_LR_RHO_SCALED
     joint_refit_solver: str = JOINT_REFIT_SOLVER
     joint_refit_stationarity: bool = True
-    event_partition: str | None = None
-    event_split_seed: int = DEFAULT_SPLIT_SEED
 
 
 class JointBestCheckpoint:
@@ -2953,10 +2910,6 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
         max_track_entries=(config.max_tracks * 4 if config.max_tracks > 0 else None),
         load_summary=False,
     )
-    if config.event_partition is not None:
-        inputs = filter_alignment_inputs_by_event_partition(
-            inputs, config.event_partition, config.event_split_seed
-        )
     print_target_residual_stats(
         inputs.initial_residuals, inputs.hit_volume_ids, inputs.hit_layer_ids, target_layers,
         loc1_valid=inputs.loc1_valid,
@@ -3265,10 +3218,6 @@ def run_alignment_pipeline(config=None):
         STATES_ROOT_FILE,
         id_to_idx_map,
     )
-    if config.event_partition is not None:
-        inputs = filter_alignment_inputs_by_event_partition(
-            inputs, config.event_partition, config.event_split_seed
-        )
     if inputs.measured_local is None or inputs.loc1_valid is None:
         raise ValueError("Surface mode requires measured_local and loc1_valid.")
 
@@ -3590,8 +3539,6 @@ def build_argument_parser():
     p.add_argument("--max-tracks", type=int, default=0, help="0 keeps all selected tracks.")
     p.add_argument("--track-batch-size", type=int, default=0, help="0 uses full-batch.")
     p.add_argument("--rng-seed", type=int, default=42)
-    p.add_argument("--event-partition", choices=PARTITIONS, default=None)
-    p.add_argument("--event-split-seed", type=int, default=DEFAULT_SPLIT_SEED)
     p.add_argument("--gpu", action="store_true", help="Use CUDA float32; CPU uses float64.")
     p.add_argument("--rot-lr-scale", type=float, default=15.0)
     p.add_argument("--joint-lr-trans", type=float, default=JOINT_LR_TRANS)
@@ -3646,8 +3593,6 @@ def alignment_config_from_args(a):
         max_tracks=a.max_tracks,
         track_batch_size=a.track_batch_size,
         rng_seed=a.rng_seed,
-        event_partition=a.event_partition,
-        event_split_seed=a.event_split_seed,
         gpu=a.gpu,
         rot_lr_scale=a.rot_lr_scale,
         joint_lr_trans=a.joint_lr_trans,

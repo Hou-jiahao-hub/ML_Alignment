@@ -9,7 +9,6 @@ from pathlib import Path
 
 try:
     from .alignment_artifact_layout import target_layers_spec
-    from .event_split import DEFAULT_SPLIT_SEED
     from .project_config import absolute_project_path, add_config_argument
     from .reconstruction_acceptance import (
         build_acceptance_baseline,
@@ -18,7 +17,6 @@ try:
     )
 except ImportError:
     from alignment_artifact_layout import target_layers_spec
-    from event_split import DEFAULT_SPLIT_SEED
     from project_config import absolute_project_path, add_config_argument
     from reconstruction_acceptance import (
         build_acceptance_baseline,
@@ -41,7 +39,6 @@ def build_argument_parser():
     parser.add_argument("--states", type=absolute_project_path, required=True)
     parser.add_argument("--output", type=absolute_project_path, required=True)
     parser.add_argument("--target-layers", default=target_layers_spec())
-    parser.add_argument("--split-seed", type=int, default=DEFAULT_SPLIT_SEED)
     parser.add_argument("--bootstrap-seed", type=int, default=6006)
     parser.add_argument("--bootstrap-replicates", type=int, default=2000)
     return parser
@@ -54,7 +51,6 @@ def main(argv=None) -> int:
     result = build_acceptance_baseline(
         frame,
         parse_layers(args.target_layers),
-        split_seed=args.split_seed,
         bootstrap_seed=args.bootstrap_seed,
         n_bootstrap=args.bootstrap_replicates,
     )

@@ -8,7 +8,6 @@ Quick smoke run over the lowest 25 unique event numbers:
 
 ```bash
 python scripts/compare_helix_recovery.py \
-  --event-partition all \
   --max-events 25 \
   --seed-iters 20 \
   --refit-iters 10 \
@@ -16,17 +15,16 @@ python scripts/compare_helix_recovery.py \
   --output-dir data/experiments/helix_recovery/Vol17_Lay8__Vol24_Lay4/smoke-25-events
 ```
 
-The retained comparison uses one deterministic 20,000-event cohort. Hash-based
-train/calibration/validation partitions are disabled: after full nominal versus
-misaligned pairing, the loader keeps every track and hit belonging to the lowest
-20,000 unique `event_nr` values. The manifest records the available and selected
-unique-event counts.
+The retained comparison uses one deterministic 20,000-event cohort. After full
+nominal-versus-misaligned pairing, the loader keeps every track and hit belonging
+to the lowest 20,000 unique `event_nr` values. The manifest records the available
+and selected unique-event counts. The removed event-partition CLI is intentionally
+not accepted; use `--max-events` and `--max-tracks` for bounded runs.
 
 Full four-arm validation:
 
 ```bash
 python scripts/compare_helix_recovery.py \
-  --event-partition all \
   --max-events 20000 \
   --exposure both \
   --seed-iters 200 \
@@ -50,7 +48,7 @@ Smoke the sampling contract with 100 rows per stratum:
 
 ```bash
 python scripts/compare_helix_recovery.py \
-  --event-partition all --max-events 0 --max-tracks 0 --exposure both \
+  --max-events 0 --max-tracks 0 --exposure both \
   --sample-rows-per-stratum 100 --sampling-seed 6006 \
   --max-probes-per-event-stratum 2 --analysis-modes interpolation \
   --seed-iters 20 --refit-iters 10 --bootstrap-replicates 100 \
@@ -61,7 +59,7 @@ The retained production protocol uses 2,000 rows per available stratum:
 
 ```bash
 python scripts/compare_helix_recovery.py \
-  --event-partition all --max-events 0 --max-tracks 0 --exposure both \
+  --max-events 0 --max-tracks 0 --exposure both \
   --sample-rows-per-stratum 2000 --sampling-seed 6006 \
   --max-probes-per-event-stratum 2 --analysis-modes interpolation \
   --seed-iters 600 --refit-iters 60 \

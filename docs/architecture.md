@@ -33,22 +33,33 @@ simulation -> ROOT/geometry JSON -> loaders -> solver -> aligned geometry
 | `experiment_manifest.py` | Reproducibility metadata and input hashes | None |
 | `path_inventory.py` | Effective absolute input/output path contract | None |
 
-The production surface/helix experiment uses a deterministic event split
-(80% train, 10% calibration, 10% blind validation). It scores the supplied
-misaligned geometry once on calibration to give the guard an arm to improve on,
-then runs a non-target helix refit, a fixed-track block-LM target-geometry
-solve, and at most two gain-0.2 surface polish candidates.
+The production surface/helix experiment fits and scores on the full nominal
+event set in one pass; there is no train/calibration/validation split (removed
+2026-09-10 -- the split had stopped doing any real work once the mainline
+moved to full-event runs). It scores the supplied misaligned geometry once up
+front to give the guard an arm to improve on, then runs a non-target helix
+refit, a fixed-track block-LM target-geometry solve, and at most two gain-0.2
+surface polish candidates.
 
 The two surface warm starts it used to run first were removed on 2026-09-01.
 Block-LM reaches the same geometry from the raw misaligned input once
 `LM_MAX_STEP_R` spans the injected rotation: the joint-only run reproduced the
 warm-start pipeline's per-sensor geometry to 2.4e-7 mm / 8.8e-9 rad and its
-calibration acceptance to 1e-7, in 13 LM iterations instead of 15 and without
-the two extra ACTS reconstructions. See
-`data/experiments/surface_helix/Vol17_Lay8__Vol24_Lay4/joint-only-20260901-*`. Candidate selection reads
-only the calibration partition; the selected geometry is evaluated once on the
-validation partition. Nominal states are used once to create a versioned frozen
-acceptance profile, while nominal geometry/truth comparisons remain diagnostic.
+acceptance to 1e-7, in 13 LM iterations instead of 15 and without the two
+extra ACTS reconstructions. See
+`data/experiments/surface_helix/Vol17_Lay8__Vol24_Lay4/joint-only-20260901-*`. Candidate
+selection and the final acceptance check both read the same full event set,
+so every acceptance result -- including the final one -- is `diagnostic_only`;
+it is an internal same-sample guard, not evidence of generalization or an
+independent validation verdict. Nominal states are used once to create a
+versioned frozen acceptance profile whose bootstrap characterizes this full
+sample's own event-level sampling uncertainty, while nominal geometry/truth
+comparisons remain diagnostic.
+
+The profile's event identity hashes the event IDs actually present in the
+nominal `trackstates`; it cannot represent generated events absent from that
+file. The pinned profile SHA256 protects the exact profile bytes, while the
+experiment manifest's input SHA256 records the ROOT inputs themselves.
 
 ## Configuration flow
 
@@ -199,7 +210,7 @@ actually removes a branch-dependent geometry effect. It loads nominal and
 misaligned `trackstates` together with uproot and assigns every measured hit its
 ordinal among measured states in that track. Predicted, filtered, and hole-state
 positions therefore cannot shift an otherwise identical measurement identity.
-Before event splitting or track limits, the loader requires identical
+Before deterministic event or track limits, the loader requires identical
 event/track/state identities, measurements, measurement uncertainties, target
 membership, and LOC availability. It never intersects mismatched files. SMT
 local/global positions, directions, and sensor indices remain branch-local; both

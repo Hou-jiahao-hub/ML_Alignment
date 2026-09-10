@@ -826,14 +826,18 @@ SMT seed 与 measurement refit 都按逐轨迹 Newton decrement 检查驻点；�
 正则用于约束 ShortStrip `ty` 等弱可观测模，并在 solver summary 中记录条件数、
 正则强度与实际步长。
 
-全部事件按固定 seed `6006` 哈希切成 train/calibration/validation = 80/10/10。
-surface、SMT seed、measurement refit 和 block-LM 只读 train；joint/polish 候选只在
-calibration 上选择；最终 validation 只运行一次，不得据此继续调参。
+事件子集划分已于 2026-09-10 移除。surface、SMT seed、measurement refit、
+block-LM 以及 joint/polish 候选选择均在输入中的全部事件上进行；验收结果（包括
+最终结果）一律标注为 `diagnostic_only`，只能作为同样本候选 guard，不代表泛化
+能力或独立验证结论。小规模运行使用确定性的 event/track 数量上限。
 
 联合输出必须经 ACTS 使用同一模拟数据重新重建。`reconstruction_acceptance.py` 以
 `measurement - eLOC_smt` 和物理 measurement variance 计算逐层 LOC0/LOC1
-`chi2/N`；ShortStrip LOC1 使用 `1.2 mm` 分辨率下限。nominal calibration 事件通过
-固定 bootstrap 生成逐层逐分量 99% 预测上界，冻结阈值取该上界与 `1.0` 的较大值。
+`chi2/N`；ShortStrip LOC1 使用 `1.2 mm` 分辨率下限。全量 nominal 事件通过
+固定 event-cluster bootstrap 生成逐层逐分量 99% 同样本经验上界，冻结阈值取该
+上界与 `1.0` 的较大值。事件身份只绑定 nominal `trackstates` 中实际出现的完整
+event ID 集合；profile SHA256 固定阈值文件字节，manifest 输入 SHA256 固定 ROOT
+输入内容，三者职责不得混用。
 验收比较 `normalized_chi2 = chi2 / threshold <= 1`，缺层、零有效分量、字段缺失或
 非有限指标均失败。失败时最多尝试两轮 surface polish，且只
 放开失败层 `(tx,ty,rz)`，写出修正乘以 0.2 的独立候选。候选仅在

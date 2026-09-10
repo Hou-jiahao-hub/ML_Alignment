@@ -1,14 +1,31 @@
+import hashlib
+import json
+
 import pytest
 
-from write_experiment_summary import build_summary, joint_solver_effective
+from write_experiment_summary import WORKFLOW, build_summary, joint_solver_effective
 
 
 def _joint(best_iteration=19, correction_max_abs=1.5):
     return {"best_iteration": best_iteration, "correction_max_abs": correction_max_abs}
 
 
+PROFILE_SHA256 = "ab" * 32
+PROFILE = {
+    "schema_version": "3.0",
+    "selection_version": "full_event_bootstrap_v1",
+    "event_identity": {"nominal_events": 4, "event_key_sha256": "cd" * 32},
+}
+
+
 def _acceptance(passed):
-    return {"passed": passed, "failed_components": [] if passed else ["17:8:LOC0"]}
+    return {
+        "passed": passed,
+        "failed_components": [] if passed else ["17:8:LOC0"],
+        "schema_version": "3.0",
+        "profile_identity_verified": True,
+        "threshold_profile_sha256": PROFILE_SHA256,
+    }
 
 
 def _summary(**overrides):
@@ -17,15 +34,14 @@ def _summary(**overrides):
         joint=_joint(),
         joint_adopted=True,
         final_acceptance=_acceptance(True),
-        calibration_acceptance=_acceptance(True),
         acceptance_baseline="baseline.json",
+        acceptance_profile=PROFILE,
+        acceptance_baseline_sha256=PROFILE_SHA256,
         final_geometry="geom.json",
         final_trackstates="states.root",
         final_tracksummary="summary.root",
         polish_attempts=0,
         selection_stop_reason="joint_acceptance_passed",
-        event_split_seed=6006,
-        blind_validation_skipped=False,
     )
     kwargs.update(overrides)
     return build_summary(**kwargs)
@@ -39,7 +55,7 @@ def test_selection_stop_reason_survives_into_the_summary():
         final_acceptance=_acceptance(False),
     )
     assert summary["selection_stop_reason"] == "joint_not_improved"
-    assert summary["stop_reason"] == "blind_validation_failed"
+    assert summary["stop_reason"] == "acceptance_failed"
 
 
 def test_a_reverted_joint_is_not_effective_even_when_the_solver_moved():
@@ -59,7 +75,7 @@ def test_an_adopted_and_effective_joint_passes_when_acceptance_passes():
     summary = _summary(joint_adopted=True, final_acceptance=_acceptance(True))
     assert summary["joint_effective"] is True
     assert summary["passed"] is True
-    assert summary["stop_reason"] == "blind_validation_passed"
+    assert summary["stop_reason"] == "acceptance_passed"
 
 
 def test_a_no_op_joint_solver_is_not_effective():
@@ -69,47 +85,98 @@ def test_a_no_op_joint_solver_is_not_effective():
     assert summary["passed"] is False
 
 
-def test_skipping_blind_validation_leaves_the_verdict_undecided():
-    summary = _summary(blind_validation_skipped=True, final_acceptance=None)
-    assert summary["passed"] is None
-    assert summary["stop_reason"] == "stopped_before_blind_validation"
-    assert summary["blind_validation_skipped"] is True
-    assert summary["final_acceptance"] is None
-    assert summary["workflow"].endswith("calibration-only")
-    # the calibration evidence is still recorded
-    assert summary["calibration_acceptance"] == _acceptance(True)
-
-
-def test_a_full_run_keeps_the_blind_validation_workflow_name():
-    summary = _summary()
-    assert summary["blind_validation_skipped"] is False
-    assert summary["workflow"].endswith("blind-validation")
-
-
-def test_final_acceptance_is_required_unless_validation_is_skipped():
-    with pytest.raises(ValueError):
-        _summary(final_acceptance=None)
-
-
-def test_a_full_event_run_does_not_claim_a_hash_split():
+def test_summary_never_claims_a_hash_split():
     """The summary must not report partitions the run never used."""
-    summary = _summary(
-        event_split_used=False,
-        blind_validation_skipped=True,
-        final_acceptance=None,
-    )
-    assert summary["event_split"] == {"mode": "none", "seed": None}
-    assert summary["workflow"] == "block-lm_surface-polish2_full-events"
-    assert summary["stop_reason"] == "no_event_split_no_blind_validation"
-    assert summary["passed"] is None
-
-
-def test_a_split_run_still_labels_its_partitions():
     summary = _summary()
-    assert summary["event_split"]["mode"] == "hash_80_10_10"
-    assert summary["event_split"]["seed"] == 6006
+    assert "event_split" not in summary
+    assert "calibration_acceptance" not in summary
+    assert summary["workflow"] == WORKFLOW
+    assert summary["acceptance_scope"] == "diagnostic_only"
+    assert summary["acceptance_baseline_sha256"] == PROFILE_SHA256
 
 
-def test_a_full_event_run_cannot_report_a_blind_validation():
-    with pytest.raises(ValueError):
-        _summary(event_split_used=False, blind_validation_skipped=False)
+@pytest.mark.parametrize(
+    ("acceptance", "profile", "profile_sha256", "message"),
+    [
+        ({"passed": True}, PROFILE, PROFILE_SHA256, "schema_version"),
+        (
+            {**_acceptance(True), "profile_identity_verified": False},
+            PROFILE,
+            PROFILE_SHA256,
+            "profile_identity_verified",
+        ),
+        (
+            {**_acceptance(True), "threshold_profile_sha256": "ef" * 32},
+            PROFILE,
+            PROFILE_SHA256,
+            "hash",
+        ),
+        (_acceptance(True), {**PROFILE, "schema_version": "2.0"}, PROFILE_SHA256, "schema"),
+        (
+            _acceptance(True),
+            {**PROFILE, "selection_version": "acceptance_v2"},
+            PROFILE_SHA256,
+            "selection_version",
+        ),
+    ],
+)
+def test_summary_fails_closed_without_the_frozen_verified_profile(
+    acceptance, profile, profile_sha256, message
+):
+    with pytest.raises(ValueError, match=message):
+        _summary(
+            final_acceptance=acceptance,
+            acceptance_profile=profile,
+            acceptance_baseline_sha256=profile_sha256,
+        )
+
+
+def test_main_hashes_the_baseline_file_and_records_it(tmp_path):
+    from write_experiment_summary import main
+
+    profile_path = tmp_path / "baseline.json"
+    profile_path.write_text(json.dumps(PROFILE))
+    profile_sha256 = hashlib.sha256(profile_path.read_bytes()).hexdigest()
+    acceptance = {**_acceptance(True), "threshold_profile_sha256": profile_sha256}
+    joint_path = tmp_path / "joint.json"
+    acceptance_path = tmp_path / "acceptance.json"
+    output = tmp_path / "summary.json"
+    joint_path.write_text(json.dumps(_joint()))
+    acceptance_path.write_text(json.dumps(acceptance))
+
+    status = main(
+        [
+            "--run-tag", "trial-test",
+            "--joint-summary", str(joint_path),
+            "--joint-adopted", "1",
+            "--final-acceptance", str(acceptance_path),
+            "--acceptance-baseline", str(profile_path),
+            "--final-geometry", "geom.json",
+            "--final-trackstates", "states.root",
+            "--final-tracksummary", "summary.root",
+            "--polish-attempts", "0",
+            "--selection-stop-reason", "joint_acceptance_passed",
+            "--output", str(output),
+        ]
+    )
+
+    assert status == 0
+    assert json.loads(output.read_text())["acceptance_baseline_sha256"] == profile_sha256
+
+
+def test_final_acceptance_is_required():
+    kwargs = dict(
+        run_tag="trial-test",
+        joint=_joint(),
+        joint_adopted=True,
+        acceptance_baseline="baseline.json",
+        acceptance_profile=PROFILE,
+        acceptance_baseline_sha256=PROFILE_SHA256,
+        final_geometry="geom.json",
+        final_trackstates="states.root",
+        final_tracksummary="summary.root",
+        polish_attempts=0,
+        selection_stop_reason="joint_acceptance_passed",
+    )
+    with pytest.raises(TypeError):
+        build_summary(**kwargs)
