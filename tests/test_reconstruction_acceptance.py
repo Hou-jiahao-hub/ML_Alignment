@@ -69,7 +69,7 @@ def test_nominal_calibration_builds_frozen_empirical_thresholds():
         n_bootstrap=20,
     )
 
-    assert baseline["schema_version"] == "3.0"
+    assert baseline["schema_version"] == "3.1"
     assert baseline["selection_version"] == "full_event_bootstrap_v1"
     assert baseline["method"] == "event_bootstrap_empirical_upper_99"
     assert baseline["event_identity"]["nominal_events"] == 100
@@ -191,7 +191,7 @@ def _write_profile(tmp_path, m, frame, event_key_sha256=None):
     profile.write_text(
         _json.dumps(
             {
-                "schema_version": "3.0",
+                "schema_version": "3.1",
                 "selection_version": m.SELECTION_VERSION,
                 "event_identity": {
                     "nominal_events": int(frame["event_nr"].nunique()),
@@ -239,8 +239,8 @@ def test_cli_uses_threshold_profile(tmp_path, monkeypatch):
     assert result["threshold_profile_sha256"] == profile_sha256
     assert result["profile_identity_verified"] is True
     assert "event_partition" not in result
-    assert "profile_type" not in result
-    assert "verdict_eligible" not in result
+    assert result["profile_type"] == "diagnostic_only"
+    assert result["verdict_eligible"] is False
     assert result["layers"]["24:4"]["LOC1"]["normalized_chi2"] == pytest.approx(1.0)
 
 
@@ -330,7 +330,7 @@ def test_cli_fails_closed_on_mismatched_profile_event_key(tmp_path, monkeypatch)
     profile.write_text(
         __import__("json").dumps(
             {
-                "schema_version": "3.0",
+                "schema_version": "3.1",
                 "selection_version": m.SELECTION_VERSION,
                 "event_identity": {
                     "nominal_events": int(frame["event_nr"].nunique()),

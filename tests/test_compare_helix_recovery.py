@@ -541,6 +541,43 @@ def test_cli_writes_selected_exposure_artifacts_and_completed_manifest(tmp_path)
     assert set(manifest["metrics"]["verdicts"]) == {"protected"}
 
 
+def test_cli_capture_source_snapshot_flag_defaults_off_and_writes_when_set(tmp_path):
+    """The opt-in source-snapshot switch must default off (unaffected existing
+    manifest calls, no extra output-dir entries) and actually archive the
+    source tree -- adding a provenance/ entry -- when passed."""
+    m = load_module()
+    default_args = m.build_argument_parser().parse_args([])
+    assert default_args.capture_source_snapshot is False
+
+    nominal_states, misaligned_states, nominal_geometry, misaligned_geometry = _cli_fixture(tmp_path)
+    output_dir = tmp_path / "snapshot-run"
+
+    result = m.main(
+        [
+            "--nominal-states", str(nominal_states),
+            "--misaligned-states", str(misaligned_states),
+            "--nominal-geometry", str(nominal_geometry),
+            "--misaligned-geometry", str(misaligned_geometry),
+            "--target-layers", "17:8",
+            "--exposure", "protected",
+            "--max-tracks", "1",
+            "--output-dir", str(output_dir),
+            "--seed-iters", "8",
+            "--refit-iters", "8",
+            "--bootstrap-replicates", "7",
+            "--bootstrap-seed", "23",
+            "--capture-source-snapshot",
+        ]
+    )
+
+    assert result == 0
+    assert "provenance" in {path.name for path in output_dir.iterdir()}
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    snapshot = manifest["git"]["source_snapshot"]
+    assert snapshot["status"] == "written"
+    assert (output_dir / snapshot["archive_path"]).is_file()
+
+
 def test_cli_reports_and_persists_completed_stage_progress(tmp_path, capsys):
     m = load_module()
     nominal_states, misaligned_states, nominal_geometry, misaligned_geometry = _cli_fixture(tmp_path)

@@ -44,7 +44,7 @@ def test_cli_writes_schema_versioned_frozen_baseline(tmp_path, monkeypatch):
     result = json.loads(output.read_text())
     accept = importlib.import_module("scripts.reconstruction_acceptance")
     assert status == 0
-    assert result["schema_version"] == "3.0"
+    assert result["schema_version"] == "3.1"
     assert result["selection_version"] == accept.SELECTION_VERSION
     assert len(result["event_identity"]["event_key_sha256"]) == 64
     assert result["source"]["states"] == str(tmp_path / "nominal.root")

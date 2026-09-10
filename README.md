@@ -41,6 +41,9 @@ PyROOT is a system/conda dependency and is not installed by `pyproject.toml`.
 
 ### ACTS simulation and reconstruction
 
+For installing and mounting `sft.cern.ch` on a standalone workstation, follow
+the [local CVMFS workstation guide](docs/cvmfs-local-workstation-guide.md).
+
 Copy the machine template if the ACTS checkout is not the default sibling path:
 
 ```bash

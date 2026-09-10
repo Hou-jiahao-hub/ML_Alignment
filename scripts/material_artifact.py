@@ -858,6 +858,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", type=absolute_project_path, required=True)
     parser.add_argument("--run-tag", type=str, required=True)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--capture-source-snapshot",
+        action="store_true",
+        help="Archive the exact tracked+untracked source tree into the run's "
+        "manifest so it can be replayed independent of git commit/dirty state.",
+    )
     return parser
 
 
@@ -886,6 +892,7 @@ def main(argv: list[str] | None = None) -> int:
         outputs={"material_artifact": output},
         metrics=artifact_metadata(),
         status="running",
+        capture_source_snapshot=args.capture_source_snapshot,
     )
     try:
         artifact, diagnostics = build_artifact(args.material, args.propsummary, args.summary)

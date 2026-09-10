@@ -23,7 +23,7 @@ except ImportError:  # Direct script execution.
     from project_config import absolute_project_path, add_config_argument
 
 
-SCHEMA_VERSION = "3.0"
+SCHEMA_VERSION = "3.1"
 #: Version of the chi2/threshold *algorithm*, independent of the JSON shape
 #: tracked by SCHEMA_VERSION.  Bump this whenever the acceptance computation
 #: itself changes (component formula, variance floor, bootstrap method, ...);
@@ -232,6 +232,8 @@ def compute_reconstruction_acceptance(
             failed_layers.append(key)
     result = {
         "schema_version": SCHEMA_VERSION,
+        "profile_type": "diagnostic_only",
+        "verdict_eligible": False,
         "threshold": threshold,
         "threshold_mode": "per_component" if thresholds is not None else "scalar",
         "profile_identity_verified": profile_identity_verified,
@@ -533,6 +535,8 @@ def main(argv=None) -> int:
         ]
         result = {
             "schema_version": SCHEMA_VERSION,
+            "profile_type": "diagnostic_only",
+            "verdict_eligible": False,
             "valid": False,
             "passed": False,
             "profile_identity_verified": False,

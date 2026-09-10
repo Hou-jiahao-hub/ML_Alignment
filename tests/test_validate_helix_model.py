@@ -1024,6 +1024,102 @@ def test_cli_runs_holdout_validation_and_writes_outputs(tmp_path, monkeypatch):
     assert manifest["inputs"]["nominal_trackstates"]["sha256"]
 
 
+def test_cli_capture_source_snapshot_flag_defaults_off_and_writes_when_set(
+    tmp_path, monkeypatch
+):
+    """The opt-in source-snapshot switch must default off (unaffected existing
+    manifest calls) and actually archive the source tree when passed."""
+    m = load_module()
+    default_args = m.build_argument_parser().parse_args([])
+    assert default_args.capture_source_snapshot is False
+
+    path = np.linspace(0.0, 500.0, 10)
+    rho = 0.002
+    points = np.column_stack(
+        (
+            np.sin(rho * path) / rho,
+            (1.0 - np.cos(rho * path)) / rho,
+            0.1 * path,
+        )
+    )
+    tangents = np.column_stack(
+        (np.cos(rho * path), np.sin(rho * path), np.full_like(path, 0.1))
+    )
+    normals = tangents / np.linalg.norm(tangents, axis=1, keepdims=True)
+    reference = np.repeat([[0.0, 0.0, 1.0]], 10, axis=0)
+    local0 = np.cross(reference, normals)
+    local0 /= np.linalg.norm(local0, axis=1, keepdims=True)
+    local1 = np.cross(normals, local0)
+    rotations = np.stack((local0, local1, normals), axis=2)
+    holdout = np.array([False, False, False, False, True, False, False, True, False, False])
+    volume = np.where(holdout, 17, 10)
+    layer = np.where(holdout, 8, np.arange(10))
+
+    geometry = m.NominalGeometry(
+        transforms=[],
+        centers=torch.tensor(points, dtype=torch.float64),
+        rotations=torch.tensor(rotations, dtype=torch.float64),
+        id_to_idx={(int(volume[i]), int(layer[i]), i + 1): i for i in range(10)},
+    )
+    inputs = m.HelixInputs(
+        hit_sensor_ids=torch.arange(10),
+        measured_local=torch.zeros((10, 2), dtype=torch.float64),
+        measurement_variance=torch.ones((10, 2), dtype=torch.float64),
+        loc1_valid=torch.ones(10, dtype=torch.bool),
+        smt_local=torch.zeros((10, 2), dtype=torch.float64),
+        hit_global_positions=torch.tensor(points, dtype=torch.float64),
+        hit_directions=torch.tensor(tangents, dtype=torch.float64),
+        hit_volume_ids=torch.tensor(volume),
+        hit_layer_ids=torch.tensor(layer),
+        hit_module_ids=torch.arange(1, 11),
+        hit_event_ids=torch.ones(10, dtype=torch.long),
+        hit_track_ids=torch.full((10,), 7, dtype=torch.long),
+    )
+    geometry_path = tmp_path / "nominal.json"
+    states_path = tmp_path / "trackstates.root"
+    geometry_path.touch()
+    states_path.touch()
+    monkeypatch.setattr(m, "load_nominal_geometry", lambda _path: geometry)
+    monkeypatch.setattr(
+        m, "load_nominal_states", lambda _path, _mapping, max_track_entries=None: inputs
+    )
+
+    output_dir = tmp_path / "output"
+    exit_code = m.main(
+        [
+            "--states",
+            str(states_path),
+            "--geometry",
+            str(geometry_path),
+            "--nominal-full-geometry",
+            str(geometry_path),
+            "--holdout-layers",
+            "17:8",
+            "--min-fit-hits",
+            "4",
+            "--min-fit-span",
+            "100",
+            "--max-tracks",
+            "1",
+            "--fit-iters",
+            "250",
+            "--max-pixel-local-rmse",
+            "10.0",
+            "--max-direction-angle-rms",
+            "0.2",
+            "--output-dir",
+            str(output_dir),
+            "--capture-source-snapshot",
+        ]
+    )
+
+    assert exit_code == 0
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    snapshot = manifest["git"]["source_snapshot"]
+    assert snapshot["status"] == "written"
+    assert (output_dir / snapshot["archive_path"]).is_file()
+
+
 def test_cli_writes_failure_artifacts_and_returns_one(tmp_path, monkeypatch):
     m = load_module()
     inputs = _straight_inputs(m, holdout_measurement_shift=1.0)

@@ -1513,6 +1513,12 @@ if "__main__" == __name__:
             "Costs memory per track; intended for Gate 0 diagnostics."
         ),
     )
+    material_parser.add_argument(
+        "--capture-source-snapshot",
+        action="store_true",
+        help="Archive the exact tracked+untracked source tree into the run's "
+        "manifest so it can be replayed independent of git commit/dirty state.",
+    )
 
     args = parser.parse_args()
 
@@ -1826,6 +1832,7 @@ if "__main__" == __name__:
                 }
             },
             status="running",
+            capture_source_snapshot=args.capture_source_snapshot,
         )
 
         detector = get_configured_open_data_detector(misaligned=False)

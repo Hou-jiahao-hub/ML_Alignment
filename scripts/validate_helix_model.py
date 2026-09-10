@@ -143,6 +143,7 @@ class HelixValidationConfig:
     on_missing_material: str = "fail"
     broken_fit_iters: int = 60
     fit_solver: str = "gauss-newton"
+    capture_source_snapshot: bool = False
 
 
 @dataclass
@@ -1673,6 +1674,7 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
             }
         },
         status="running",
+        capture_source_snapshot=config.capture_source_snapshot,
     )
 
     use_cuda = bool(config.gpu and torch.cuda.is_available())
@@ -2156,6 +2158,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--broken-fit-iters", type=int, default=defaults.broken_fit_iters
     )
+    parser.add_argument(
+        "--capture-source-snapshot",
+        action="store_true",
+        default=defaults.capture_source_snapshot,
+        help="Archive the exact tracked+untracked source tree into the run's "
+        "manifest so it can be replayed independent of git commit/dirty state.",
+    )
     return parser
 
 
@@ -2189,6 +2198,7 @@ def config_from_args(args: argparse.Namespace) -> HelixValidationConfig:
         material_artifact_energy_loss=args.material_artifact_energy_loss,
         on_missing_material=args.on_missing_material,
         broken_fit_iters=args.broken_fit_iters,
+        capture_source_snapshot=args.capture_source_snapshot,
     )
 
 

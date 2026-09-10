@@ -531,3 +531,49 @@ def test_perigee_hypothesis_is_enforced_once_gate0_measured_a_unit_pass_rate():
     position[1, 0] += 5.0
     with pytest.raises(ValueError, match="perigee"):
         material_artifact.check_perigee_hypothesis(position, d0, z0, phi)
+
+
+def test_capture_source_snapshot_flag_defaults_off_and_threads_through(tmp_path, monkeypatch):
+    """The opt-in source-snapshot switch must reach write_experiment_manifest
+    unchanged; default False keeps every existing manifest call unaffected."""
+    material_artifact = _module()
+
+    default_args = material_artifact.build_argument_parser().parse_args(
+        [
+            "--material", "m.root",
+            "--propsummary", "p.root",
+            "--summary", "s.root",
+            "--out", "artifact.npz",
+            "--run-tag", "test-run",
+        ]
+    )
+    assert default_args.capture_source_snapshot is False
+
+    captured = {}
+
+    def fake_write_experiment_manifest(*_args, **kwargs):
+        captured.update(kwargs)
+        raise SystemExit("stop-after-manifest")
+
+    monkeypatch.setattr(
+        material_artifact, "write_experiment_manifest", fake_write_experiment_manifest
+    )
+    material = tmp_path / "material.root"
+    propsummary = tmp_path / "propsummary.root"
+    summary = tmp_path / "summary.root"
+    for path in (material, propsummary, summary):
+        path.touch()
+
+    with pytest.raises(SystemExit):
+        material_artifact.main(
+            [
+                "--material", str(material),
+                "--propsummary", str(propsummary),
+                "--summary", str(summary),
+                "--out", str(tmp_path / "artifact.npz"),
+                "--run-tag", "test-run",
+                "--capture-source-snapshot",
+            ]
+        )
+
+    assert captured["capture_source_snapshot"] is True

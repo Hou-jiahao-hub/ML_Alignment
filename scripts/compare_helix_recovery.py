@@ -1555,6 +1555,12 @@ def build_argument_parser(config: ProjectConfig | None = None) -> argparse.Argum
     )
     parser.add_argument("--gpu", action="store_true")
     parser.add_argument("--config", help="Path to a TOML project configuration override.")
+    parser.add_argument(
+        "--capture-source-snapshot",
+        action="store_true",
+        help="Archive the exact tracked+untracked source tree into the run's "
+        "manifest so it can be replayed independent of git commit/dirty state.",
+    )
     return parser
 
 
@@ -2017,6 +2023,7 @@ def main(argv: list[str] | None = None) -> int:
             metrics=available_metrics,
             status="running",
             allow_missing_inputs=True,
+            capture_source_snapshot=args.capture_source_snapshot,
         )
         progress.attach(manifest_path)
         progress("manifest", "completed")

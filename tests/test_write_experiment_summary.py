@@ -12,7 +12,7 @@ def _joint(best_iteration=19, correction_max_abs=1.5):
 
 PROFILE_SHA256 = "ab" * 32
 PROFILE = {
-    "schema_version": "3.0",
+    "schema_version": "3.1",
     "selection_version": "full_event_bootstrap_v1",
     "event_identity": {"nominal_events": 4, "event_key_sha256": "cd" * 32},
 }
@@ -22,9 +22,11 @@ def _acceptance(passed):
     return {
         "passed": passed,
         "failed_components": [] if passed else ["17:8:LOC0"],
-        "schema_version": "3.0",
+        "schema_version": "3.1",
         "profile_identity_verified": True,
         "threshold_profile_sha256": PROFILE_SHA256,
+        "profile_type": "diagnostic_only",
+        "verdict_eligible": False,
     }
 
 
@@ -110,6 +112,18 @@ def test_summary_never_claims_a_hash_split():
             PROFILE,
             PROFILE_SHA256,
             "hash",
+        ),
+        (
+            {**_acceptance(True), "profile_type": "validation"},
+            PROFILE,
+            PROFILE_SHA256,
+            "profile_type",
+        ),
+        (
+            {**_acceptance(True), "verdict_eligible": True},
+            PROFILE,
+            PROFILE_SHA256,
+            "verdict_eligible",
         ),
         (_acceptance(True), {**PROFILE, "schema_version": "2.0"}, PROFILE_SHA256, "schema"),
         (

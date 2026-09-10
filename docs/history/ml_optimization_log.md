@@ -2694,3 +2694,145 @@ Fisher floor 撑起的方向本就不是被数据识别的模式。
 AlignDerivLib 环境跳过。
 
 本轮没有运行真实算法实验，因此没有实验 manifest，也没有新增物理或精度结论。
+
+---
+
+## Iteration 29 — 当前工作树 100k 全事件闭环与一次性几何 truth 否决门（预注册）
+
+**日期**：2026-09-10
+**性质**：工程回归闭环；验证当前修改后的生产编排、数值契约、ACTS 回灌和候选几何
+闭合。**不构成 blind validation、独立泛化或新精度声明。**
+**状态**：预注册；以下规则写于本轮真实 ROOT/ACTS 运行之前，结果只能在本条末尾追加，
+不得据结果改阈值、调参或另选候选。
+
+### 1. 冻结输入与生产配方
+
+- 复用现有 100k misaligned reconstruction：
+  `trackstates_kf_v17l8_v24l4.root`（98,958 ROOT entries）及配套 tracksummary；
+  不重新生成错位输入。
+- target layers 固定 `17:8,24:4`，active DOF 固定 `0,1,5`（`tx,ty,rz`）。
+- run tag 固定 `closure-current-100k-20260910`；事件数 100000、surface epochs 200、
+  joint iterations 1000、SMT seed cap 2000、measurement refit cap 200、
+  block-LM cap 60、`max_tracks=0`、bootstrap seed 6006。
+- 工作树允许 dirty，但主实验与 truth-veto 都必须捕获 schema-2 source snapshot；
+  不以 commit 单独声称可复现。
+
+生产选择严格保持：
+
+```text
+misaligned input acceptance
+  -> joint free-helix / block-LM
+  -> ACTS reconstruction + same-sample acceptance
+  -> at most two gain-0.2 surface-polish candidates
+  -> freeze exactly one final candidate
+```
+
+候选只能由不读取 truth 的 acceptance score 选择。最终候选路径只能从
+`experiment_summary.json` 读取，不预设是 joint 还是 polish。
+
+### 2. 一次性 truth 诊断
+
+旧 holdout-track truth-distance closure 同时从两臂 refit 中排除目标层 hit，而两臂
+非目标几何相同；收敛后它主要测到同一个非目标测量最优点。20-event 实测 CI 上界只因
+浮点误差落在 `0.99999999998...` 附近，不能判别候选 geometry，本轮不得用它作门。
+
+新 `run_truth_veto_closure.py` 在候选冻结后只运行一次，直接比较 nominal、原始
+misaligned 与最终 candidate geometry。在 misaligned 局部帧中，对每个 sensor 形成
+truth correction、candidate correction 和剩余误差；以 sensor 为配对 bootstrap 单位，
+2000 resamples、seed 6006、95% 上尾。六个预注册指标为：
+
+```text
+17:8 tx, 17:8 ty, 17:8 rz,
+24:4 tx, 24:4 ty, 24:4 rz
+```
+
+每项 CI 上界都必须严格小于 1.0。任一项失败即否决本轮最终候选，不允许读取其他候选的
+truth 后换赢家。sensor 集合不一致、重复 ID、非有限量、零/非有限 baseline RMS 或
+bootstrap 非有限均 fail closed。
+
+### 3. 工程、数值与物理判据
+
+- `make test` 与 `make test-shell` 必须通过；truth-veto 不得被 solver、
+  calibration、reconstruction acceptance 或生产 shell 引用。
+- 主实验和 truth-veto manifest 均须 finalize，source snapshot 状态为 `written`。
+- retained tracks 必须为 61,482；不符时先判输入/选择身份失败，不读取效果指标。
+- SMT seed 与 measurement refit 非驻点比例均不超过 0.1%，且无非有限 decrement。
+- block-LM preregistration version 必须为 2；
+  `min_components_delta_accepted >= 0` 且
+  `min_components_end_minus_start >= 0`。rank-deficient、boundary、
+  budget-exhausted 必须显式记账，不得伪装成 converged。
+- 最终 acceptance score 必须严格优于原始 misaligned baseline；四个目标层分量均
+  `passed=true`，同时保持 `profile_type=diagnostic_only`、
+  `verdict_eligible=false`。
+- §2 六个几何 truth-error RMS ratio 的 paired 95% CI 上界全部 `< 1.0`。
+- `trial-010-fullevents` 只旁路展示轨迹数、迭代数、acceptance 与几何 RMS，
+  不进入选择或门控。
+
+### 4. 失败语义与宣称边界
+
+truth 科学判据失败属于一次完整实验：truth-veto manifest 记 `completed` 且
+`verdict.passed=false`；输入、配对、数值、异常或中断故障记 `failed` 并保留已有
+指标。任一正式判据失败，本轮结论只能是「当前修改未通过闭环」，不得用 truth 调参后重跑。
+
+### 5. 正式结果（只回填，不据 truth 调参）
+
+正式主运行从 `2026-09-10T10:02:16Z` 至 `11:59:39Z`，run tag 为
+`closure-current-100k-20260910`。主 manifest 为 schema 2、`completed`；输入哈希为：
+
+- misaligned geometry：`b4b113222dd714c42d149508e8497542b29069a2a84a1b80e00b51307c82a63d`
+- misaligned trackstates：`c7b377187c1eb10c2c258aaa1b6fb545940594c3d4bec027009dd5c8029edc2b`
+- misaligned tracksummary：`c0b2c29ecc4fcd76d98cea1a7d40251772675fd5f551309224d213b3f2b27615`
+
+主运行与 truth-veto 的 source snapshot 均为 `written`、各含 139 个文件；两个归档都已
+用 `restore-source` 恢复到独立空目录并通过整包、文件数与逐文件哈希校验。恢复时只有
+Python 3.9 `tarfile` 的安全默认行为提示，没有完整性错误。
+
+数值身份与契约通过：98,958 input tracks 中保留 **61,482**；SMT seed 和 measurement
+refit 终态非驻点比例均为 0，非有限 decrement 均为 0。block-LM preregistration
+version 为 2，`best_iteration=13`、`stop_reason=all_blocks_terminal`；2,268 blocks
+全部明确记为 interior `converged`，budget-exhausted、rank-deficient、boundary 和
+intersection-failed 均为 0。`min_components_delta_accepted=0`、
+`min_components_end_minus_start=0`，满足固定有效集判据。
+
+生产 acceptance 将 score 从原始 misaligned 的
+`[4, 1002.2362008145352, 1543.7135270312644]` 改善为
+`[0, 0.9694442432274074, 0]`；四个 layer/component 均 `passed=true`。候选因此冻结为
+summary 所列的 `aligned_transforms_closure-current-100k-20260910_joint_free.json`，
+没有运行 polish。**但预注册的元数据判据未完全满足**：summary 明确记录
+`acceptance_scope=diagnostic_only`，而 acceptance JSON 本身没有
+`profile_type=diagnostic_only` 和 `verdict_eligible=false` 两个字段。既有单测还显式断言
+无 event split 时省略这两个字段。因此本轮不能把语义近似当成字段契约通过；该工程缺口
+不在 truth 后修补，也不重跑本轮。
+
+冻结后仅对该候选执行了一次几何 truth-veto（seed 6006、2,000 paired sensor
+bootstrap），truth manifest 为 schema 2、`completed`。六项 nominal ratio / 95% CI
+上界如下，全部严格 `<1.0`：
+
+| layer/DOF | ratio | CI upper |
+|---|---:|---:|
+| 17:8 tx | 0.00616720 | 0.00651634 |
+| 17:8 ty | 0.00951357 | 0.01017928 |
+| 17:8 rz | 0.00746449 | 0.00796759 |
+| 24:4 tx | 0.01498277 | 0.01565493 |
+| 24:4 ty | 0.31917439 | 0.33565704 |
+| 24:4 rz | 0.01104834 | 0.01157299 |
+
+`trial-010-fullevents` 旁路对照（未进入选择）：两次均为 61,482 tracks、best iteration
+13、最终候选为 joint-free。trial-010 的 acceptance score 为
+`[0, 0.940964439649173, 0]`，本轮为 `[0, 0.9694442432274074, 0]`；两次 profile schema
+与阈值不同，不能把第二分量差值解释为物理退化。按 `compare_geometries.py` 的
+misaligned/aligned RMS（tx、ty 单位 mm，rz 单位 rad）：
+
+| layer/DOF | trial-010 | 本轮 |
+|---|---:|---:|
+| 17:8 tx | 0.51764482 / 0.00319084 | 0.51764482 / 0.00319073 |
+| 17:8 ty | 0.52181491 / 0.00496369 | 0.52181491 / 0.00496371 |
+| 17:8 rz | 0.02107606 / 0.000157321 | 0.02107606 / 0.000157322 |
+| 24:4 tx | 0.51671589 / 0.00697580 | 0.51671589 / 0.00697582 |
+| 24:4 ty | 0.52000645 / 0.16597611 | 0.52000645 / 0.16591260 |
+| 24:4 rz | 0.02055998 / 0.000227157 | 0.02055998 / 0.000227154 |
+
+**结论**：数值、重建 acceptance 和一次性几何 truth 判据均通过，未观察到“重建改善但
+几何更差”；但 acceptance JSON 的两个预注册诊断元数据字段缺失，因此按 fail-closed
+规则，**当前修改整体未完全通过本次工程闭环**。这是字段契约失败，不改变几何 truth
+通过的事实，也不授权使用 truth 调参或改选候选。

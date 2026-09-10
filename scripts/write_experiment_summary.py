@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 SCHEMA_VERSION = 3
-ACCEPTANCE_SCHEMA_VERSION = "3.0"
+ACCEPTANCE_SCHEMA_VERSION = "3.1"
 ACCEPTANCE_SELECTION_VERSION = "full_event_bootstrap_v1"
 
 WORKFLOW = "block-lm_surface-polish2_full-events"
@@ -46,6 +46,10 @@ def build_summary(
         raise ValueError("final acceptance schema_version is missing or unsupported")
     if not final_acceptance.get("profile_identity_verified"):
         raise ValueError("final acceptance profile_identity_verified must be true")
+    if final_acceptance.get("profile_type") != "diagnostic_only":
+        raise ValueError("final acceptance profile_type must be diagnostic_only")
+    if final_acceptance.get("verdict_eligible") is not False:
+        raise ValueError("final acceptance verdict_eligible must be false")
     if final_acceptance.get("threshold_profile_sha256") != acceptance_baseline_sha256:
         raise ValueError("final acceptance threshold profile hash does not match baseline")
     if acceptance_profile.get("schema_version") != ACCEPTANCE_SCHEMA_VERSION:

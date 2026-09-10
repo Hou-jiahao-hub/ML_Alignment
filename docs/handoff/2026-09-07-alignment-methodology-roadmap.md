@@ -245,6 +245,136 @@ conda run -n pytorch make test
 
 #### L2. 验收 profile 和运行代码身份绑定
 
+> **进展（2026-09-08 追加，本段以下的预注册文字一字未改）**：代码与测试已实现，
+> 尚未提交 commit。`scripts/experiment_manifest.py` 的 manifest schema 升至 2，
+> 新增 `git` 字段（`dirty`／tracked diff 哈希／untracked 文件清单哈希／`probe_failed`），
+> 以及 ACTS setup 脚本、conda 环境名、conda setup 脚本的身份记录（新增 CLI
+> `--acts-setup`/`--conda-env`/`--conda-setup`，`run_surface_helix_experiment.sh`
+> 已接上）。diff 只落哈希，不把完整 diff 文本写进 manifest 或落地成 sidecar 文件——
+> 最初实现把完整 diff 文本写成同目录下的 `git_tracked_diff.patch`，直接弄坏了
+> `test_compare_helix_recovery.py` 里断言输出目录精确文件集合的两个既有测试；已改为
+> 仅存哈希，并把 git 探测挪到 preflight manifest 写入之后（不再抢在慢哈希失败测试
+> 之前打断 "crash 前必须先有可见 running manifest" 的既有契约）。
+> `scripts/reconstruction_acceptance.py`／`scripts/calibrate_acceptance.py` 的
+> profile 新增 `selection_version` 与逐分区事件键哈希；消费端新增
+> `AcceptanceProfileIdentityError`，在 `event_partition` 不为空时校验 seed 与事件键，
+> 不符即 fail closed（不产出 verdict），且删除了原来"静默用 profile 里的 seed 覆盖
+> 调用方 seed"的行为；每条验收结果新增 `profile_type`／`verdict_eligible`
+> 字段（`--no-event-split` 结果为 `diagnostic_only`／`False`，有分区时为分区名／
+> `True`）。`scripts/write_experiment_summary.py` 增加对 `verdict_eligible` 的纵深
+> 防御检查，非 verdict-eligible 的验收结果不得产出 `passed`。全部改动在
+> `conda run -n pytorch pytest -q tests`（510 passed）与 `make test-shell` 下验证
+> 通过，未消费 calibration／validation。真实全流程（实际跑一次
+> `run_surface_helix_experiment.sh` 产生 manifest／acceptance 并检视）尚未执行。
+
+> **进展（2026-09-09 追加第二轮，本段以下的预注册文字一字未改）**：针对评审确认
+> 尚未关闭的两类 L2 缺口继续实现，仍未提交 commit。(1) **dirty 工作树不可重放**：
+> `experiment_manifest.py` 新增源码快照——`_write_source_snapshot()` 用
+> `git ls-files`／`git ls-files --others --exclude-standard` 枚举当前 tracked 及
+> 非 ignored untracked 的普通文件（`.git`、`data/*` 等 ignored 内容因此天然不会入档），
+> 打包成 `<run_dir>/provenance/source_snapshot.tar.gz`，逐文件哈希列表作为内部成员
+> 存进 tar 本身（不写进 `manifest.json`，避免小型 manifest 膨胀），manifest 只留
+> `format_version`／`archive_path`／`archive_sha256`／`file_count`。新增
+> `restore-source` CLI 子命令与 `restore_source_snapshot()`，恢复到空目录时校验整包
+> 哈希、内部逐文件哈希、文件数三重一致，任一不符或目标目录非空即抛
+> `SourceSnapshotError`。这是**主动选择的不对称设计**：`_git_dirty_state()`
+> （已有的脏树探测）失败时仍是 `probe_failed=True` 的诊断性降级，但源码快照是重放
+> 的唯一依据，探测或打包失败会直接抛出 `SourceSnapshotError` 终止启动（preflight
+> manifest 此时已可见，由 shell 的 EXIT trap 落 `failed`）。**该功能是 opt-in**
+> （`capture_source_snapshot=False` 默认关闭，CLI 对应 `--capture-source-snapshot`）：
+> `write_experiment_manifest()` 还被 `compare_helix_recovery.py`／
+> `material_artifact.py`／`validate_helix_model.py`／`compare_geometries.py`／
+> `alignment_odd.py`等多处按 stage 调用，且多数既有测试用真实仓库根（`load_project_config()`
+> 默认 `repository_root` 就是本仓库）——如果默认强制打包，每个单测都会去扫描/打包整个
+> 真实仓库，且会在 `test_compare_helix_recovery.py` 断言输出目录精确文件集合的用例上
+> 重演此前 diff-sidecar 文件那次回归。因此只有 `run_surface_helix_experiment.sh`
+> 里唯一那次顶层 `experiment_manifest.py start` 调用打开了这个开关，其余调用点行为
+> 不变。(2) **非 validation 结果可误报通过**：`reconstruction_acceptance.py` 的
+> `verdict_eligible` 此前只看 `event_partition is not None`——calibration 分区的结果
+> 也会被标记为 `True`，可被误用于 blind-validation verdict。现在改为要求
+> `event_partition == "validation"` 且新增字段 `profile_identity_verified`（仅在
+> `_verify_profile_identity()` 真正跑过且未抛异常时为 `True`）同时成立。另外新增
+> `--threshold-profile-sha256`：只要 `--event-partition` 与 `--threshold-profile`
+> 同时给出就强制要求这个整文件哈希，缺失或不匹配都在既有的 try/except 里 fail
+> closed（成为失败结果而非崩溃）。`run_surface_helix_experiment.sh` 在
+> `calibrate_acceptance.py` 冻结 profile 后只算一次 `PROFILE_SHA256`，后续所有
+> `reconstruction_acceptance.py` 调用统一传入。`write_experiment_summary.py` 在
+> `verdict_eligible` 之外新增对 `event_partition`／`profile_type`／
+> `profile_identity_verified` 三个字段的独立复查，防的是一份手工拼出的、
+> `verdict_eligible` 被直接写 `true` 但其余字段不自洽的验收 JSON。验证：
+> `conda run -n pytorch make test`（539 passed / 3 skipped，跳过项是既有的 ACTS
+> 绑定／pybind 扩展缺失，与本轮无关）与 `make test-shell` 全过；`make test-root-io`
+> 有一个既有失败（`test_material_artifact.py::test_build_artifact_round_trips_a_synthetic_three_table_run`，
+> awkward 版本不兼容导致的 `ak.to_numpy` 报错），已用 `git stash` 验证改动前就失败，
+> 与本轮无关，未处理。真实跑一次 `run_surface_helix_experiment.sh` 产生并检视带
+> `source_snapshot` 的 manifest，仍未执行。
+
+> **进展（2026-09-10 追加第三轮，本段以下的预注册文字一字未改）**：评审指出前两轮
+> 只是"实现完成"，预注册判据本身（真实跑通、独立目录重放、1e-6mm/1e-7rad 公差）
+> 从未被验证过；另外指出冻结的 profile 哈希只活在 shell 变量里、`capture_source_snapshot`
+> 只在顶层一处开启。本轮据此收口：(1) `scripts/reconstruction_acceptance.py::compute_reconstruction_acceptance`
+> 新增 `threshold_profile_sha256` 关键字参数，写进返回结果字典；`main()` 把已经算出的
+> `actual_profile_sha256` 传进去。这样 `experiment_summary.json`／manifest 的
+> `metrics` 会自动带上这个字段（两者都是把 acceptance JSON 原样并入，不需要改
+> `write_experiment_summary.py`／`experiment_manifest.py`），一份 acceptance 结果
+> JSON 单独拿出来就能查到它当时锁定的是哪份 profile，不再只靠 shell 变量。
+> (2) `--capture-source-snapshot` 开关（默认关闭，行为不变）扩展到另外三个可测试的
+> 直接调用 `write_experiment_manifest()` 的入口：`compare_helix_recovery.py`、
+> `material_artifact.py`、`validate_helix_model.py`；`alignment_odd.py` 的
+> `material` 子命令也加了同名 CLI flag 并线传下去，但该文件顶部 `import acts`，
+> 在 conda pytorch 环境下无法导入（`ModuleNotFoundError: No module named 'acts'`），
+> 仓库里也没有 `tests/test_alignment_odd.py`，所以这一处只做了语法检查
+> （`ast.parse`），没有、也无法用 pytest 验证，真实验证要等真实 ACTS 环境跑一次
+> `material` 子命令。`compare_geometries.py` 按约束保持不动。三个可测试入口各新增
+> 一条回归测试，确认默认值仍是 `False`（不影响现有断言，包括
+> `test_compare_helix_recovery.py` 里那几处输出目录精确文件集合断言）、且显式传
+> flag 后 manifest 的 `git.source_snapshot.status == "written"`
+> （`compare_helix_recovery.py` 那条还额外确认 `provenance/` 出现在输出目录里）。
+> (3) L3 新增独立 closure 脚本 `scripts/analysis/run_truth_veto_closure.py`，不改
+> `measure_all_hit_refit.py` 一行代码，只从中 `import` 现成的
+> `load_states`／`require_paired`／`select_tracks`／`build_batches`／`run_arm`，
+> 把它原有的"nominal vs misaligned"两臂对比换成"baseline（对齐前）vs
+> candidate（对齐后）"两臂对比，只用非目标层 hit 做 holdout refit（避开已实测的
+> "目标 hit 并入拟合把 truth 距离拉偏 9.9 倍"那个坑），限定在 `validation`
+> 分区事件上，对"两个目标层合并"（primary，`ci_upper < 1.0`）和"每个目标层单独"
+> （required，`ci_upper <= 1.01`）分别调用 `paired_truth_distance_ratio_ci` 后交给
+> `evaluate_truth_veto(after_candidate_selection=True)`；用现有
+> `write_experiment_manifest`／`finalize_experiment_manifest` 写自己的 manifest，
+> 不写回、不接入 `run_surface_helix_experiment.sh`。`tests/test_truth_veto_gate_isolation.py`
+> 的禁止名单不包含这个新文件，属于设计使然（它就是被明确要求存在的真实调用方），
+> 跑一遍确认仍然全绿。新增 `tests/test_run_truth_veto_closure.py`：`run_arm`
+> 用假实现替换掉（Gauss-Newton 数值细节已经有
+> `measure_all_hit_refit.py`／`validate_helix_model.py` 自己的设计和测试兜底，这
+> 里只测本脚本自己的职责——分区过滤、逐层/合并指标构造、pass/fail 传导），验证了
+> train 分区事件被正确排除、候选变好时 verdict passed、候选变差时 primary
+> 指标失败、`--capture-source-snapshot` 正确线传。以上代码改动的验证：
+> `conda run -n pytorch make test`（558 passed / 3 skipped，跳过项同前，与本轮
+> 无关）、`make test-shell` 全过。**真实端到端验证（本轮跑通）**：探测时 CVMFS
+> 未挂载（`setup_acts.sh` 报自动挂载需要 sudo 密码，属于交互式操作，无法自动完成），
+> 请用户手动挂载后重新探测，确认 `import acts` 可用。随后真实执行了一次
+> `run_surface_helix_experiment.sh --run-tag l2a-verify-20260910-c --events 20
+> --max-tracks 10 --surface-epochs 2 --joint-iters 5
+> --joint-measurement-refit-iters 5 --lm-max-iters 5 --skip-blind-validation
+> --no-event-split`（故意用很小的迭代数/事件数/track 数只为验证机制，不追求物理
+> 结果；`--joint-smt-seed-iters` 保留默认 2000——曾经把它也调小过，直接触发了
+> `require_stationary_helix_point_fit` 的 fail-closed 报错，见下）。产出
+> `manifest.json` 里 `git.source_snapshot.status == "written"`
+> （`provenance/source_snapshot.tar.gz`，139 个文件）；用
+> `experiment_manifest.py restore-source` 把源码复原到一个全新空目录，三重哈希
+> 校验（整包哈希／内部逐文件哈希／文件数）全部通过。用复原目录里的
+> `ml_alignment_autograd.py`，配上 manifest 里记录的完全相同的输入路径（并重新
+> 核对了这些输入文件的 sha256，与 manifest 记录的一致，确认输入数据本身也没变）
+> 和完全相同的参数，重跑了一次 joint-free block-LM 求解，把新产出的 geometry
+> JSON 与原始运行的 2268 个 surface 逐值比较：最大平移分量差和最大旋转矩阵元素差
+> 均为 `0.0`——严格优于预注册的 `1e-6 mm / 1e-7 rad` 公差，判据满足。过程中先后
+> 两次尝试因为参数选得不合适而失败（一次是把 `--joint-smt-seed-iters` 调到 5
+> 触发了预期内的 fail-closed 报错；另一次是外部 `timeout` 命令没能把 SIGTERM
+> 正确传导到多层 subshell 里的 ACTS 子进程，导致 manifest 卡在 `running`
+> 状态没被 finalize）——这两次连同其产物已作为本轮自建的临时验证数据清理掉，只
+> 保留跑通的 `l2a-verify-20260910-c`。**仍未跑通**：真实 ACTS 环境下跑一次
+> `alignment_odd.py material --capture-source-snapshot`（该文件顶层 `import acts`，
+> 无法在 conda pytorch 环境下用 pytest 验证，需要单独在 ACTS 环境里手动跑一次）。
+
 **目标**：阻止 full-event 与 holdout 口径混用，并补上 dirty 工作树不可重放的问题。
 
 **改动位置**：
@@ -274,6 +404,120 @@ conda run -n pytorch make test
 工作树内容。
 
 #### L3. 新模拟实验的 truth 否决门
+
+> **进展（2026-09-08 追加，本段以下的预注册文字一字未改）**：新增独立模块
+> `scripts/analysis/truth_veto_gate.py`（不 import acts/torch，只依赖 numpy），
+> 尚未提交 commit。`paired_truth_distance_ratio_ci()` 按事件分块 bootstrap 计算
+> RMS(candidate)/RMS(baseline) 的 paired 比值及其 95% CI 上界（`ci_quantile=0.975`，
+> 对齐 `validate_helix_model.paired_bootstrap_ci`／`compare_truth_rms.py` 既有惯例；
+> 只比较两臂都有效的 hit，即 `candidate_valid & baseline_valid`）；`evaluate_truth_veto()`
+> 实现主判据（严格 `< 1.0`）／次判据（`<= 1.01`）逐项独立判定、不做跨层跨分量平均，
+> 且 `after_candidate_selection` 是强制参数而非默认值，必须显式传 `True`。新增
+> `tests/test_truth_veto_gate_isolation.py`，grep 求解器／校准脚本确认无人引用这个
+> 模块，作为"truth 不得反馈进校准循环"的操作性回归。**范围收窄，明确排除在本轮之外**：
+> 尚未接入 `measure_all_hit_refit.py` 的真实 ACTS per-hit 输出（本轮只实现了统计
+> 判据核心，用合成数组测试）；也未实现逐层逐 DOF 的几何误差分解——那需要要么改动
+> 在途的 `scripts/compare_geometries.py`（本轮按交接文档要求未触碰），要么先独立核实
+> `ml_alignment_autograd.py` 里未文档化的 DOF 索引约定，两者都留作后续工作。真实数据
+> 端到端否决门尚未跑通。
+
+> **进展（2026-09-09 追加第二轮，本段以下的预注册文字一字未改）**：修了评审确认的
+> "truth 非有限值可漏过否决"缺口，仍未提交 commit。此前
+> `paired_truth_distance_ratio_ci()` 对非有限 bootstrap 比值的处理是
+> `resampled_ratio[np.isfinite(resampled_ratio)]`——静默丢弃非有限重采样，只用剩下
+> 的有限子集算分位数；这意味着只要有部分 resample 因为撞上零 baseline RMS 而炸掉，
+> 结果仍然可能是一个"看起来正常"的、可以通过否决门的 `ci_upper`。现在改为三重
+> fail-closed：(1) 计算前检查两臂共享有效 hit 上的 candidate／baseline distance
+> 是否全部有限，任一非有限直接抛 `ValueError`；(2) 检查全局 baseline RMS
+> 是否非零且有限，否则抛错（比值本身无定义）；(3) 要求全部 `n_bootstrap` 次重采样
+> 都有限，只要有一次非有限就抛错，不再静默过滤后继续。`evaluate_truth_veto()`
+> 同步加固：`ci_upper`／`nominal_ratio`（若存在）必须有限，且若指标结果带
+> `n_finite_resamples`／`bootstrap.replicates` 字段，两者必须相等——防的是一份
+> 陈旧或手工拼出的、重采样不完整的指标结果直接被拿来判否决。新增 10 个回归测试
+> （非有限 candidate／baseline distance、零 baseline RMS、部分重采样非有限、
+> `evaluate_truth_veto` 对应的非有限 `ci_upper`／`nominal_ratio`／不完整重采样数），
+> 连同既有用例共 21 个全部通过。**范围继续排除**：真实 ACTS per-hit NPZ 接入
+> （无论是扩展 `measure_all_hit_refit.py` 的诊断输出，还是在
+> `run_surface_helix_experiment.sh` 生产流程里新增 helix-refit-to-truth-distance
+> 逻辑）与逐层逐 DOF 几何误差分解，2026-09-09 与用户核对后明确选择本轮不做——
+> 原因不变，仍是要么触碰在途的 `compare_geometries.py`，要么需要先独立核实
+> `ml_alignment_autograd.py` 未文档化的 DOF 索引约定；且生产流程
+> `run_surface_helix_experiment.sh` 目前完全不计算 per-hit truth distance（只有
+> chi2 验收），把 truth veto 接入生产流程需要新设计一段目前没有先例可循的逻辑，
+> 留作独立的后续工作单独设计和验收，不在本轮顺带做掉。真实数据端到端否决门依旧
+> 尚未跑通。
+
+> **进展（2026-09-10 追加第三轮，本段以下的预注册文字一字未改）**：评审指出
+> `tests/test_truth_veto_gate_isolation.py` 只证明了"没人调用 truth_veto_gate"，
+> 而不是"有人正确地调用它"——否决门此前没有任何真实或 closure 调用方，不可能真的
+> 挡住任何候选。本轮新增独立 closure 脚本
+> `scripts/analysis/run_truth_veto_closure.py`，作为第一个真实调用方，解决"无调用
+> 方"和"未接真实数据管线"两个缺口（仍未解决的是"真实 ACTS 数据"——见下）。设计：
+> 完全复用 `scripts/analysis/measure_all_hit_refit.py` 已有的
+> `load_states`／`require_paired`／`select_tracks`／`build_batches`／`run_arm`（不
+> 改该文件一行代码，只 `import` 它的函数），把它原本的"nominal vs misaligned"两臂
+> 对比换成"baseline（`run_surface_helix_experiment.sh` 的对齐前输入几何）vs
+> candidate（其最终产出几何）"两臂对比——这正是 L3 要回答的问题本身。只用非目标层
+> hit 做 holdout refit（复用同一份已实测的"目标 hit 并入拟合把 truth 距离拉偏
+> 9.9 倍"教训，refit 阶段避开它），限定在 `--event-partition validation`（复用
+> `scripts/event_split.py::event_partition_mask`，默认即 `validation`，避免拿校准
+> 阶段挑过候选的事件再来做否决检查），对"两个目标层合并"（primary，
+> `ci_upper < 1.0`）和"每个目标层单独"（required，`ci_upper <= 1.01`）分别调用
+> `paired_truth_distance_ratio_ci` 后交给
+> `evaluate_truth_veto(after_candidate_selection=True)`，用现有
+> `write_experiment_manifest`／`finalize_experiment_manifest` 写自己的 manifest
+> 和一份 `truth_veto_result.json`，不写回、不接入
+> `run_surface_helix_experiment.sh`——`tests/test_truth_veto_gate_isolation.py` 的
+> 禁止名单不包含这个新文件，属于设计使然，跑一遍确认仍然全绿。新增
+> `tests/test_run_truth_veto_closure.py`：`run_arm` 换成假实现（真实
+> Gauss-Newton 数值细节已经有 `measure_all_hit_refit.py`／
+> `validate_helix_model.py` 自己的设计和测试兜底，这里只测本脚本自己的职责——
+> 事件分区过滤是否发生在拟合之前、逐层/合并指标是否构造正确、pass/fail 是否正确
+> 传导），验证了 train 分区事件被正确排除、候选变好时 verdict passed、候选变差时
+> primary 指标失败、`--capture-source-snapshot` 正确线传。**范围继续排除**：真实
+> ACTS per-hit truth-distance 数据源（本轮的合成 DataFrame 测试绕开了
+> `load_states` 的 ROOT 读取）；逐层逐 DOF 的几何误差分解（原因不变：要么触碰
+> 在途的 `compare_geometries.py`，要么需要先独立核实 `ml_alignment_autograd.py`
+> 未文档化的 DOF 索引约定）；重建效率／求交成功率／尾部 truth distance 分布；
+> 把这个 closure 脚本自动接入 `run_surface_helix_experiment.sh`（目前仍是跑完
+> 实验后手动调用一次）。这些留作独立的后续工作单独设计和验收。
+
+> **真实数据端到端验证（本轮跑通，紧接 L2-A 的 CVMFS 恢复之后）**：针对
+> L2-A 里那次真实 `l2a-verify-20260910-c` 跑出的产物，对
+> `scripts/analysis/measure_all_hit_refit.py::load_geometries` 的复用方式做了一处
+> 修正——最初实现直接对 `baseline_geometry`/`candidate_geometry` 调用
+> `build_geometry(json.loads(path.read_text()))`，把它们当成自包含的全量探测器
+> 几何；真实数据上第一次尝试就在 `build_batches` 里对非目标层 hit 抛出
+> `KeyError`，因为 `misalignment_applied_v17l8_v24l4.json`／
+> `ml_alignment_autograd.py --output-geom` 产出的都只是**目标层区域的 overlay**
+> （本次真实数据里是 2268 个 surface，相对全探测器 18824 个 surface 而言），
+> 而一条真实径迹的非目标层拟合 hit 会散布在整个探测器上。修正为改用
+> `load_geometries(nominal_full_geometry_path, overlay_path, target_layers)`
+> （新增必填 CLI 参数 `--nominal-full-geometry`），让 overlay 正确合并到完整
+> nominal 几何上再建 `id_to_idx`，与 `measure_all_hit_refit.py` 自己的既有约定
+> 一致。同步更新了 `tests/test_run_truth_veto_closure.py` 的几何 fixture（拆成
+> "nominal 全量" + "overlay 仅目标层"两个文件，不再共用一个自包含文件）。之后
+> 用 `alignment_odd.py reconstruction --num-events 20`（与 L2-A 验证跑同一套
+> misaligned 几何、同一批模拟事件）额外重建了一份与候选产物事件数匹配的 baseline
+> 重建（这是必要的：`require_paired` 要求两臂逐 hit 完全对齐，而
+> `data/reconstruction/misaligned/.../trackstates_kf_v17l8_v24l4.root` 是早先一次
+> 更大规模重建的产物，事件集合和这次 20 事件的候选重建对不上，直接拿来配对会
+> fail closed）；用它和 `l2a-verify-20260910-c` 的 `surface_polish2` 最终几何/态
+> 真跑了一次 `run_truth_veto_closure.py`，产出真实 verdict：`passed: true`，
+> `target_combined`/`17_8`/`24_4` 三个指标的 `ci_upper` 都在 1.0 附近（约
+> 0.99999999998–1.00000000004，因浮点误差有正有负）。**明确的统计局限，不构成
+> 精度改善声明**：这次验证只用了 2 条径迹（`--max-tracks 10`、目标层选择后剩 2
+> 条满足 span/hit 数条件），bootstrap 在如此小的样本上几乎不提供任何统计功效，
+> `ci_upper` 贴着 1.0 纯属样本量太小、方差被 bootstrap 拉到几乎覆盖整个可能区间，
+> 不能读成"候选比基线好"的证据；这次验证的目的只是证明 closure 脚本能在真实
+> ACTS 产物上端到端跑通、产出结构正确的 verdict，不是一次有统计意义的精度评估。
+> 另外用同一次真实 ACTS 环境验证了 L2-C 里未能用 pytest 覆盖的
+> `alignment_odd.py material --capture-source-snapshot`（`--num-events 5` 的最小
+> 材料导出），manifest 的 `git.source_snapshot.status == "written"`，验证产物已
+> 清理，不留在 `data/` 下。`l2a-verify-20260910-c` 连同它的
+> `truth_veto_closure/` 子目录作为本轮真实验证证据保留在
+> `data/experiments/surface_helix/Vol17_Lay8__Vol24_Lay4/` 下（其余两次因参数
+> 选择不当/被外部 timeout 误杀而失败的自建验证目录已清理，不保留)。
 
 **目标**：防止“chi2 更好、truth 更差”的候选进入算法结论。
 

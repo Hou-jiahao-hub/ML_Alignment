@@ -273,6 +273,8 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
         --input "acts_setup=$ACTS_SETUP" --input "conda_setup=$CONDA_SH" \
         --input "odd_digi_config=$ML_ALIGNMENT_ACTS_DIGI_CONFIG" \
         --input "odd_material_map=$ML_ALIGNMENT_ODD_MATERIAL_MAP" \
+        --acts-setup "$ACTS_SETUP" --conda-env "$CONDA_ENV" --conda-setup "$CONDA_SH" \
+        --capture-source-snapshot \
         "${CONFIG_ARGS[@]}" >/dev/null
     require_file "$INPUT_GEOM"
     require_file "$INPUT_STATES"
