@@ -1,0 +1,140 @@
+{
+  "schema_version": 1,
+  "artifact_type": "presentation_source_snapshot",
+  "not_an_algorithm_experiment": true,
+  "captured_at": "2026-09-14T06:38:05.737320+00:00",
+  "git_commit": "7519f2dbf08e9d24540127ed287e6b3600560386",
+  "git_status_at_capture": [
+    " M docs/history/ml_optimization_log.md",
+    "?? NUL",
+    "?? docs/presentations/"
+  ],
+  "files": [
+    {
+      "path": "scripts/helix_model.py",
+      "sha256": "c3605e0b158fc8d36fbd1e22bea89d5bbd52a02551e8cc6c76cd1508d9505914",
+      "symbols": {
+        "helix_point": {
+          "line": 33,
+          "end_line": 41
+        },
+        "helix_tangent": {
+          "line": 44,
+          "end_line": 50
+        },
+        "closest_helix_points": {
+          "line": 64,
+          "end_line": 105
+        },
+        "intersect_plane": {
+          "line": 108,
+          "end_line": 175
+        },
+        "reference_gauge_frame": {
+          "line": 192,
+          "end_line": 207
+        },
+        "pack_gauge_fixed_track_parameters": {
+          "line": 210,
+          "end_line": 216
+        },
+        "unpack_gauge_fixed_track_parameters": {
+          "line": 219,
+          "end_line": 228
+        },
+        "damped_gauss_newton": {
+          "line": 231,
+          "end_line": 340
+        },
+        "_single_point_fit_residual": {
+          "line": 343,
+          "end_line": 363
+        },
+        "_fit_helix_points_gauss_newton_block": {
+          "line": 390,
+          "end_line": 437
+        },
+        "fit_helix_points_gauss_newton": {
+          "line": 440,
+          "end_line": 508
+        },
+        "require_stationary_helix_point_fit": {
+          "line": 511,
+          "end_line": 530
+        }
+      }
+    },
+    {
+      "path": "scripts/ml_alignment_autograd.py",
+      "sha256": "a5dec4231d42c2d00d6cafed4ff9ac0a909c33242784f2d441775fae50bd7b84",
+      "symbols": {
+        "build_track_batches": {
+          "line": 393,
+          "end_line": 502
+        },
+        "seed_helices": {
+          "line": 567,
+          "end_line": 597
+        },
+        "_measurement_refit_objective": {
+          "line": 620,
+          "end_line": 650
+        },
+        "_validation_batches_from_joint": {
+          "line": 675,
+          "end_line": 722
+        },
+        "_refit_helices_gauss_newton": {
+          "line": 851,
+          "end_line": 887
+        },
+        "fit_helices_to_measurements": {
+          "line": 890,
+          "end_line": 985
+        },
+        "run_block_lm_alignment": {
+          "line": 1454,
+          "end_line": 1801
+        },
+        "euler_to_rotation_matrix": {
+          "line": 2502,
+          "end_line": 2509
+        }
+      }
+    },
+    {
+      "path": "scripts/validate_helix_model.py",
+      "sha256": "908b8885d85e2b0a61ea5f04c87f8420f64dbd6917e67b127c1dc6d69badf6cf",
+      "symbols": {
+        "reference_gauge_frame": {
+          "line": 2427,
+          "end_line": 2456
+        },
+        "broken_helix_local_prediction": {
+          "line": 2487,
+          "end_line": 2511
+        },
+        "_standardized_residual": {
+          "line": 2514,
+          "end_line": 2545
+        },
+        "fit_broken_helix": {
+          "line": 2585,
+          "end_line": 2673
+        },
+        "newton_decrement": {
+          "line": 3219,
+          "end_line": 3254
+        },
+        "stationarity_report": {
+          "line": 3257,
+          "end_line": 3277
+        },
+        "fit_helices_gauss_newton": {
+          "line": 3313,
+          "end_line": 3386
+        }
+      }
+    }
+  ]
+}

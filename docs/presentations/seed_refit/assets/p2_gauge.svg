@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="850" viewBox="0 0 1600 850">
+<defs><marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8 Z" fill="#53616D"/></marker></defs>
+<rect width="100%" height="100%" fill="white"/>
+<text x="65" y="58.0" font-family="Droid Sans Fallback, sans-serif" font-size="34" font-weight="700" text-anchor="start" fill="#23343D">规范固定｜同一条曲线的局部唯一表示</text>
+<text x="65" y="98.0" font-family="Droid Sans Fallback, sans-serif" font-size="22" font-weight="400" text-anchor="start" fill="#53616D">示意图：展示参数原点冗余，不表示具体探测器几何</text>
+<text x="390" y="165.0" font-family="Droid Sans Fallback, sans-serif" font-size="27" font-weight="700" text-anchor="middle" fill="#23343D">同一 helix，可选择不同参数原点</text>
+<path d="M110 530 C210 210 410 220 530 420 S690 660 765 350" fill="none" stroke="#287A6D" stroke-width="4" />
+<circle cx="266.48" cy="295.44" r="7" fill="#287A6D"/>
+<text x="220" y="267.0" font-family="Droid Sans Fallback, sans-serif" font-size="25" font-weight="400" text-anchor="middle" fill="#23343D">原点 O</text>
+<circle cx="530" cy="420" r="7" fill="#9A7134"/>
+<text x="587" y="400.0" font-family="Droid Sans Fallback, sans-serif" font-size="25" font-weight="400" text-anchor="middle" fill="#23343D">原点 O′</text>
+<path d="M266.48,295.44 L355,249.5" fill="none" stroke="#53616D" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<path d="M530,420 L578,500" fill="none" stroke="#53616D" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<text x="410" y="610.0" font-family="Droid Sans Fallback, sans-serif" font-size="23" font-weight="400" text-anchor="middle" fill="#23343D">原点沿曲线移动，方位角同步改变</text>
+<text x="410" y="655.0" font-family="Droid Sans Fallback, sans-serif" font-size="25" font-weight="700" text-anchor="middle" fill="#23343D">几何轨迹不变：一个表示冗余</text>
+<text x="1190" y="165.0" font-family="Droid Sans Fallback, sans-serif" font-size="27" font-weight="700" text-anchor="middle" fill="#23343D">固定参考法平面</text>
+<path d="M920 530 L1130 230 L1480 340 L1270 640 Z" fill="#E8F3F1" stroke="#9CADB4" stroke-width="2" />
+<path d="M1170,445 L1370,390" fill="none" stroke="#53616D" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<text x="1400" y="383.0" font-family="Droid Sans Fallback, sans-serif" font-size="25" font-weight="400" text-anchor="middle" fill="#23343D">e₀</text>
+<path d="M1170,445 L1080,573" fill="none" stroke="#53616D" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<text x="1060" y="608.0" font-family="Droid Sans Fallback, sans-serif" font-size="25" font-weight="400" text-anchor="middle" fill="#23343D">e₁</text>
+<path d="M1170,445 L1130,210" fill="none" stroke="#9A7134" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<text x="1250" y="210.0" font-family="Droid Sans Fallback, sans-serif" font-size="24" font-weight="400" text-anchor="middle" fill="#23343D">参考单位切向 d</text>
+<circle cx="1170" cy="445" r="7" fill="#287A6D"/>
+<text x="1190" y="490.0" font-family="Droid Sans Fallback, sans-serif" font-size="23" font-weight="400" text-anchor="middle" fill="#23343D">r_ref</text>
+<circle cx="1290" cy="458" r="7" fill="#344A9B"/>
+<text x="1370" y="505.0" font-family="Droid Sans Fallback, sans-serif" font-size="24" font-weight="400" text-anchor="middle" fill="#23343D">优化原点 r₀</text>
+<path d="M1170,445 L1290,458" fill="none" stroke="#53616D" stroke-width="2.4" stroke-dasharray="7 6" />
+<text x="1190" y="700.0" font-family="Droid Sans Fallback, sans-serif" font-size="28" font-weight="400" text-anchor="middle" fill="#23343D">r₀ = r_ref + a₀e₀ + a₁e₁</text>
+<rect x="200" y="755" width="1200" height="65" rx="12" fill="#E8F3F1" stroke="#62777F" stroke-width="2"/>
+<text x="800.0" y="795.82" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#23343D">六个物理参数 → 五个优化变量；曲率缩放与降维是两项不同处理</text></svg>

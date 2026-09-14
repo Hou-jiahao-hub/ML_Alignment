@@ -1,0 +1,6 @@
+flowchart LR
+ A["非目标层 SMT<br/>几何预拟合"] --> B["非目标层 measurement<br/>径迹重拟合"]
+ B --> C["终态验收"]
+ C -->|通过| D["固定径迹参数"]
+ D --> E["目标层 measurement<br/>几何优化"]
+ C -->|失败| F["退出并记录原因"]

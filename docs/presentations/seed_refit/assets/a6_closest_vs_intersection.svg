@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="850" viewBox="0 0 1600 850">
+<defs><marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8 Z" fill="#53616D"/></marker></defs>
+<rect width="100%" height="100%" fill="white"/>
+<text x="65" y="58.0" font-family="Droid Sans Fallback, sans-serif" font-size="34" font-weight="700" text-anchor="start" fill="#23343D">最近点与测量面交点：两种不同的路径定义</text>
+<text x="65" y="98.0" font-family="Droid Sans Fallback, sans-serif" font-size="22" font-weight="400" text-anchor="start" fill="#53616D">概念示意；具体路径均由当前 helix 参数数值求解</text>
+<text x="390" y="170.0" font-family="Droid Sans Fallback, sans-serif" font-size="27" font-weight="700" text-anchor="middle" fill="#23343D">SMT seed：点到曲线的最近点</text>
+<path d="M100 640 C240 520 210 430 400 430 C560 430 640 490 730 330" fill="none" stroke="#287A6D" stroke-width="4" />
+<circle cx="400" cy="240" r="7" fill="#9A7134"/>
+<text x="455" y="220.0" font-family="Droid Sans Fallback, sans-serif" font-size="25" font-weight="400" text-anchor="middle" fill="#23343D">SMT 点 p</text>
+<circle cx="400" cy="430" r="7" fill="#287A6D"/>
+<path d="M400,240 L400,430" fill="none" stroke="#53616D" stroke-width="2.4" stroke-dasharray="7 6" />
+<path d="M280,430 L540,430" fill="none" stroke="#53616D" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<text x="440" y="478.0" font-family="Droid Sans Fallback, sans-serif" font-size="25" font-weight="400" text-anchor="middle" fill="#23343D">h(s*)</text>
+<text x="570" y="412.0" font-family="Droid Sans Fallback, sans-serif" font-size="23" font-weight="400" text-anchor="middle" fill="#23343D">切向 t</text>
+<path d="M400 405 L425 405 L425 430" fill="none" stroke="#53616D" stroke-width="2" />
+<text x="390" y="645.0" font-family="Droid Sans Fallback, sans-serif" font-size="24" font-weight="400" text-anchor="middle" fill="#23343D">内部精确最近点满足：</text>
+<text x="390" y="695.0" font-family="Droid Sans Fallback, sans-serif" font-size="28" font-weight="400" text-anchor="middle" fill="#23343D">[h(s*) − p] · t(s*) = 0</text>
+<text x="1190" y="170.0" font-family="Droid Sans Fallback, sans-serif" font-size="27" font-weight="700" text-anchor="middle" fill="#23343D">Measurement refit：曲线与平面求交</text>
+<path d="M940 560 L1050 300 L1460 350 L1350 610 Z" fill="#EDF0FA" stroke="#9CADB4" stroke-width="2" />
+<path d="M900 650 C1080 600 1000 500 1180 450 S1350 280 1490 240" fill="none" stroke="#344A9B" stroke-width="4" />
+<circle cx="1180" cy="450" r="7" fill="#344A9B"/>
+<text x="1280" y="475.0" font-family="Droid Sans Fallback, sans-serif" font-size="25" font-weight="400" text-anchor="middle" fill="#23343D">交点 h(s<tspan baseline-shift="super" font-size="70%">∩</tspan>)</text>
+<circle cx="1070" cy="490" r="7" fill="#53616D"/>
+<text x="1035" y="530.0" font-family="Droid Sans Fallback, sans-serif" font-size="23" font-weight="400" text-anchor="middle" fill="#23343D">中心 c</text>
+<path d="M1070,490 L1010,210" fill="none" stroke="#9A7134" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<text x="985" y="220.0" font-family="Droid Sans Fallback, sans-serif" font-size="25" font-weight="400" text-anchor="middle" fill="#23343D">法向 n</text>
+<text x="1190" y="695.0" font-family="Droid Sans Fallback, sans-serif" font-size="28" font-weight="400" text-anchor="middle" fill="#23343D">[h(s<tspan baseline-shift="super" font-size="70%">∩</tspan>) − c] · n = 0</text>
+<rect x="190" y="755" width="1220" height="65" rx="12" fill="#E8F3F1" stroke="#62777F" stroke-width="2"/>
+<text x="800.0" y="795.82" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#23343D">最近点约束是距离驻点条件；求交约束是预测点位于测量平面</text></svg>

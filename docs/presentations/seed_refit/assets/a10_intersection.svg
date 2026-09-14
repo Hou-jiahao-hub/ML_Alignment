@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="850" viewBox="0 0 1600 850">
+<defs><marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8 Z" fill="#53616D"/></marker></defs>
+<rect width="100%" height="100%" fill="white"/>
+<text x="65" y="58.0" font-family="Droid Sans Fallback, sans-serif" font-size="34" font-weight="700" text-anchor="start" fill="#23343D">从全局交点到局部测量预测</text>
+<text x="65" y="98.0" font-family="Droid Sans Fallback, sans-serif" font-size="22" font-weight="400" text-anchor="start" fill="#53616D">几何固定；R 将局部坐标映射到全局，Rᵀ 用于逆变换</text>
+<path d="M140 580 L300 260 L760 350 L600 670 Z" fill="#EDF0FA" stroke="#9CADB4" stroke-width="2" />
+<path d="M85 650 C260 630 230 500 440 450 S690 210 810 240" fill="none" stroke="#344A9B" stroke-width="4" />
+<circle cx="440" cy="450" r="7" fill="#344A9B"/>
+<text x="520" y="475.0" font-family="Droid Sans Fallback, sans-serif" font-size="25" font-weight="400" text-anchor="middle" fill="#23343D">全局交点</text>
+<circle cx="335" cy="470" r="7" fill="#287A6D"/>
+<text x="285" y="510.0" font-family="Droid Sans Fallback, sans-serif" font-size="24" font-weight="400" text-anchor="middle" fill="#23343D">中心 c</text>
+<path d="M335,470 L595,525" fill="none" stroke="#53616D" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<text x="650" y="548.0" font-family="Droid Sans Fallback, sans-serif" font-size="24" font-weight="400" text-anchor="middle" fill="#23343D">LOC0</text>
+<path d="M335,470 L405,330" fill="none" stroke="#53616D" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<text x="440" y="310.0" font-family="Droid Sans Fallback, sans-serif" font-size="24" font-weight="400" text-anchor="middle" fill="#23343D">LOC1</text>
+<path d="M335,470 L250,185" fill="none" stroke="#9A7134" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<text x="203" y="190.0" font-family="Droid Sans Fallback, sans-serif" font-size="25" font-weight="400" text-anchor="middle" fill="#23343D">法向 n</text>
+<rect x="900" y="190" width="600" height="115" rx="12" fill="#EDF0FA" stroke="#62777F" stroke-width="2"/>
+<text x="1200.0" y="237.375" font-family="Droid Sans Fallback, sans-serif" font-size="25" font-weight="400" text-anchor="middle" fill="#23343D">① 平面求交</text>
+<text x="1200.0" y="273.625" font-family="Droid Sans Fallback, sans-serif" font-size="25" font-weight="400" text-anchor="middle" fill="#23343D">得到 h(η, s<tspan baseline-shift="super" font-size="70%">∩</tspan>)</text>
+<rect x="900" y="365" width="600" height="115" rx="12" fill="#EDF0FA" stroke="#62777F" stroke-width="2"/>
+<text x="1200.0" y="412.375" font-family="Droid Sans Fallback, sans-serif" font-size="25" font-weight="400" text-anchor="middle" fill="#23343D">② 局部变换</text>
+<text x="1200.0" y="448.625" font-family="Droid Sans Fallback, sans-serif" font-size="25" font-weight="400" text-anchor="middle" fill="#23343D">Rᵀ [h(η, s<tspan baseline-shift="super" font-size="70%">∩</tspan>) − c]</text>
+<rect x="900" y="540" width="600" height="115" rx="12" fill="#EDF0FA" stroke="#62777F" stroke-width="2"/>
+<text x="1200.0" y="587.375" font-family="Droid Sans Fallback, sans-serif" font-size="25" font-weight="400" text-anchor="middle" fill="#23343D">③ 提取 LOC0 / 有效 LOC1</text>
+<text x="1200.0" y="623.625" font-family="Droid Sans Fallback, sans-serif" font-size="25" font-weight="400" text-anchor="middle" fill="#23343D">测量减预测，再按方差标准化</text>
+<path d="M1200,305 L1200,365" fill="none" stroke="#53616D" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<path d="M1200,480 L1200,540" fill="none" stroke="#53616D" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<rect x="180" y="735" width="1240" height="75" rx="12" fill="#FAF0D9" stroke="#62777F" stroke-width="2"/>
+<text x="800.0" y="780.82" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#23343D">求交有效性 ≠ 传感器有限边界检查；无效分量通过 mask 排除</text></svg>

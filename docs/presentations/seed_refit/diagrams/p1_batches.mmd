@@ -1,0 +1,8 @@
+flowchart LR
+ A["逐 hit 数据"] --> B["按 event / track 分组"]
+ B --> C["标记目标层与非目标层"]
+ C --> D{"满足径迹筛选？"}
+ D -->|是| E["padding 与有效性 masks"]
+ D -->|否| X["不纳入批次"]
+ E --> F["非目标层：seed / refit"]
+ E --> G["目标层：后续几何优化"]

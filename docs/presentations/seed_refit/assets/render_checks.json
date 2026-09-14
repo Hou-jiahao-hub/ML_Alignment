@@ -1,0 +1,101 @@
+[
+  {
+    "file": "a10_intersection.svg",
+    "viewBox": {
+      "w": 1600,
+      "h": 850
+    },
+    "width_px": 3840,
+    "text_outside_canvas": []
+  },
+  {
+    "file": "a6_closest_vs_intersection.svg",
+    "viewBox": {
+      "w": 1600,
+      "h": 850
+    },
+    "width_px": 3840,
+    "text_outside_canvas": []
+  },
+  {
+    "file": "p1_batches.svg",
+    "viewBox": {
+      "w": 1756.203125,
+      "h": 307.25
+    },
+    "width_px": 3840,
+    "text_outside_canvas": []
+  },
+  {
+    "file": "p2_gauge.svg",
+    "viewBox": {
+      "w": 1600,
+      "h": 850
+    },
+    "width_px": 3840,
+    "text_outside_canvas": []
+  },
+  {
+    "file": "p2_parameters.svg",
+    "viewBox": {
+      "w": 1420,
+      "h": 151
+    },
+    "width_px": 3840,
+    "text_outside_canvas": []
+  },
+  {
+    "file": "p3_seed.svg",
+    "viewBox": {
+      "w": 1600,
+      "h": 1000
+    },
+    "width_px": 3840,
+    "text_outside_canvas": []
+  },
+  {
+    "file": "p3_seed_detailed.svg",
+    "viewBox": {
+      "w": 794.390625,
+      "h": 2635
+    },
+    "width_px": 3840,
+    "text_outside_canvas": []
+  },
+  {
+    "file": "p4_refit.svg",
+    "viewBox": {
+      "w": 1600,
+      "h": 1000
+    },
+    "width_px": 3840,
+    "text_outside_canvas": []
+  },
+  {
+    "file": "p4_refit_detailed.svg",
+    "viewBox": {
+      "w": 834.96875,
+      "h": 2594.171875
+    },
+    "width_px": 3840,
+    "text_outside_canvas": []
+  },
+  {
+    "file": "p5_gate.svg",
+    "viewBox": {
+      "w": 1223,
+      "h": 294
+    },
+    "width_px": 3840,
+    "text_outside_canvas": []
+  },
+  {
+    "file": "p6_output.svg",
+    "viewBox": {
+      "w": 1386.15625,
+      "h": 222
+    },
+    "width_px": 3840,
+    "text_outside_canvas": []
+  }
+]
