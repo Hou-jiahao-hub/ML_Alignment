@@ -206,6 +206,19 @@ def test_hit_quality_engine_is_loaded_only_when_enabled():
     assert "alignment_experiments" in sys.modules
 
 
+def test_historical_hit_weight_constants_are_lazy_compatibility_exports():
+    sys.modules.pop("alignment_experiments", None)
+    m = load_module()
+    assert "alignment_experiments" not in sys.modules
+
+    assert m.HIT_WEIGHT_FLOOR == 0.3
+    assert m.HIT_QUALITY_INPUT_SIZE == 9
+    assert m.HIT_QUALITY_HIDDEN_ONE == 32
+    assert m.HIT_QUALITY_HIDDEN_TWO == 16
+    assert m.HIT_QUALITY_OUTPUT_SIZE == 1
+    assert "alignment_experiments" in sys.modules
+
+
 def test_normalize_hit_weights_semantics_are_untouched():
     """No all-ones short circuit was introduced: float64 keeps its 1e-12 offset."""
     m = load_module()

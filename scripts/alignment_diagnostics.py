@@ -255,4 +255,3 @@ def validate_against_truth(transforms_list, predicted_deltas, nominal_json,
                   f"|err|rms={np.sqrt(((p-t)**2).mean()):.4f}{unit}")
         metrics[(vol, lay)] = layer_metrics
     return metrics
-

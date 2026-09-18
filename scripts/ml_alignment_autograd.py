@@ -3058,7 +3058,15 @@ def alignment_config_from_args(a):
 
 def __getattr__(name):
     """Lazily preserve imports of historical experiment-only helpers."""
-    if name in {"JointBestCheckpoint", "joint_checkpoint_score"}:
+    if name in {
+        "HIT_QUALITY_HIDDEN_ONE",
+        "HIT_QUALITY_HIDDEN_TWO",
+        "HIT_QUALITY_INPUT_SIZE",
+        "HIT_QUALITY_OUTPUT_SIZE",
+        "HIT_WEIGHT_FLOOR",
+        "JointBestCheckpoint",
+        "joint_checkpoint_score",
+    }:
         value = getattr(_load_alignment_experiments(), name)
         globals()[name] = value
         return value

@@ -387,6 +387,41 @@ def measurement_residual_jacobian(
     )
 
 
+def _require_well_constrained_measurement_rows(
+    parameters: torch.Tensor,
+    inputs: MeasurementFitInputs,
+    jacobian: torch.Tensor,
+    stage: str,
+) -> None:
+    """Reject rows for which LM damping would manufacture a false solution."""
+    finite_jacobian = torch.isfinite(jacobian).all(dim=(1, 2))
+    if not bool(finite_jacobian.all()):
+        count = int((~finite_jacobian).sum())
+        raise FloatingPointError(
+            f"Non-finite {stage} measurement Jacobian on {count} rows."
+        )
+
+    _local, intersection_valid = measurement_local_prediction(parameters, inputs)
+    active = inputs.component_mask & intersection_valid.unsqueeze(-1)
+    active_count = active.sum(dim=(1, 2))
+    no_valid = active_count == 0
+    if bool(no_valid.any()):
+        raise ValueError(
+            f"{stage.capitalize()} measurement fit has {int(no_valid.sum())} rows "
+            "with no valid measurement components."
+        )
+
+    n_parameters = jacobian.shape[-1]
+    rank = torch.linalg.matrix_rank(jacobian)
+    underconstrained = (active_count < n_parameters) | (rank < n_parameters)
+    if bool(underconstrained.any()):
+        raise ValueError(
+            f"{stage.capitalize()} measurement fit has "
+            f"{int(underconstrained.sum())} underconstrained rows; each row "
+            f"requires rank {n_parameters} in the unregularized Jacobian."
+        )
+
+
 def damped_gauss_newton(
     theta: torch.Tensor,
     residual_of: Callable[[torch.Tensor], torch.Tensor],
@@ -543,6 +578,10 @@ def _fit_helix_measurements_gauss_newton_block(
     current = 0.5 * residual_of(theta).square().sum(dim=1)
     if not torch.isfinite(current).all():
         raise FloatingPointError("Non-finite initial Gauss-Newton objective.")
+    initial_jacobian = jacobian_of(theta)
+    _require_well_constrained_measurement_rows(
+        initial, inputs, initial_jacobian, "initial"
+    )
     initial_objective = float(current.mean())
     identity = torch.eye(theta.shape[1], dtype=theta.dtype, device=theta.device)
     level = torch.full(
@@ -556,7 +595,7 @@ def _fit_helix_measurements_gauss_newton_block(
     change = 0.0
     gradient = torch.zeros_like(theta)
     for iterations in range(1, max_iters + 1):
-        jacobian = jacobian_of(theta)
+        jacobian = initial_jacobian if iterations == 1 else jacobian_of(theta)
         residual = residual_of(theta)
         hessian = jacobian.transpose(1, 2) @ jacobian
         gradient = (
@@ -661,6 +700,9 @@ def measurement_newton_decrement(
         theta = pack_gauge_fixed_track_parameters(block_parameters)
         residual = measurement_standardized_residual(theta, frame, block_inputs)
         jacobian = measurement_residual_jacobian(theta, frame, block_inputs)
+        _require_well_constrained_measurement_rows(
+            block_parameters, block_inputs, jacobian, "stationarity"
+        )
         hessian = jacobian.transpose(1, 2) @ jacobian
         gradient = (
             jacobian.transpose(1, 2) @ residual.unsqueeze(-1)

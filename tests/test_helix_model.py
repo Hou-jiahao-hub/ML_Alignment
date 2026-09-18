@@ -162,6 +162,53 @@ def test_measurement_fit_rejects_non_finite_residuals():
         model.fit_helix_measurements_gauss_newton(seed, invalid)
 
 
+def test_measurement_fit_rejects_a_row_without_valid_intersections():
+    """An all-masked-by-geometry row must not masquerade as a zero residual."""
+    model = importlib.import_module("scripts.helix_model")
+    dtype = torch.float64
+    seed = torch.tensor(
+        [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=dtype
+    )
+    rotations = torch.tensor(
+        [[[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]]],
+        dtype=dtype,
+    ).reshape(1, 1, 3, 3)
+    inputs = model.MeasurementFitInputs(
+        measured=torch.zeros((1, 1, 2), dtype=dtype),
+        variance=torch.ones((1, 1, 2), dtype=dtype),
+        component_mask=torch.ones((1, 1, 2), dtype=torch.bool),
+        centers=torch.tensor([[[0.0, 5.0, 0.0]]], dtype=dtype),
+        rotations=rotations,
+    )
+
+    with pytest.raises(ValueError, match="no valid measurement components"):
+        model.fit_helix_measurements_gauss_newton(seed, inputs)
+
+
+def test_measurement_fit_rejects_an_underconstrained_row():
+    """LM damping must not turn a rank-one row into a reported solution."""
+    model = importlib.import_module("scripts.helix_model")
+    dtype = torch.float64
+    seed = torch.tensor(
+        [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=dtype
+    )
+    inputs = model.MeasurementFitInputs(
+        measured=torch.zeros((1, 1, 2), dtype=dtype),
+        variance=torch.ones((1, 1, 2), dtype=dtype),
+        component_mask=torch.tensor([[[True, False]]]),
+        centers=torch.tensor([[[10.0, 0.0, 0.0]]], dtype=dtype),
+        rotations=torch.tensor(
+            [[[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]],
+            dtype=dtype,
+        ).reshape(1, 1, 3, 3),
+    )
+
+    with pytest.raises(ValueError, match="underconstrained"):
+        model.fit_helix_measurements_gauss_newton(seed, inputs)
+    with pytest.raises(ValueError, match="underconstrained"):
+        model.measurement_newton_decrement(seed, inputs)
+
+
 def test_shared_closest_point_and_plane_intersection_report_invalid_paths():
     model = importlib.import_module("scripts.helix_model")
     track = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float64)
