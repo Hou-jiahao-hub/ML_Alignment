@@ -24,30 +24,50 @@ from alignment_artifact_layout import (
 )
 from project_config import absolute_project_path, add_config_argument
 try:
+    from .alignment_diagnostics import (
+        print_per_layer_residual_diagnostics,
+        print_target_residual_stats,
+        validate_against_truth,
+    )
+except ImportError:  # Direct script execution.
+    from alignment_diagnostics import (
+        print_per_layer_residual_diagnostics,
+        print_target_residual_stats,
+        validate_against_truth,
+    )
+try:
     from .helix_model import (
         CURVATURE_SCALE,
+        MeasurementFitInputs,
         S_MAX,
         accept_newton_candidate,
         assemble_track_parameters as assemble_joint_track_parameters,
         closest_helix_points,
         fit_helix_points_gauss_newton,
+        fit_helix_measurements_gauss_newton,
         helix_point,
         helix_tangent,
         intersect_plane,
+        measurement_newton_decrement,
+        measurement_stationarity_report,
         require_stationary_helix_point_fit,
         split_track_parameters as split_joint_track_parameters,
     )
 except ImportError:  # Direct script execution.
     from helix_model import (
         CURVATURE_SCALE,
+        MeasurementFitInputs,
         S_MAX,
         accept_newton_candidate,
         assemble_track_parameters as assemble_joint_track_parameters,
         closest_helix_points,
         fit_helix_points_gauss_newton,
+        fit_helix_measurements_gauss_newton,
         helix_point,
         helix_tangent,
         intersect_plane,
+        measurement_newton_decrement,
+        measurement_stationarity_report,
         require_stationary_helix_point_fit,
         split_track_parameters as split_joint_track_parameters,
     )
@@ -177,14 +197,6 @@ BLOCK_LM_BOUND_ATOL = 1.0e-12
 MEASUREMENT_REFIT_LR_POSITION = 1e-3
 MEASUREMENT_REFIT_LR_DIRECTION = 1e-5
 MEASUREMENT_REFIT_LR_RHO_SCALED = 1e-3
-# EXPERIMENTAL: hit-quality weighting is temporarily disabled; no caller sets
-# use_hit_weights=True.  Kept so the experiment can be restarted.
-HIT_WEIGHT_FLOOR = 0.3
-HIT_QUALITY_INPUT_SIZE = 9
-HIT_QUALITY_HIDDEN_ONE = 32
-HIT_QUALITY_HIDDEN_TWO = 16
-HIT_QUALITY_OUTPUT_SIZE = 1
-
 @dataclass
 class AlignmentInputs:
     hit_sensor_ids: torch.Tensor
@@ -307,36 +319,6 @@ class AlignmentRunConfig:
     joint_refit_stationarity: bool = True
 
 
-class JointBestCheckpoint:
-    """Track and restore the lowest evaluated joint objective."""
-
-    def __init__(self, parameters, patience=0, min_delta=0.0):
-        self.parameters = tuple(parameters)
-        self.patience = int(patience)
-        self.min_delta = float(min_delta)
-        self.best_loss = float("inf")
-        self.best_iteration = -1
-        self._state = None
-
-    def observe(self, loss, iteration):
-        loss = float(loss)
-        if loss < self.best_loss - self.min_delta:
-            self.best_loss = loss
-            self.best_iteration = int(iteration)
-            self._state = tuple(parameter.detach().clone() for parameter in self.parameters)
-        return (
-            self.patience > 0
-            and self._state is not None
-            and int(iteration) - self.best_iteration >= self.patience
-        )
-
-    def restore(self):
-        if self._state is None:
-            raise RuntimeError("No joint checkpoint has been observed.")
-        with torch.no_grad():
-            for parameter, value in zip(self.parameters, self._state):
-                parameter.copy_(value)
-
 
 def clamp_parameter_and_reset_adam(parameter, lower, upper, optimizer):
     """Clamp a parameter and clear Adam moments for entries that hit a bound."""
@@ -350,12 +332,6 @@ def clamp_parameter_and_reset_adam(parameter, lower, upper, optimizer):
                 moment.masked_fill_(saturated, 0.0)
     return saturated
 
-
-def joint_checkpoint_score(total_loss, invalid_fraction, max_invalid_fraction):
-    """Reject checkpoints that reduce loss by dropping too many intersections."""
-    if float(invalid_fraction) > float(max_invalid_fraction):
-        return float("inf")
-    return float(total_loss)
 
 
 def summarize_joint_layer_chi2(
@@ -650,75 +626,25 @@ def _measurement_refit_objective(
     return loss, invalid_fraction, component_mask
 
 
-#: Prediction mode for batches built only to be measured, never fitted.  Gate 4
-#: selects rows by ``prediction_mode`` equality against ``PREDICTION_MODES``, so a
-#: value outside that tuple selects nothing rather than letting a placeholder row
-#: reach a physics result.
-DIAGNOSTIC_PREDICTION_MODE = "joint-refit-diagnostic"
-
-
-def _load_validation_module():
-    """Import ``validate_helix_model`` lazily.
-
-    It is a 4000-line entry point; importing it at module scope would make every
-    autograd run pay for the Gate 4 machinery.  Nothing runs at its import time
-    beyond constants and one ``vmap`` construction, and it does not import this
-    module, so there is no cycle.
-    """
-    try:
-        from . import validate_helix_model
-    except ImportError:  # Direct script execution.
-        import validate_helix_model
-    return validate_helix_model
-
-
-def _validation_batches_from_joint(batches, validation):
-    """Re-label joint batches as the validation module's ``TrackBatches``.
-
-    Both modules carry the same measurements under different field names
-    (``covariances``/``loc1_mask`` here, ``measurement_variance``/``loc1_valid``
-    there).  Building the real dataclass instead of duck-typing means a field
-    added on either side fails loudly here rather than silently reading a
-    placeholder.
-
-    ``holdout_mask`` has no meaning during joint initialization -- nothing is held
-    out.  ``newton_decrement`` reads none of the ``holdout_*`` inputs, so the first
-    fitted hit stands in, and ``prediction_mode`` carries the diagnostic sentinel
-    so this object cannot contribute rows to a Gate 4 verdict.
-    """
+def _measurement_fit_inputs_from_joint(batches, geometry, parameters):
+    """Build the ACTS-independent single-helix measurement-fit tensors."""
     fit_mask = _non_target_fit_mask(batches)
-    n_rows = fit_mask.shape[0]
     if not bool(fit_mask.any(dim=1).all()):
         raise ValueError("Every joint track needs at least one non-target hit.")
-    holdout_mask = torch.zeros_like(fit_mask)
-    holdout_mask[
-        torch.arange(n_rows, device=fit_mask.device),
-        fit_mask.to(torch.int64).argmax(dim=1),
-    ] = True
-    real_dtype = batches.measured_local.dtype
-    zeros_long = torch.zeros(n_rows, dtype=torch.long)
-    zeros_real = torch.zeros(n_rows, dtype=real_dtype)
-    return validation.TrackBatches(
-        measured_local=batches.measured_local,
-        measurement_variance=batches.covariances,
-        loc1_valid=batches.loc1_mask,
-        smt_local=torch.zeros_like(batches.measured_local),
-        sensor_idx=batches.sensor_idx,
-        hit_mask=batches.hit_mask,
-        fit_mask=fit_mask,
-        holdout_mask=holdout_mask,
-        g_smt=batches.g_smt,
-        p_smt=batches.p_smt,
-        volume_id=batches.volume_id,
-        layer_id=batches.layer_id,
-        module_id=torch.zeros_like(batches.volume_id),
-        event_track_ids=batches.event_track_ids,
-        fit_span=batches.fit_span if batches.fit_span is not None else zeros_real,
-        prediction_mode=(DIAGNOSTIC_PREDICTION_MODE,) * n_rows,
-        context_hits_before=zeros_long,
-        context_hits_after=zeros_long,
-        nearest_context_distance=zeros_real,
-        farthest_context_distance=zeros_real,
+    device = parameters.device
+    dtype = parameters.dtype
+    sensor_idx = batches.sensor_idx.to(device=device)
+    centers = geometry.centers.to(device=device, dtype=dtype)[sensor_idx]
+    rotations = geometry.rotations.to(device=device, dtype=dtype)[sensor_idx]
+    fit_mask = fit_mask.to(device=device)
+    loc1_mask = batches.loc1_mask.to(device=device)
+    component_mask = torch.stack((fit_mask, fit_mask & loc1_mask), dim=-1)
+    return MeasurementFitInputs(
+        measured=batches.measured_local.to(device=device, dtype=dtype),
+        variance=batches.covariances.to(device=device, dtype=dtype),
+        component_mask=component_mask,
+        centers=centers,
+        rotations=rotations,
     )
 
 
@@ -734,22 +660,26 @@ def measure_joint_refit_stationarity(
     Turns "the optimiser may have stopped on budget" into a number.  Measurement
     only: it reads the parameters and never changes them.
 
-    Deliberately routed through the validation module's ``newton_decrement`` so
-    this and the Gate 4 single arm cannot drift apart, and so the value lands in
-    the pre-registered ``F = 0.5 * chi2`` gauge that ``NEWTON_DECREMENT_STATIONARY``
-    was set in.  ``_measurement_refit_objective`` divides by the component count,
-    which would scale every decrement by that factor -- order 1e-5 on a real run --
-    and make the threshold meaningless.
+    The shared helix model evaluates the unnormalised ``F = 0.5 * chi2`` gauge.
+    ``_measurement_refit_objective`` divides by the component count, which would
+    scale every decrement and make the pre-registered threshold meaningless.
 
     Runs in float64 on the CPU by default: a decrement compared against 1e-6 is
     below float32 resolution.
     """
-    validation = _load_validation_module()
-    measured = _validation_batches_from_joint(batches, validation)
-    decrement = validation.measurement_newton_decrement(
-        measured, geometry, parameters, device=device, dtype=dtype
+    measured = _measurement_fit_inputs_from_joint(batches, geometry, parameters)
+    decrement = measurement_newton_decrement(
+        parameters, measured, device=device, dtype=dtype
     )
-    return validation.stationarity_report(decrement)
+    return measurement_stationarity_report(decrement)
+
+
+def _load_alignment_experiments():
+    try:
+        from . import alignment_experiments
+    except ImportError:  # Direct script execution.
+        import alignment_experiments
+    return alignment_experiments
 
 
 def _refit_helices_adam(
@@ -763,108 +693,40 @@ def _refit_helices_adam(
     lr_rho_scaled,
     initial_loss,
 ):
-    """The first-order refit, kept reachable so pre-Iteration-19 runs reproduce.
+    """Load the historical first-order refit only when explicitly requested."""
+    import sys
 
-    Iteration 18 measured what it actually delivers: after the full 200-iteration
-    budget the Newton decrement p90 is 4.17e5 against a 1e-6 threshold, so this is
-    a truncated descent, not a minimum.  Nothing in it changed with the swap.
-    """
-    linear_initial, rho_initial = split_joint_track_parameters(initial)
-    position = nn.Parameter(linear_initial[:, :3].clone())
-    direction = nn.Parameter(linear_initial[:, 3:].clone())
-    rho_scaled = nn.Parameter(rho_initial.clone())
-    optimizer = optim.Adam(
-        (
-            {"params": [position], "lr": lr_position},
-            {"params": [direction], "lr": lr_direction},
-            {"params": [rho_scaled], "lr": lr_rho_scaled},
-        )
+    experiments = _load_alignment_experiments()
+    return experiments.refit_helices_adam(
+        sys.modules[__name__],
+        batches,
+        geometry,
+        initial,
+        n_iter,
+        max_invalid_fraction,
+        lr_position,
+        lr_direction,
+        lr_rho_scaled,
+        initial_loss,
     )
-    checkpoint = JointBestCheckpoint((position, direction, rho_scaled))
-    checkpoint.observe(initial_loss, iteration=-1)
-    first_step = None
-    for iteration in range(n_iter):
-        optimizer.zero_grad()
-        linear = torch.cat((position, direction), dim=1)
-        parameters = assemble_joint_track_parameters(linear, rho_scaled)
-        loss, invalid_fraction, component_mask = _measurement_refit_objective(
-            parameters, batches, geometry
-        )
-        if not component_mask.any():
-            raise ValueError("No valid non-target measurement components remain for helix refit.")
-        if not torch.isfinite(loss):
-            raise FloatingPointError("Non-finite non-target measurement helix loss.")
-        loss.backward()
-        before = (
-            position.detach().clone(),
-            direction.detach().clone(),
-            rho_scaled.detach().clone(),
-        )
-        gradient_norms = {
-            "position": float(position.grad.norm().detach().cpu()),
-            "direction": float(direction.grad.norm().detach().cpu()),
-            "rho_scaled": float(rho_scaled.grad.norm().detach().cpu()),
-        }
-        optimizer.step()
-        with torch.no_grad():
-            evaluated = assemble_joint_track_parameters(
-                torch.cat((position, direction), dim=1), rho_scaled
-            )
-            evaluated_loss, evaluated_invalid, _evaluated_mask = _measurement_refit_objective(
-                evaluated, batches, geometry
-            )
-        evaluated_value = joint_checkpoint_score(
-            float(evaluated_loss.cpu()), evaluated_invalid, max_invalid_fraction
-        )
-        if iteration == 0:
-            updates = (
-                position.detach() - before[0],
-                direction.detach() - before[1],
-                rho_scaled.detach() - before[2],
-            )
-            names = ("position", "direction", "rho_scaled")
-            first_step = {
-                "loss_before": float(loss.detach().cpu()),
-                "loss_after": float(evaluated_loss.cpu()),
-                "invalid_fraction_after": evaluated_invalid,
-                "gradient_norms": gradient_norms,
-                "update_rms": {
-                    name: float(torch.sqrt(torch.mean(update.square())).cpu())
-                    for name, update in zip(names, updates, strict=True)
-                },
-                "update_max": {
-                    name: float(update.abs().max().cpu())
-                    for name, update in zip(names, updates, strict=True)
-                },
-            }
-        checkpoint.observe(evaluated_value, iteration=iteration)
-    checkpoint.restore()
-    fitted = assemble_joint_track_parameters(
-        torch.cat((position, direction), dim=1), rho_scaled
-    ).detach()
-    return fitted, {
-        "best_iteration": checkpoint.best_iteration,
-        "first_step": first_step,
-    }
 
 
 def _refit_helices_gauss_newton(batches, geometry, initial, device):
     """Solve the same objective, and refuse to return a solution that is not one.
 
-    Routed through the validation module's solver rather than a second
-    implementation, for the same reason the measurement was: the joint path and
-    the Gate 4 single arm cannot drift apart if there is only one solver.  The
-    adapter and the input preparation are the ones Iteration 18 already validated,
-    so the objective here is the one that was shown to agree bit-for-bit.
+    The production solver lives in ``helix_model`` and has no dependency on the
+    holdout-validation or broken-helix experiment entry points.
 
     Always float64.  The pre-registered stationarity threshold is 1e-6, which is
     below float32 resolution, and the joint pipeline runs float32 whenever it runs
     on the GPU.  The caller casts the result back to its own dtype.
     """
-    validation = _load_validation_module()
-    measured = _validation_batches_from_joint(batches, validation)
-    fitted, solver_stats = validation.fit_helices_gauss_newton(
-        measured, geometry, initial, device=device, dtype=torch.float64
+    measured = _measurement_fit_inputs_from_joint(batches, geometry, initial)
+    fitted, solver_stats = fit_helix_measurements_gauss_newton(
+        initial,
+        measured,
+        device=device,
+        dtype=torch.float64,
     )
     report = solver_stats["stationarity"]
     if report["n_non_finite"]:
@@ -1808,224 +1670,37 @@ def run_joint_alignment(
     active_dof=DEFAULT_ACTIVE_DOF,
     initial_track_params=None,
 ):
-    """Jointly optimize free per-track helices and target-surface alignment."""
-    use_cuda = bool(config.gpu and torch.cuda.is_available())
-    if config.gpu and not use_cuda:
-        print("  [warn] --gpu requested but CUDA is unavailable; using CPU float64.")
-    device = torch.device("cuda" if use_cuda else "cpu")
-    dtype = torch.float32 if use_cuda else torch.float64
-    torch.manual_seed(config.rng_seed)
-    np.random.seed(config.rng_seed)
-    if use_cuda:
-        torch.cuda.manual_seed_all(config.rng_seed)
+    """Lazily run the historical joint Adam experiment."""
+    import sys
 
-    if initial_track_params is None:
-        initial_track_params = seed_helices(batches, device=device, dtype=dtype)
-    initial_track_params = initial_track_params.to(device=device, dtype=dtype)
-    initial_linear, initial_rho_scaled = split_joint_track_parameters(initial_track_params)
-    track_linear = nn.Parameter(initial_linear.clone())
-    track_rho_scaled = nn.Parameter(initial_rho_scaled.clone())
-    n_surfaces = len(geometry.centers)
-    translation = nn.Parameter(torch.zeros((n_surfaces, 3), device=device, dtype=dtype))
-    rotation = nn.Parameter(torch.zeros((n_surfaces, 3), device=device, dtype=dtype))
-    dof_mask = torch.zeros(6, device=device, dtype=dtype)
-    dof_mask[list(active_dof)] = 1.0
-    target_mask = geometry.target_mask.to(device=device, dtype=dtype).unsqueeze(-1)
-    parameter_groups = [
-        {"params": [translation], "lr": config.joint_lr_trans},
-        {"params": [rotation], "lr": config.joint_lr_trans / config.rot_lr_scale},
-    ]
-    if not config.freeze_tracks:
-        parameter_groups[0:0] = [
-            {"params": [track_linear], "lr": config.joint_lr_track},
-            {"params": [track_rho_scaled], "lr": config.joint_lr_track},
-        ]
-    optimizer = optim.Adam(parameter_groups)
-    checkpoint = JointBestCheckpoint(
-        (track_linear, track_rho_scaled, translation, rotation),
-        patience=config.joint_patience,
-        min_delta=config.joint_min_delta,
+    return _load_alignment_experiments().run_joint_alignment(
+        sys.modules[__name__],
+        batches,
+        geometry,
+        config,
+        active_dof,
+        initial_track_params,
     )
-    history = []
-    checkpoint_history = []
-    invalid_history = []
-    n_tracks = len(track_linear)
-    batch_size = (
-        min(config.track_batch_size, n_tracks)
-        if config.track_batch_size > 0
-        else n_tracks
-    )
-    with torch.no_grad():
-        initial_tracks = assemble_joint_track_parameters(track_linear, track_rho_scaled)
-        initial_alignment = torch.zeros((n_surfaces, 6), device=device, dtype=dtype)
-        initial_residuals, _initial_covariance, initial_component_mask, _initial_valid = (
-            _joint_forward(initial_tracks, initial_alignment, batches, geometry)
-        )
-        initial_weighted = initial_residuals.square() / torch.clamp(
-            _initial_covariance, min=EPS_COVARIANCE
-        )
-        initial_total_loss = float((torch.sum(torch.where(
-            initial_component_mask, initial_weighted, torch.zeros_like(initial_weighted)
-        )) / initial_component_mask.sum().clamp(min=1)).cpu())
-        initial_invalid_fraction = 1.0 - float(
-            _initial_valid[batches.hit_mask.to(device)].float().mean().item()
-        )
-    initial_checkpoint_loss = joint_checkpoint_score(
-        initial_total_loss,
-        initial_invalid_fraction,
-        config.joint_max_invalid_fraction,
-    )
-    if not np.isfinite(initial_checkpoint_loss):
-        raise ValueError(
-            "Initial helix seed has too many invalid intersections for a safe checkpoint: "
-            f"{initial_invalid_fraction:.2%} > {config.joint_max_invalid_fraction:.2%}."
-        )
-    checkpoint.observe(initial_checkpoint_loss, iteration=-1)
-    checkpoint_history.append((-1, initial_total_loss))
 
-    if config.joint_iters < 1:
-        raise ValueError("joint_iters must be at least 1.")
-    checkpoint_interval = max(1, int(config.joint_checkpoint_interval))
-    last_total_loss = float("inf")
-    stopped_early = False
-    for iteration in range(config.joint_iters):
-        start = (iteration * batch_size) % n_tracks
-        track_indices = torch.arange(start, min(start + batch_size, n_tracks), device=device)
-        if len(track_indices) < batch_size:
-            track_indices = torch.cat((
-                track_indices,
-                torch.arange(0, batch_size - len(track_indices), device=device),
-            ))
-        optimizer.zero_grad()
-        track_parameters = assemble_joint_track_parameters(track_linear, track_rho_scaled)
-        alignment = torch.cat((translation, rotation), dim=1)
-        alignment = alignment * target_mask * dof_mask
-        residuals, covariance, component_mask, intersection_valid = _joint_forward(
-            track_parameters, alignment, batches, geometry, track_indices
-        )
-        weighted = residuals.square() / torch.clamp(covariance, min=EPS_COVARIANCE)
-        data_loss = torch.sum(torch.where(component_mask, weighted, torch.zeros_like(weighted)))
-        data_loss = data_loss / component_mask.sum().clamp(min=1)
-        l2 = config.lambda_l2 * alignment.square().sum()
-        loss = data_loss + l2
-        if not torch.isfinite(loss):
-            raise FloatingPointError(f"Non-finite joint loss at iteration {iteration}.")
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_([track_linear, track_rho_scaled, translation, rotation], max_norm=10.0)
-        optimizer.step()
-        with torch.no_grad():
-            translation.mul_(target_mask * dof_mask[:3])
-            rotation.mul_(target_mask * dof_mask[3:])
-        clamp_parameter_and_reset_adam(
-            translation, -config.joint_clamp_t, config.joint_clamp_t, optimizer
-        )
-        clamp_parameter_and_reset_adam(
-            rotation, -config.joint_clamp_r, config.joint_clamp_r, optimizer
-        )
-        invalid_fraction = 1.0 - float(
-            intersection_valid[batches.hit_mask.to(device)[track_indices]].float().mean().item()
-        )
-        history.append(float(data_loss.detach().cpu()))
-        invalid_history.append(invalid_fraction)
-        evaluate_checkpoint = (
-            iteration == 0
-            or (iteration + 1) % checkpoint_interval == 0
-            or iteration == config.joint_iters - 1
-        )
-        if evaluate_checkpoint:
-            with torch.no_grad():
-                evaluated_tracks = assemble_joint_track_parameters(track_linear, track_rho_scaled)
-                evaluated_alignment = torch.cat((translation, rotation), dim=1)
-                evaluated_alignment = evaluated_alignment * target_mask * dof_mask
-                evaluated_residuals, evaluated_covariance, evaluated_mask, evaluated_valid = _joint_forward(
-                    evaluated_tracks, evaluated_alignment, batches, geometry
-                )
-                evaluated_weighted = evaluated_residuals.square() / torch.clamp(
-                    evaluated_covariance, min=EPS_COVARIANCE
-                )
-                evaluated_data_loss = torch.sum(torch.where(
-                    evaluated_mask, evaluated_weighted, torch.zeros_like(evaluated_weighted)
-                )) / evaluated_mask.sum().clamp(min=1)
-                evaluated_total_loss = (
-                    evaluated_data_loss + config.lambda_l2 * evaluated_alignment.square().sum()
-                )
-                last_total_loss = float(evaluated_total_loss.cpu())
-                evaluated_invalid_fraction = 1.0 - float(
-                    evaluated_valid[batches.hit_mask.to(device)].float().mean().item()
-                )
-            checkpoint_loss = joint_checkpoint_score(
-                last_total_loss,
-                evaluated_invalid_fraction,
-                config.joint_max_invalid_fraction,
-            )
-            checkpoint_history.append((iteration, last_total_loss))
-            if checkpoint.observe(checkpoint_loss, iteration):
-                stopped_early = True
-                print(
-                    f"Joint early stop at iteration {iteration}; "
-                    f"best={checkpoint.best_loss:.4f} at iteration {checkpoint.best_iteration}."
-                )
-                break
-        if iteration % 100 == 0 or iteration == config.joint_iters - 1:
-            warning = " WARNING: >5%" if invalid_fraction > 0.05 else ""
-            print(
-                f"Joint [{iteration:04d}/{config.joint_iters}] chi2/component={history[-1]:.4f} "
-                f"invalid={invalid_fraction:.2%}{warning}"
-            )
-
-    checkpoint.restore()
-    with torch.no_grad():
-        track_parameters = assemble_joint_track_parameters(track_linear, track_rho_scaled)
-        predicted = torch.cat((translation, rotation), dim=1)
-        predicted = predicted * target_mask * dof_mask
-        final_residuals, _covariance, final_component_mask, _valid = _joint_forward(
-            track_parameters, predicted, batches, geometry
-        )
-        final_invalid_fraction = 1.0 - float(
-            _valid[batches.hit_mask.to(device)].float().mean().cpu()
-        )
-    if final_invalid_fraction > config.joint_max_invalid_fraction:
-        raise ValueError(
-            "Best joint checkpoint exceeds the invalid-intersection limit: "
-            f"{final_invalid_fraction:.2%} > {config.joint_max_invalid_fraction:.2%}."
-        )
-    return {
-        "predicted_deltas": predicted.detach().cpu().double().numpy(),
-        "track_params": track_parameters.detach().cpu().double().numpy(),
-        "final_residuals": final_residuals.detach().cpu(),
-        "final_component_mask": final_component_mask.detach().cpu(),
-        "initial_residuals": initial_residuals.detach().cpu(),
-        "initial_component_mask": initial_component_mask.detach().cpu(),
-        "history": history,
-        "checkpoint_history": checkpoint_history,
-        "best_total_loss": checkpoint.best_loss,
-        "last_total_loss": last_total_loss,
-        "best_iteration": checkpoint.best_iteration,
-        "stopped_early": stopped_early,
-        "initial_total_loss": initial_total_loss,
-        "initial_invalid_fraction": initial_invalid_fraction,
-        "invalid_fraction": final_invalid_fraction,
-    }
 
 class AlignmentEngine(nn.Module):
+    """Production surface-alignment parameters with unweighted residuals."""
+
+    def __new__(cls, num_sensors, use_hit_weights=False):
+        if use_hit_weights:
+            import sys
+
+            experiments = _load_alignment_experiments()
+            return experiments.HitQualityAlignmentEngine(
+                sys.modules[__name__], num_sensors
+            )
+        return super().__new__(cls)
+
     def __init__(self, num_sensors, use_hit_weights=False):
         super().__init__()
         self.num_sensors = num_sensors
-        # EXPERIMENTAL: temporarily disabled; no caller sets use_hit_weights=True.
-        # The network and its feature chain are kept so the experiment can be
-        # restarted, but the disabled path must stay free of its cost.
-        self.use_hit_weights = use_hit_weights
-
+        self.use_hit_weights = False
         self.alignment_params = nn.Parameter(torch.zeros(num_sensors, 6))
-
-        if self.use_hit_weights:
-            self.hit_quality_net = nn.Sequential(
-                nn.Linear(HIT_QUALITY_INPUT_SIZE, HIT_QUALITY_HIDDEN_ONE),
-                nn.GELU(),
-                nn.Linear(HIT_QUALITY_HIDDEN_ONE, HIT_QUALITY_HIDDEN_TWO),
-                nn.GELU(),
-                nn.Linear(HIT_QUALITY_HIDDEN_TWO, HIT_QUALITY_OUTPUT_SIZE),
-            )
 
     def forward(
         self,
@@ -2038,11 +1713,7 @@ class AlignmentEngine(nn.Module):
         hit_global_positions,
         hit_directions,
     ):
-        """Return ``(residuals, hit_weights)`` as ``tuple[Tensor, Tensor | None]``.
-
-        ``hit_weights`` is ``None`` when the experimental weighting is disabled,
-        which selects the unweighted loss path instead of multiplying by ones.
-        """
+        del track_params, track_chi2_ndf
         residuals = compute_autograd_residuals(
             measured_local,
             hit_global_positions,
@@ -2052,36 +1723,14 @@ class AlignmentEngine(nn.Module):
             sensor_rotations,
             self.alignment_params,
         )
-        if not self.use_hit_weights:
-            return residuals, None
+        return residuals, None
 
-        # EXPERIMENTAL: only reachable with use_hit_weights=True.
-        hit_sensor_center_positions = sensor_center_positions[hit_sensor_ids]
-        advanced_features = torch.cat([track_params, hit_sensor_center_positions, track_chi2_ndf], dim=-1)
-        raw_logits = self.hit_quality_net(advanced_features)
-        hit_weights = HIT_WEIGHT_FLOOR + (1.0 - HIT_WEIGHT_FLOOR) * torch.sigmoid(raw_logits)
-        return residuals, hit_weights
 
 def normalize_hit_weights(hit_weights, hit_volume_ids=None, hit_layer_ids=None):
-    if hit_volume_ids is None and hit_layer_ids is None:
-        return hit_weights / (torch.mean(hit_weights) + EPS_WEIGHT)
-    if hit_volume_ids is None or hit_layer_ids is None:
-        raise ValueError("hit_volume_ids and hit_layer_ids must be provided together.")
-    if len(hit_weights) != len(hit_volume_ids) or len(hit_weights) != len(hit_layer_ids):
-        raise ValueError("Hit weight and layer identifier tensors must have matching lengths.")
-
-    volume_ids = hit_volume_ids.to(device=hit_weights.device)
-    layer_ids = hit_layer_ids.to(device=hit_weights.device)
-    layer_keys = torch.stack((volume_ids, layer_ids), dim=1)
-    unique_layers = torch.unique(layer_keys, dim=0)
-
-    normalized = torch.zeros_like(hit_weights)
-    for vol, lay in unique_layers:
-        layer_mask = (volume_ids == vol) & (layer_ids == lay)
-        layer_scale = torch.mean(hit_weights[layer_mask]) + EPS_WEIGHT
-        layer_weight = layer_mask.to(hit_weights.dtype).unsqueeze(-1)
-        normalized = normalized + layer_weight * (hit_weights / layer_scale)
-    return normalized
+    """Compatibility entry point for the historical weighting experiment."""
+    return _load_alignment_experiments().normalize_hit_weights(
+        hit_weights, hit_volume_ids, hit_layer_ids
+    )
 
 
 def physics_informed_residual_loss(
@@ -2092,19 +1741,26 @@ def physics_informed_residual_loss(
     hit_volume_ids=None,
     hit_layer_ids=None,
 ):
-    """``hit_weights=None`` selects the unweighted path (no normalisation)."""
-    raw_chi2 = (residuals ** 2) / torch.clamp(covariances, min=EPS_COVARIANCE)
-
-    if hit_weights is None:
-        weighted_chi2 = raw_chi2
-    else:
-        w_normalized = normalize_hit_weights(hit_weights, hit_volume_ids, hit_layer_ids)
-        weighted_chi2 = w_normalized * raw_chi2
-    if component_mask is None:
-        return torch.mean(weighted_chi2)
-    return torch.sum(torch.where(component_mask, weighted_chi2, torch.zeros_like(weighted_chi2))) / (
-        component_mask.sum().clamp(min=1)
+    """Compute production chi2, loading experimental weighting only on request."""
+    if hit_weights is not None:
+        return _load_alignment_experiments().weighted_residual_loss(
+            residuals,
+            covariances,
+            hit_weights,
+            EPS_COVARIANCE,
+            component_mask=component_mask,
+            hit_volume_ids=hit_volume_ids,
+            hit_layer_ids=hit_layer_ids,
+        )
+    raw_chi2 = residuals.square() / torch.clamp(
+        covariances, min=EPS_COVARIANCE
     )
+    if component_mask is None:
+        return torch.mean(raw_chi2)
+    return torch.sum(
+        torch.where(component_mask, raw_chi2, torch.zeros_like(raw_chi2))
+    ) / component_mask.sum().clamp(min=1)
+
 
 def load_geometry_from_json(filepath):
     with open(filepath, "r", encoding="utf-8") as f:
@@ -2673,221 +2329,6 @@ def combine_component_masks(hit_mask, initial_component_mask, final_component_ma
     final_only = hit_mask & ~initial_component_mask[..., 0] & final_component_mask[..., 0]
     return hit_valid, both[hit_valid], int(initial_only.sum()), int(final_only.sum())
 
-
-def _as_numpy(values):
-    """Detach torch tensors without forcing a dtype promotion.
-
-    Callers mix torch tensors and ndarrays; converting only some of them would
-    leave `ndarray & Tensor` mixed operations whose semantics depend on the
-    conversion rules.  No `dtype=` is passed: numpy's `float` is float64 and the
-    surface residuals are float32, so promoting here would change the reported
-    statistics.
-    """
-    if hasattr(values, "detach"):
-        values = values.detach().cpu()
-    return np.asarray(values)
-
-
-def _stat_pair(values):
-    """(mean, RMS) of a 1-D array, or (nan, nan) when it is empty.
-
-    RMS is sqrt(mean(x^2)) — not np.std.  A detector misalignment shows up as a
-    non-zero residual *mean*, which np.std subtracts away.
-    """
-    if values.size == 0:
-        return float("nan"), float("nan")
-    return float(np.mean(values)), float(np.sqrt(np.mean(values ** 2)))
-
-
-def _fmt_mm(value):
-    return "       N/A" if not np.isfinite(value) else f"{value:>9.4f}mm"
-
-
-def print_target_residual_stats(
-    initial_residuals, hit_volume_ids, hit_layer_ids, target_layers, loc1_valid=None
-):
-    res_np = _as_numpy(initial_residuals)
-    vols_np = _as_numpy(hit_volume_ids)
-    lays_np = _as_numpy(hit_layer_ids)
-    if loc1_valid is None:
-        loc1_np = np.ones(len(res_np), dtype=bool)
-    else:
-        loc1_np = _as_numpy(loc1_valid).astype(bool)
-
-    print("\n=== Target-layer ACTS KF-smoothed residuals before solve ===")
-    print(f"  {'Layer':<20}  {'N0':>8}  {'N1':>8}  {'mean LOC0':>12}  {'RMS LOC0':>10}"
-          f"  {'mean LOC1':>12}  {'RMS LOC1':>10}")
-    for vol, lay in parse_target_layers(target_layers):
-        mask = (vols_np == vol) & (lays_np == lay)
-        if mask.sum() == 0:
-            print(f"  vol={vol} lay={lay:<6}  no valid hits")
-            continue
-        mask1 = mask & loc1_np
-        mean0, rms0 = _stat_pair(res_np[mask, 0])
-        mean1, rms1 = _stat_pair(res_np[mask1, 1])
-        label = f"vol={vol} lay={lay}"
-        cell = lambda v, w: f"{'N/A':>{w}}" if not np.isfinite(v) else f"{v:>{w}.5f}"
-        print(f"  {label:<20}  {int(mask.sum()):>8}  {int(mask1.sum()):>8}  "
-              f"{cell(mean0, 12)}  {cell(rms0, 10)}  {cell(mean1, 12)}  {cell(rms1, 10)}")
-
-
-def print_per_layer_residual_diagnostics(
-    init_res_np, final_res, vols_np, lays_np, target_layers,
-    return_metrics=False,
-    component_mask=None,
-):
-    """Per-layer before/after residual tables.
-
-    ``component_mask`` is an ``(N, 2)`` boolean array marking which residual
-    components are real measurements.  Without it the zeros written into LOC1
-    for 1-D strip hits are averaged in and dilute the Y statistics.
-    New parameters are appended so existing positional calls keep working.
-    """
-    init_res_np = _as_numpy(init_res_np)
-    final_res = _as_numpy(final_res)
-    vols_np = _as_numpy(vols_np)
-    lays_np = _as_numpy(lays_np)
-
-    if init_res_np.shape != final_res.shape:
-        raise ValueError(
-            f"init_res_np shape {init_res_np.shape} != final_res shape {final_res.shape}"
-        )
-    if init_res_np.ndim != 2 or init_res_np.shape[1] != 2:
-        raise ValueError(f"residuals must have shape (N, 2), got {init_res_np.shape}")
-    for name, array in (("init_res_np", init_res_np), ("final_res", final_res)):
-        if not np.issubdtype(array.dtype, np.number):
-            raise ValueError(f"{name} must be numeric, got dtype {array.dtype}")
-    n_hits = init_res_np.shape[0]
-    if len(vols_np) != n_hits or len(lays_np) != n_hits:
-        raise ValueError(
-            f"vols_np ({len(vols_np)}) and lays_np ({len(lays_np)}) must both have "
-            f"length {n_hits}"
-        )
-
-    if component_mask is None:
-        component_mask = np.ones(init_res_np.shape, dtype=bool)
-    else:
-        component_mask = _as_numpy(component_mask).astype(bool)
-    if component_mask.shape != init_res_np.shape:
-        raise ValueError(
-            f"component_mask shape {component_mask.shape} != residual shape "
-            f"{init_res_np.shape}"
-        )
-
-    header = (f"  {'Layer':<20}  {'X_before':>10}  {'X_after':>10}"
-              f"  {'Y_before':>10}  {'Y_after':>10}")
-    metrics = {}
-    layer_masks = {}
-    for vol, lay in target_layers:
-        layer = (vols_np == vol) & (lays_np == lay)
-        layer_masks[(vol, lay)] = (layer & component_mask[:, 0], layer & component_mask[:, 1])
-
-    print("\n=== Per-layer residual mean (training data) ===")
-    print(header)
-    for vol, lay in target_layers:
-        mask0, mask1 = layer_masks[(vol, lay)]
-        n0, n1 = int(mask0.sum()), int(mask1.sum())
-        x_bef, rms_x_bef = _stat_pair(init_res_np[mask0, 0])
-        x_aft, rms_x_aft = _stat_pair(final_res[mask0, 0])
-        y_bef, rms_y_bef = _stat_pair(init_res_np[mask1, 1])
-        y_aft, rms_y_aft = _stat_pair(final_res[mask1, 1])
-        label = f"vol={vol} lay={lay} (n0={n0}, n1={n1})"
-        print(f"  {label:<28}  {_fmt_mm(x_bef)}  {_fmt_mm(x_aft)}"
-              f"  {_fmt_mm(y_bef)}  {_fmt_mm(y_aft)}")
-        metrics[(vol, lay)] = {
-            "n_hits": n0,          # retained alias for existing callers
-            "n_hits_loc0": n0,
-            "n_hits_loc1": n1,
-            "mean_before_loc0": x_bef, "mean_after_loc0": x_aft,
-            "mean_before_loc1": y_bef, "mean_after_loc1": y_aft,
-            "rms_before_loc0": rms_x_bef, "rms_after_loc0": rms_x_aft,
-            "rms_before_loc1": rms_y_bef, "rms_after_loc1": rms_y_aft,
-        }
-
-    print("\n=== Per-layer residual RMS (training data) ===")
-    print(header)
-    for vol, lay in target_layers:
-        entry = metrics[(vol, lay)]
-        label = f"vol={vol} lay={lay} (n0={entry['n_hits_loc0']}, n1={entry['n_hits_loc1']})"
-        print(f"  {label:<28}  {_fmt_mm(entry['rms_before_loc0'])}"
-              f"  {_fmt_mm(entry['rms_after_loc0'])}"
-              f"  {_fmt_mm(entry['rms_before_loc1'])}"
-              f"  {_fmt_mm(entry['rms_after_loc1'])}")
-    print()
-    return metrics if return_metrics else None
-
-def validate_against_truth(transforms_list, predicted_deltas, nominal_json,
-                           target_layers):
-    """Compare ML correction against the TRUE misalignment per sensor (Iteration 4).
-
-    The real ground truth: applying δα to the misaligned surface must recover the
-    nominal one.  In ml convention (new_c = c_mis + R_mis·δt, new_R = R_mis·Rδ):
-        δt_true  = R_misᵀ (c_nom - c_mis)        (local tx, ty, tz)
-        Rδ_true  = R_misᵀ R_nom                  → rz = atan2(Rδ[1,0], Rδ[0,0])
-    Reports per-DOF correlation + recovery fraction over each target layer; this is
-    the metric that actually decides whether the local signal is recoverable.
-    """
-    if not os.path.exists(nominal_json):
-        print(f"  [truth] nominal {nominal_json} not found — skipping.")
-        return {}
-    nom = {}
-    with open(nominal_json, "r", encoding="utf-8") as f:
-        nominal_data = json.load(f)
-    for it in nominal_data:
-        m = re.search(r"vol=(\d+)\|lay=(\d+)\|sen=(\d+)", it.get("ID", ""))
-        if m:
-            nom[tuple(map(int, m.groups()))] = (np.array(it["Translation"], float),
-                                                np.array(it["RotationMatrix"], float))
-    print("\n=== ML vs TRUE misalignment (local frame, per sensor) ===")
-    metrics = {}
-    for vol, lay in target_layers:
-        true_v, pred_v = [], []
-        for i, it in enumerate(transforms_list):
-            m = re.search(r"vol=(\d+)\|lay=(\d+)\|sen=(\d+)", it.get("ID", ""))
-            if not m:
-                continue
-            key = tuple(map(int, m.groups()))
-            if key[0] != vol or key[1] != lay or key not in nom:
-                continue
-            c_mis = np.array(it["Translation"], float); R_mis = np.array(it["RotationMatrix"], float)
-            c_nom, R_nom = nom[key]
-            dt_true = R_mis.T @ (c_nom - c_mis)
-            Rd = R_mis.T @ R_nom
-            rx_true, ry_true, rz_true = rotation_matrix_to_euler(Rd)
-            true_v.append([*dt_true, rx_true, ry_true, rz_true])
-            p = predicted_deltas[i]
-            pred_v.append(p[:6])
-        if not true_v:
-            continue
-        true_v = np.array(true_v); pred_v = np.array(pred_v)
-        names = ["tx", "ty", "tz", "rx", "ry", "rz"]
-        print(f"  vol={vol} lay={lay} (n={len(true_v)})")
-        layer_metrics = {}
-        for j, nm in enumerate(names):
-            t, p = true_v[:, j], pred_v[:, j]
-            corr = np.corrcoef(t, p)[0, 1] if np.std(t) > 0 and np.std(p) > 0 else float("nan")
-            recov = (p @ t) / (t @ t) if (t @ t) > 0 else float("nan")  # projection / recovery fraction
-            unit = "mm" if j < 3 else "rad"
-            layer_metrics[nm] = {
-                "corr": float(corr),
-                "recovery": float(recov),
-                "true_rms": float(np.sqrt((t ** 2).mean())),
-                "pred_rms": float(np.sqrt((p ** 2).mean())),
-                # RMS of the residual truth error, the quantity a candidate arm
-                # has to avoid making worse.  ``true_rms`` and ``pred_rms`` are
-                # magnitudes of the injection and of the correction; neither of
-                # them gets smaller when the answer gets better.  Point estimate
-                # only -- the interval comes from a paired bootstrap over
-                # sensors in scripts/analysis/compare_truth_rms.py.
-                "err_rms": float(np.sqrt(((p - t) ** 2).mean())),
-                "n_sensors": int(len(t)),
-                "unit": unit,
-            }
-            print(f"    {nm}: corr={corr:+.3f}  recovery={recov:+.3f}  "
-                  f"|true|rms={np.sqrt((t**2).mean()):.4f}{unit}  |pred|rms={np.sqrt((p**2).mean()):.4f}{unit}  "
-                  f"|err|rms={np.sqrt(((p-t)**2).mean()):.4f}{unit}")
-        metrics[(vol, lay)] = layer_metrics
-    return metrics
 
 
 def run_free_alignment_pipeline(config, target_layers, active_dof):
@@ -3613,6 +3054,15 @@ def alignment_config_from_args(a):
         joint_refit_stationarity=not a.no_joint_refit_stationarity,
         alignment_gain=a.alignment_gain,
     )
+
+
+def __getattr__(name):
+    """Lazily preserve imports of historical experiment-only helpers."""
+    if name in {"JointBestCheckpoint", "joint_checkpoint_score"}:
+        value = getattr(_load_alignment_experiments(), name)
+        globals()[name] = value
+        return value
+    raise AttributeError(name)
 
 
 if __name__ == "__main__":

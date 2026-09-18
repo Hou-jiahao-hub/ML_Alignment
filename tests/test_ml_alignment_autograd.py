@@ -23,6 +23,26 @@ def load_ml_alignment_autograd_module():
     return module
 
 
+def test_production_module_import_excludes_experiment_validation_and_acts():
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    code = (
+        "import sys, ml_alignment_autograd; "
+        "forbidden={'alignment_experiments','broken_helix_model',"
+        "'validate_helix_model','acts'}; "
+        "loaded={name.rsplit('.',1)[-1] for name in sys.modules}; "
+        "assert not (forbidden & loaded), forbidden & loaded"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=scripts,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
 def load_layout_module():
     module_path = Path(__file__).resolve().parents[1] / "scripts" / "alignment_artifact_layout.py"
     spec = importlib.util.spec_from_file_location("alignment_artifact_layout", module_path)
@@ -485,16 +505,14 @@ def build_synthetic_joint_case(m, n_tracks=4, n_hits=6, noise=0.02):
 
 
 def test_refit_stationarity_is_measured_in_the_half_chi2_gauge():
-    """The two modules must agree on the objective before the decrement means anything.
+    """The production objective and shared helix residual must use one gauge.
 
     ``_measurement_refit_objective`` divides by the component count while the
-    pre-registered ``NEWTON_DECREMENT_STATIONARY`` lives in ``F = 0.5 * chi2``.
-    Undoing that normalisation has to land exactly on the validation module's
-    standardized residual, or the reported decrement is off by the component
-    count and the threshold is meaningless.
+    pre-registered stationarity threshold lives in ``F = 0.5 * chi2``. Undoing
+    that normalisation has to land exactly on the shared standardized residual.
     """
     m = load_ml_alignment_autograd_module()
-    v = load_validate_helix_model_module()
+    h = importlib.import_module("helix_model")
     batches, geometry, _truth, seed = build_synthetic_joint_case(m)
 
     loss, _invalid, component_mask = m._measurement_refit_objective(
@@ -502,22 +520,11 @@ def test_refit_stationarity_is_measured_in_the_half_chi2_gauge():
     )
     autograd_half_chi2 = float(loss) * float(component_mask.sum()) / 2.0
 
-    validation_batches = m._validation_batches_from_joint(batches, v)
-    inputs = v._measurement_fit_inputs(validation_batches, geometry, seed)
-    no_kinks = inputs.node_s.new_zeros((seed.shape[0], 0, 2))
-    residual = v._standardized_residual(
-        v._pack_parameters(seed, no_kinks),
-        0,
-        v.reference_gauge_frame(seed),
-        inputs.node_s,
-        inputs.node_valid,
-        inputs.kink_sigma,
-        inputs.measured,
-        inputs.variance,
-        inputs.mask,
-        inputs.hit_s,
-        inputs.centers,
-        inputs.rotations,
+    inputs = m._measurement_fit_inputs_from_joint(batches, geometry, seed)
+    residual = h.measurement_standardized_residual(
+        h.pack_gauge_fixed_track_parameters(seed),
+        h.reference_gauge_frame(seed),
+        inputs,
     )
     validation_half_chi2 = float(0.5 * residual.square().sum())
 
@@ -525,35 +532,87 @@ def test_refit_stationarity_is_measured_in_the_half_chi2_gauge():
     assert abs(autograd_half_chi2 - validation_half_chi2) <= 1e-9 * validation_half_chi2
 
 
-def test_validation_batches_from_joint_relabels_without_reinterpreting():
+def test_joint_measurement_inputs_preserve_the_production_objective():
+    """Catch an adapter that changes masks, variances, or residual sign."""
     m = load_ml_alignment_autograd_module()
-    v = load_validate_helix_model_module()
-    batches, _geometry, _truth, _seed = build_synthetic_joint_case(m)
+    h = importlib.import_module("helix_model")
+    batches, geometry, _truth, seed = build_synthetic_joint_case(m)
 
-    relabelled = m._validation_batches_from_joint(batches, v)
+    loss, _invalid, component_mask = m._measurement_refit_objective(
+        seed, batches, geometry
+    )
+    inputs = m._measurement_fit_inputs_from_joint(batches, geometry, seed)
+    frame = h.reference_gauge_frame(seed)
+    theta = h.pack_gauge_fixed_track_parameters(seed)
+    residual = h.measurement_standardized_residual(theta, frame, inputs)
 
-    assert torch.equal(relabelled.measured_local, batches.measured_local)
-    assert torch.equal(relabelled.measurement_variance, batches.covariances)
-    assert torch.equal(relabelled.loc1_valid, batches.loc1_mask)
-    assert torch.equal(relabelled.fit_mask, batches.fit_mask)
-    assert torch.equal(relabelled.sensor_idx, batches.sensor_idx)
-    assert torch.equal(relabelled.g_smt, batches.g_smt)
-    # The stand-in holdout never overlaps the target layer, and the sentinel mode
-    # keeps these rows out of every Gate 4 selection.
-    assert not bool((relabelled.holdout_mask & batches.is_target).any())
-    assert bool((relabelled.holdout_mask & relabelled.fit_mask).any(dim=1).all())
-    assert set(relabelled.prediction_mode) == {m.DIAGNOSTIC_PREDICTION_MODE}
-    assert m.DIAGNOSTIC_PREDICTION_MODE not in v.PREDICTION_MODES
+    expected_half_chi2 = float(loss) * float(component_mask.sum()) / 2.0
+    actual_half_chi2 = float(0.5 * residual.square().sum())
+    assert actual_half_chi2 > 0.0
+    assert actual_half_chi2 == pytest.approx(expected_half_chi2, rel=1.0e-9)
 
 
-def test_validation_batches_from_joint_fails_closed_on_target_leakage():
+def test_default_joint_refit_does_not_import_validation_module(monkeypatch):
+    """The production solver must remain usable when experiments are unavailable."""
     m = load_ml_alignment_autograd_module()
-    v = load_validate_helix_model_module()
-    batches, _geometry, _truth, _seed = build_synthetic_joint_case(m)
+    batches, geometry, _truth, seed = build_synthetic_joint_case(m)
+    real_import = __import__
+
+    def reject_validation(name, *args, **kwargs):
+        forbidden = (
+            "validate_helix_model",
+            "broken_helix_model",
+            "alignment_experiments",
+        )
+        if name.endswith(forbidden):
+            raise AssertionError(f"production refit imported {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", reject_validation)
+    fitted, stats = m.fit_helices_to_measurements(batches, geometry, seed)
+
+    assert fitted.shape == seed.shape
+    assert stats["solver"] == "gauss-newton"
+    assert stats["stationarity_gate"]["non_stationary_row_fraction"] == 0.0
+
+
+def test_adam_refit_is_loaded_from_the_experiment_module():
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, _truth, seed = build_synthetic_joint_case(m)
+    sys.modules.pop("alignment_experiments", None)
+
+    fitted, stats = m.fit_helices_to_measurements(
+        batches, geometry, seed, n_iter=1, stationarity=False, solver="adam"
+    )
+
+    assert fitted.shape == seed.shape
+    assert stats["solver"] == "adam"
+    assert "alignment_experiments" in sys.modules
+
+
+def test_measurement_inputs_from_joint_relabel_without_reinterpreting():
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, _truth, seed = build_synthetic_joint_case(m)
+
+    relabelled = m._measurement_fit_inputs_from_joint(batches, geometry, seed)
+
+    assert torch.equal(relabelled.measured, batches.measured_local)
+    assert torch.equal(relabelled.variance, batches.covariances)
+    assert torch.equal(relabelled.component_mask[..., 0], batches.fit_mask)
+    assert torch.equal(
+        relabelled.component_mask[..., 1], batches.fit_mask & batches.loc1_mask
+    )
+    assert relabelled.centers.shape == (*batches.fit_mask.shape, 3)
+    assert relabelled.rotations.shape == (*batches.fit_mask.shape, 3, 3)
+
+
+def test_measurement_inputs_from_joint_fail_closed_on_target_leakage():
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, _truth, seed = build_synthetic_joint_case(m)
     batches.fit_mask = torch.ones_like(batches.fit_mask)
 
     with pytest.raises(ValueError, match="target-layer hits"):
-        m._validation_batches_from_joint(batches, v)
+        m._measurement_fit_inputs_from_joint(batches, geometry, seed)
 
 
 def test_refit_stationarity_measurement_leaves_the_fit_untouched():
@@ -584,7 +643,6 @@ def test_refit_stationarity_separates_a_truncated_fit_from_a_solved_one():
     constant.
     """
     m = load_ml_alignment_autograd_module()
-    v = load_validate_helix_model_module()
     batches, geometry, _truth, seed = build_synthetic_joint_case(m)
 
     _one, one_step = m.fit_helices_to_measurements(
@@ -598,9 +656,7 @@ def test_refit_stationarity_separates_a_truncated_fit_from_a_solved_one():
         < one_step["stationarity"]["refit"]["newton_decrement_p50"]
     )
 
-    solved, _stats = v.fit_helices_gauss_newton(
-        m._validation_batches_from_joint(batches, v), geometry, seed
-    )
+    solved, _stats = m.fit_helices_to_measurements(batches, geometry, seed)
     solved_report = m.measure_joint_refit_stationarity(batches, geometry, solved)
     assert solved_report["non_stationary_row_fraction"] == 0.0
     assert (
@@ -645,18 +701,13 @@ def test_joint_refit_rejects_a_truncated_gauss_newton_solution(monkeypatch):
     criterion that is never evaluated.
     """
     m = load_ml_alignment_autograd_module()
-    v = load_validate_helix_model_module()
     batches, geometry, _truth, seed = build_synthetic_joint_case(m)
+    full_solver = m.fit_helix_measurements_gauss_newton
 
-    class TruncatedSolver:
-        def __getattr__(self, name):
-            return getattr(v, name)
+    def truncated_solver(*args, **kwargs):
+        return full_solver(*args, **{**kwargs, "max_iters": 1})
 
-        @staticmethod
-        def fit_helices_gauss_newton(*args, **kwargs):
-            return v.fit_helices_gauss_newton(*args, **{**kwargs, "max_iters": 1})
-
-    monkeypatch.setattr(m, "_load_validation_module", TruncatedSolver)
+    monkeypatch.setattr(m, "fit_helix_measurements_gauss_newton", truncated_solver)
     with pytest.raises(ValueError, match="pre-registered stationary point"):
         m.fit_helices_to_measurements(batches, geometry, seed)
 

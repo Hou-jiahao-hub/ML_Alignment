@@ -13,6 +13,23 @@ import pytest
 import torch
 
 
+def test_diagnostics_module_owns_residual_reporting():
+    diagnostics = importlib.import_module("alignment_diagnostics")
+    before = np.array([[3.0, 4.0]], dtype=np.float64)
+    after = np.array([[0.0, 0.0]], dtype=np.float64)
+    metrics = diagnostics.print_per_layer_residual_diagnostics(
+        before,
+        after,
+        np.array([17]),
+        np.array([8]),
+        ((17, 8),),
+        return_metrics=True,
+    )
+
+    assert metrics[(17, 8)]["rms_before_loc0"] == 3.0
+    assert metrics[(17, 8)]["rms_before_loc1"] == 4.0
+
+
 def load_module():
     module_path = Path(__file__).resolve().parents[1] / "scripts" / "ml_alignment_autograd.py"
     sys.path.insert(0, str(module_path.parent))

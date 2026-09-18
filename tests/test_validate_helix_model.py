@@ -2527,6 +2527,38 @@ def test_gauss_newton_measurement_fit_matches_the_gate4_single_arm():
     assert torch.allclose(fitted, arm["reference"], atol=1e-9, rtol=0.0)
 
 
+def test_production_single_helix_matches_legacy_nodeless_solver():
+    """The independent production implementation must preserve the old result."""
+    validation = load_module()
+    production = importlib.import_module("scripts.helix_model")
+    batches, geometry, seeded = _measurement_fit_fixture(validation)
+    legacy, legacy_stats = validation.fit_helices_gauss_newton(
+        batches, geometry, seeded
+    )
+    legacy_inputs = validation._measurement_fit_inputs(
+        batches, geometry, seeded
+    )
+    inputs = production.MeasurementFitInputs(
+        measured=legacy_inputs.measured,
+        variance=legacy_inputs.variance,
+        component_mask=legacy_inputs.mask,
+        centers=legacy_inputs.centers,
+        rotations=legacy_inputs.rotations,
+    )
+
+    fitted, stats = production.fit_helix_measurements_gauss_newton(
+        seeded, inputs
+    )
+    legacy_decrement = validation.measurement_newton_decrement(
+        batches, geometry, legacy
+    )
+    decrement = production.measurement_newton_decrement(fitted, inputs)
+
+    torch.testing.assert_close(fitted, legacy, atol=1.0e-9, rtol=0.0)
+    torch.testing.assert_close(decrement, legacy_decrement, atol=1.0e-9, rtol=1.0e-9)
+    assert stats["stationarity"] == legacy_stats["stationarity"]
+
+
 def test_gauss_newton_measurement_fit_chunking_is_exact():
     m = load_module()
     batches, geometry, seeded = _measurement_fit_fixture(m)

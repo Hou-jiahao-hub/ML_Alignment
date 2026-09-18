@@ -8,6 +8,7 @@ curvature in inverse millimetres.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 
@@ -23,6 +24,9 @@ GAUSS_NEWTON_INITIAL_DAMPING = 1.0e-8
 GAUSS_NEWTON_MIN_DAMPING = 1.0e-12
 GAUSS_NEWTON_ABSOLUTE_DECREMENT_TOLERANCE = 1.0e-12
 POINT_FIT_MAX_NON_STATIONARY_ROW_FRACTION = 1.0e-3
+MEASUREMENT_VARIANCE_FLOOR = 1.0e-8
+MEASUREMENT_NEWTON_DECREMENT_STATIONARY = 1.0e-6
+MEASUREMENT_FIT_CHUNK_ROWS = 2048
 
 
 def _sinc(value: torch.Tensor) -> torch.Tensor:
@@ -228,6 +232,161 @@ def unpack_gauge_fixed_track_parameters(
     )
 
 
+@dataclass(frozen=True)
+class MeasurementFitInputs:
+    """Tensors required by the production single-helix measurement fit."""
+
+    measured: torch.Tensor
+    variance: torch.Tensor
+    component_mask: torch.Tensor
+    centers: torch.Tensor
+    rotations: torch.Tensor
+
+    def __post_init__(self) -> None:
+        if self.measured.ndim != 3 or self.measured.shape[-1] != 2:
+            raise ValueError("measured must have shape [tracks, hits, 2].")
+        if self.variance.shape != self.measured.shape:
+            raise ValueError("variance must match measured shape.")
+        if self.component_mask.shape != self.measured.shape:
+            raise ValueError("component_mask must match measured shape.")
+        expected_centers = (*self.measured.shape[:2], 3)
+        if self.centers.shape != expected_centers:
+            raise ValueError("centers must have shape [tracks, hits, 3].")
+        expected_rotations = (*self.measured.shape[:2], 3, 3)
+        if self.rotations.shape != expected_rotations:
+            raise ValueError("rotations must have shape [tracks, hits, 3, 3].")
+        if self.component_mask.dtype != torch.bool:
+            raise ValueError("component_mask must be boolean.")
+        if self.measured.shape[0] == 0:
+            raise ValueError("At least one measurement-fit row is required.")
+        if not bool(self.component_mask.any(dim=(1, 2)).all()):
+            raise ValueError("Every measurement-fit row needs an active component.")
+
+    def slice(self, start: int, stop: int) -> "MeasurementFitInputs":
+        return MeasurementFitInputs(
+            measured=self.measured[start:stop],
+            variance=self.variance[start:stop],
+            component_mask=self.component_mask[start:stop],
+            centers=self.centers[start:stop],
+            rotations=self.rotations[start:stop],
+        )
+
+    def to(
+        self, device: str | torch.device, dtype: torch.dtype
+    ) -> "MeasurementFitInputs":
+        return MeasurementFitInputs(
+            measured=self.measured.to(device=device, dtype=dtype),
+            variance=self.variance.to(device=device, dtype=dtype),
+            component_mask=self.component_mask.to(device=device),
+            centers=self.centers.to(device=device, dtype=dtype),
+            rotations=self.rotations.to(device=device, dtype=dtype),
+        )
+
+
+def measurement_local_prediction(
+    parameters: torch.Tensor,
+    inputs: MeasurementFitInputs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project one single helix per row onto each measurement surface."""
+    if parameters.shape != (inputs.measured.shape[0], 6):
+        raise ValueError("parameters must have shape [tracks, 6].")
+    expanded = parameters[:, None, :].expand(-1, inputs.measured.shape[1], -1)
+    _path, intersections, valid = intersect_plane(
+        expanded, inputs.centers, inputs.rotations[..., :, 2], n_newton=12
+    )
+    local3 = torch.matmul(
+        inputs.rotations.transpose(-1, -2),
+        (intersections - inputs.centers).unsqueeze(-1),
+    ).squeeze(-1)
+    return local3[..., :2], valid
+
+
+def measurement_standardized_residual(
+    theta: torch.Tensor,
+    frame: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    inputs: MeasurementFitInputs,
+) -> torch.Tensor:
+    """Return flattened whitened residuals in the ``F = 0.5 chi2`` gauge."""
+    return _measurement_standardized_residual_tensors(
+        theta,
+        frame,
+        inputs.measured,
+        inputs.variance,
+        inputs.component_mask,
+        inputs.centers,
+        inputs.rotations,
+    )
+
+
+def _measurement_standardized_residual_tensors(
+    theta: torch.Tensor,
+    frame: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    measured: torch.Tensor,
+    variance: torch.Tensor,
+    component_mask: torch.Tensor,
+    centers: torch.Tensor,
+    rotations: torch.Tensor,
+) -> torch.Tensor:
+    parameters = unpack_gauge_fixed_track_parameters(theta, frame)
+    expanded = parameters[:, None, :].expand(-1, measured.shape[1], -1)
+    _path, intersections, valid = intersect_plane(
+        expanded, centers, rotations[..., :, 2], n_newton=12
+    )
+    local3 = torch.matmul(
+        rotations.transpose(-1, -2),
+        (intersections - centers).unsqueeze(-1),
+    ).squeeze(-1)
+    residual = (measured - local3[..., :2]) / variance.clamp_min(
+        MEASUREMENT_VARIANCE_FLOOR
+    ).sqrt()
+    active = component_mask & valid.unsqueeze(-1)
+    return torch.where(active, residual, torch.zeros_like(residual)).flatten(1)
+
+
+def _single_measurement_residual(
+    theta: torch.Tensor,
+    origin: torch.Tensor,
+    axis0: torch.Tensor,
+    axis1: torch.Tensor,
+    measured: torch.Tensor,
+    variance: torch.Tensor,
+    component_mask: torch.Tensor,
+    centers: torch.Tensor,
+    rotations: torch.Tensor,
+) -> torch.Tensor:
+    return _measurement_standardized_residual_tensors(
+        theta.unsqueeze(0),
+        (origin.unsqueeze(0), axis0.unsqueeze(0), axis1.unsqueeze(0)),
+        measured.unsqueeze(0),
+        variance.unsqueeze(0),
+        component_mask.unsqueeze(0),
+        centers.unsqueeze(0),
+        rotations.unsqueeze(0),
+    ).squeeze(0)
+
+
+_BATCHED_MEASUREMENT_RESIDUAL_JACOBIAN = torch.func.vmap(
+    torch.func.jacrev(_single_measurement_residual, argnums=0)
+)
+
+
+def measurement_residual_jacobian(
+    theta: torch.Tensor,
+    frame: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    inputs: MeasurementFitInputs,
+) -> torch.Tensor:
+    """Differentiate the production measurement residual row by row."""
+    return _BATCHED_MEASUREMENT_RESIDUAL_JACOBIAN(
+        theta,
+        *frame,
+        inputs.measured,
+        inputs.variance,
+        inputs.component_mask,
+        inputs.centers,
+        inputs.rotations,
+    )
+
+
 def damped_gauss_newton(
     theta: torch.Tensor,
     residual_of: Callable[[torch.Tensor], torch.Tensor],
@@ -337,6 +496,214 @@ def damped_gauss_newton(
         ),
         "non_stationary_row_fraction": float((~stationary).double().mean()),
         "n_non_finite": int((~finite).sum()),
+    }
+
+
+def _merge_gauss_newton_diagnostics(
+    blocks: list[dict[str, float | int | bool]], weights: list[int]
+) -> dict[str, float | int | bool]:
+    total = float(sum(weights))
+    return {
+        "converged": all(bool(block["converged"]) for block in blocks),
+        "iterations": max(int(block["iterations"]) for block in blocks),
+        "initial_objective": sum(
+            float(block["initial_objective"]) * weight
+            for block, weight in zip(blocks, weights)
+        ) / total,
+        "final_objective": sum(
+            float(block["final_objective"]) * weight
+            for block, weight in zip(blocks, weights)
+        ) / total,
+        "max_relative_decrease": max(
+            float(block["max_relative_decrease"]) for block in blocks
+        ),
+        "max_gradient_norm": max(
+            float(block["max_gradient_norm"]) for block in blocks
+        ),
+        "n_chunks": len(blocks),
+    }
+
+
+def _fit_helix_measurements_gauss_newton_block(
+    initial: torch.Tensor,
+    inputs: MeasurementFitInputs,
+    max_iters: int,
+    damping: float,
+    tolerance: float,
+) -> tuple[torch.Tensor, dict[str, float | int | bool]]:
+    frame = reference_gauge_frame(initial)
+    theta = pack_gauge_fixed_track_parameters(initial).clone()
+
+    def residual_of(values: torch.Tensor) -> torch.Tensor:
+        return measurement_standardized_residual(values, frame, inputs)
+
+    def jacobian_of(values: torch.Tensor) -> torch.Tensor:
+        return measurement_residual_jacobian(values, frame, inputs)
+
+    current = 0.5 * residual_of(theta).square().sum(dim=1)
+    if not torch.isfinite(current).all():
+        raise FloatingPointError("Non-finite initial Gauss-Newton objective.")
+    initial_objective = float(current.mean())
+    identity = torch.eye(theta.shape[1], dtype=theta.dtype, device=theta.device)
+    level = torch.full(
+        (theta.shape[0], 1, 1),
+        float(damping),
+        dtype=theta.dtype,
+        device=theta.device,
+    )
+    converged = False
+    iterations = 0
+    change = 0.0
+    gradient = torch.zeros_like(theta)
+    for iterations in range(1, max_iters + 1):
+        jacobian = jacobian_of(theta)
+        residual = residual_of(theta)
+        hessian = jacobian.transpose(1, 2) @ jacobian
+        gradient = (
+            jacobian.transpose(1, 2) @ residual.unsqueeze(-1)
+        ).squeeze(-1)
+        scale = hessian.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1.0e-30)
+        regularized = hessian + level * scale[:, None, None] * identity
+        step = torch.linalg.solve(regularized, -gradient.unsqueeze(-1)).squeeze(-1)
+        candidate = theta + step
+        candidate_objective = 0.5 * residual_of(candidate).square().sum(dim=1)
+        improved = candidate_objective < current
+        theta = torch.where(improved.unsqueeze(-1), candidate, theta)
+        level = torch.where(
+            improved[:, None, None],
+            (level * 0.1).clamp_min(GAUSS_NEWTON_MIN_DAMPING),
+            level * 10.0,
+        )
+        decrease = (current - candidate_objective).clamp_min(0.0) / current.abs().clamp_min(1.0)
+        current = torch.where(improved, candidate_objective, current)
+        change = float(decrease.max())
+        if change < tolerance:
+            converged = True
+            break
+    fitted = unpack_gauge_fixed_track_parameters(theta, frame).detach()
+    return fitted, {
+        "converged": bool(converged),
+        "iterations": int(iterations),
+        "initial_objective": initial_objective,
+        "final_objective": float(current.mean()),
+        "max_relative_decrease": float(change),
+        "max_gradient_norm": float(gradient.norm(dim=1).max()),
+    }
+
+
+def fit_helix_measurements_gauss_newton(
+    initial: torch.Tensor,
+    inputs: MeasurementFitInputs,
+    max_iters: int = GAUSS_NEWTON_MAX_ITERS,
+    damping: float = GAUSS_NEWTON_INITIAL_DAMPING,
+    tolerance: float = GAUSS_NEWTON_TOLERANCE,
+    chunk_rows: int = MEASUREMENT_FIT_CHUNK_ROWS,
+    device: str | torch.device = "cpu",
+    dtype: torch.dtype = torch.float64,
+) -> tuple[torch.Tensor, dict]:
+    """Fit independent single helices to local measurements in row chunks."""
+    if initial.ndim != 2 or initial.shape[1] != 6:
+        raise ValueError("initial must have shape [tracks, 6].")
+    if initial.shape[0] != inputs.measured.shape[0]:
+        raise ValueError("initial and measurement inputs must have matching rows.")
+    if max_iters < 1:
+        raise ValueError("max_iters must be at least 1.")
+    initial = initial.to(device=device, dtype=dtype)
+    inputs = inputs.to(device=device, dtype=dtype)
+    step = initial.shape[0] if chunk_rows <= 0 else chunk_rows
+    fitted_blocks: list[torch.Tensor] = []
+    diagnostics_blocks: list[dict[str, float | int | bool]] = []
+    weights: list[int] = []
+    for start in range(0, initial.shape[0], max(step, 1)):
+        stop = min(start + max(step, 1), initial.shape[0])
+        fitted, diagnostics = _fit_helix_measurements_gauss_newton_block(
+            initial[start:stop],
+            inputs.slice(start, stop),
+            max_iters=max_iters,
+            damping=damping,
+            tolerance=tolerance,
+        )
+        fitted_blocks.append(fitted)
+        diagnostics_blocks.append(diagnostics)
+        weights.append(stop - start)
+    fitted = torch.cat(fitted_blocks, dim=0)
+    decrement = measurement_newton_decrement(
+        fitted, inputs, chunk_rows=chunk_rows, device=device, dtype=dtype
+    )
+    return fitted, {
+        "solver": "gauss-newton",
+        "convergence": _merge_gauss_newton_diagnostics(
+            diagnostics_blocks, weights
+        ),
+        "stationarity": measurement_stationarity_report(decrement),
+    }
+
+
+def measurement_newton_decrement(
+    parameters: torch.Tensor,
+    inputs: MeasurementFitInputs,
+    chunk_rows: int = MEASUREMENT_FIT_CHUNK_ROWS,
+    device: str | torch.device = "cpu",
+    dtype: torch.dtype = torch.float64,
+) -> torch.Tensor:
+    """Return per-row ``g^T H^-1 g`` for the single-helix measurement fit."""
+    if parameters.shape != (inputs.measured.shape[0], 6):
+        raise ValueError("parameters must have shape [tracks, 6].")
+    parameters = parameters.to(device=device, dtype=dtype)
+    inputs = inputs.to(device=device, dtype=dtype)
+    step = parameters.shape[0] if chunk_rows <= 0 else chunk_rows
+    pieces: list[torch.Tensor] = []
+    for start in range(0, parameters.shape[0], max(step, 1)):
+        stop = min(start + max(step, 1), parameters.shape[0])
+        block_parameters = parameters[start:stop]
+        block_inputs = inputs.slice(start, stop)
+        frame = reference_gauge_frame(block_parameters)
+        theta = pack_gauge_fixed_track_parameters(block_parameters)
+        residual = measurement_standardized_residual(theta, frame, block_inputs)
+        jacobian = measurement_residual_jacobian(theta, frame, block_inputs)
+        hessian = jacobian.transpose(1, 2) @ jacobian
+        gradient = (
+            jacobian.transpose(1, 2) @ residual.unsqueeze(-1)
+        ).squeeze(-1)
+        scale = hessian.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1.0e-30)
+        identity = torch.eye(
+            theta.shape[1], dtype=theta.dtype, device=theta.device
+        )
+        regularized = (
+            hessian
+            + GAUSS_NEWTON_MIN_DAMPING * scale[:, None, None] * identity
+        )
+        step_vector = torch.linalg.solve(
+            regularized, gradient.unsqueeze(-1)
+        ).squeeze(-1)
+        pieces.append((gradient * step_vector).sum(dim=1).detach())
+    return torch.cat(pieces, dim=0)
+
+
+def measurement_stationarity_report(
+    decrement: torch.Tensor,
+    threshold: float = MEASUREMENT_NEWTON_DECREMENT_STATIONARY,
+) -> dict[str, float | int]:
+    """Summarize measurement-fit Newton decrements for the production gate."""
+    finite = decrement[torch.isfinite(decrement)]
+
+    def quantile(value: float) -> float:
+        return float(finite.quantile(value)) if finite.numel() else float("nan")
+
+    return {
+        "stationary_threshold": float(threshold),
+        "non_stationary_row_fraction": (
+            float((decrement > threshold).to(torch.float64).mean())
+            if decrement.numel()
+            else 0.0
+        ),
+        "n_non_finite": int(decrement.numel() - finite.numel()),
+        "newton_decrement_p50": quantile(0.50),
+        "newton_decrement_p90": quantile(0.90),
+        "newton_decrement_p99": quantile(0.99),
+        "newton_decrement_max": (
+            float(finite.max()) if finite.numel() else float("nan")
+        ),
     }
 
 
@@ -530,191 +897,29 @@ def require_stationary_helix_point_fit(
         )
 
 
-# ---------------------------------------------------------------------------
-# Highland multiple-scattering prior
-# ---------------------------------------------------------------------------
-
-MUON_MASS_GEV = 0.1056583755
-HIGHLAND_ENERGY_GEV = 0.0136
-HIGHLAND_LOG_COEFFICIENT = 0.038
-
-
-def highland_kink_sigma(
-    x_over_x0: torch.Tensor,
-    q_over_p_gev_inv: torch.Tensor,
-    mass_gev: float = MUON_MASS_GEV,
-    abs_charge: float = 1.0,
-) -> torch.Tensor:
-    """Return the Highland projected-angle width for each material node.
-
-    Transcribes RPP2018 eq. 33.15 exactly as ACTS does in
-    ``Core/src/Material/Interactions.cpp:484-491``, including the ``q^2/beta^2``
-    factor inside the logarithm.  ``x_over_x0`` is ``[..., N]`` and
-    ``q_over_p_gev_inv`` is ``[...]``; the signed ``q/p`` is constant along a
-    track, matching the material artifact contract.
-
-    Vacuum nodes (``x/X0 == 0``) return exactly zero through a masked limit.
-    Clamping the logarithm instead would fabricate a discontinuous non-zero
-    floor at the clamp threshold.
-    """
-    q_over_p = q_over_p_gev_inv.unsqueeze(-1).to(x_over_x0.dtype)
-    q2_over_beta2 = abs_charge**2 + (mass_gev * q_over_p) ** 2
-    positive = x_over_x0 > 0
-    # Evaluate the log on a safe surrogate so that vacuum entries never produce
-    # non-finite intermediates in either the forward or the backward pass.
-    safe = torch.where(positive, x_over_x0, torch.ones_like(x_over_x0))
-    t = torch.sqrt(safe * q2_over_beta2)
-    momentum_inv = torch.abs(q_over_p / abs_charge)
-    sigma = (
-        HIGHLAND_ENERGY_GEV
-        * momentum_inv
-        * t
-        * (1.0 + HIGHLAND_LOG_COEFFICIENT * 2.0 * torch.log(t))
-    )
-    return torch.where(positive, sigma, torch.zeros_like(sigma))
+_BROKEN_HELIX_COMPAT_NAMES = {
+    "HIGHLAND_ENERGY_GEV",
+    "HIGHLAND_LOG_COEFFICIENT",
+    "KINK_THETA_EPS",
+    "MUON_MASS_GEV",
+    "assign_hit_segments",
+    "broken_helix_local_path",
+    "broken_helix_segments",
+    "broken_helix_track_parameters",
+    "highland_kink_sigma",
+    "node_arc_lengths",
+    "segment_origin_path",
+}
 
 
-# ---------------------------------------------------------------------------
-# Broken helix: a reference trajectory plus two-dimensional material kinks
-# ---------------------------------------------------------------------------
-
-KINK_THETA_EPS = 1.0e-9
-
-
-def node_arc_lengths(
-    reference: torch.Tensor,
-    node_positions: torch.Tensor,
-    node_valid: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Project material nodes onto a frozen reference helix.
-
-    The helix ``s`` origin is fixed by ``(x0, y0, z0)``, so arc lengths are NOT
-    a track-level invariant: two fits of the same trajectory over different
-    windows produce different ``s``.  Consumers must therefore recompute node
-    and hit arc lengths against whichever reference they froze, rather than
-    reusing an arc length that came out of the exporter.
-
-    Returned arc lengths are detached: they define the linearisation point and
-    must not drift while the kinks and the reference are being optimised.
-    """
-    n_nodes = node_positions.shape[-2]
-    expanded = reference[:, None, :].expand(-1, n_nodes, -1)
-    _fitted, path, ok = closest_helix_points(expanded, node_positions)
-    path = torch.where(node_valid, path, torch.zeros_like(path))
-    return path.detach(), ok & node_valid
-
-
-def segment_origin_path(node_s: torch.Tensor, node_valid: torch.Tensor) -> torch.Tensor:
-    """Reference arc length at which every segment starts, shape ``[T, N+1]``.
-
-    Segment 0 starts at the reference origin.  A masked node transfers the
-    previous origin unchanged so padding never shifts the local coordinate.
-    """
-    # ``new_zeros`` rather than ``node_s[:, 0]`` so a nodeless track (N == 0) is
-    # a legal input: that is exactly how the single-helix arm of the paired
-    # holdout runs, and it must go through this same solver to stay comparable.
-    origins = [node_s.new_zeros(node_s.shape[0])]
-    current = origins[0]
-    for index in range(node_s.shape[1]):
-        current = torch.where(node_valid[:, index], node_s[:, index], current)
-        origins.append(current)
-    return torch.stack(origins, dim=1)
-
-
-def assign_hit_segments(
-    node_s: torch.Tensor, hit_s: torch.Tensor, node_valid: torch.Tensor
-) -> torch.Tensor:
-    """Return the segment index of every hit, as a detached integer tensor.
-
-    A hit sitting exactly on a node belongs to the segment after it.  Keeping
-    this integer and detached is what stops the autograd graph from developing
-    a discontinuity when a kink nudges a hit across a node.
-    """
-    active = node_valid.unsqueeze(1) & (
-        node_s.unsqueeze(1) <= hit_s.unsqueeze(-1)
-    )
-    return active.sum(dim=-1).to(torch.int64).detach()
-
-
-def broken_helix_segments(
-    reference: torch.Tensor,
-    kinks: torch.Tensor,
-    node_s: torch.Tensor,
-    node_valid: torch.Tensor,
-) -> torch.Tensor:
-    """Build the ``[T, N+1, 6]`` per-segment helix parameters.
-
-    Segments stay continuous in position; only the direction changes at a node.
-    The two kink components follow the ACTS convention
-    (``PointwiseMaterialInteraction.cpp:69-74``): ``sigmaPhi = theta0 / sin(theta)``
-    and ``sigmaTheta = theta0``, which makes a diagonal prior isotropic in the
-    plane transverse to the incident direction.
-
-    Signed curvature is shared by every segment: the first version keeps
-    curvature constant and does not model energy loss.
-
-    Arc lengths between nodes are taken from the reference trajectory, which is
-    the standard broken-lines linearisation rather than an exact re-integration.
-    """
-    segments = [reference]
-    current = reference
-    origin = node_s.new_zeros(node_s.shape[0])
-    for index in range(node_s.shape[1]):
-        valid = node_valid[:, index]
-        delta = torch.where(
-            valid, node_s[:, index] - origin, torch.zeros_like(origin)
-        )
-        arrival = helix_point(current, delta)
-        psi = current[..., 3] + current[..., 5] * delta
-        tanl = current[..., 4]
-        theta = torch.atan2(torch.ones_like(tanl), tanl)
-        sin_theta = torch.sin(theta).clamp_min(KINK_THETA_EPS)
-        psi_kinked = psi + kinks[:, index, 0] / sin_theta
-        theta_kinked = (theta + kinks[:, index, 1]).clamp(
-            KINK_THETA_EPS, torch.pi - KINK_THETA_EPS
-        )
-        tanl_kinked = torch.cos(theta_kinked) / torch.sin(theta_kinked)
-        candidate = torch.stack(
-            (
-                arrival[..., 0],
-                arrival[..., 1],
-                arrival[..., 2],
-                psi_kinked,
-                tanl_kinked,
-                current[..., 5],
-            ),
-            dim=-1,
-        )
-        current = torch.where(valid.unsqueeze(-1), candidate, current)
-        origin = torch.where(valid, node_s[:, index], origin)
-        segments.append(current)
-    return torch.stack(segments, dim=1)
-
-
-def broken_helix_local_path(
-    node_s: torch.Tensor, node_valid: torch.Tensor, hit_s: torch.Tensor
-) -> torch.Tensor:
-    """Arc length of every hit measured from the origin of its own segment."""
-    origins = segment_origin_path(node_s, node_valid)
-    segment_of_hit = assign_hit_segments(node_s, hit_s, node_valid)
-    return hit_s - torch.gather(origins, 1, segment_of_hit)
-
-
-def broken_helix_track_parameters(
-    reference: torch.Tensor,
-    kinks: torch.Tensor,
-    node_s: torch.Tensor,
-    node_valid: torch.Tensor,
-    hit_s: torch.Tensor,
-) -> torch.Tensor:
-    """Return per-hit helix parameters, shape ``[T, H, 6]``.
-
-    This is deliberately the shape every existing consumer already builds with
-    ``track_parameters[:, None, :].expand(-1, n_hits, -1)``, so
-    :func:`intersect_plane` and the local projection downstream need no change.
-    Pair it with :func:`broken_helix_local_path` for the matching arc lengths.
-    """
-    segments = broken_helix_segments(reference, kinks, node_s, node_valid)
-    segment_of_hit = assign_hit_segments(node_s, hit_s, node_valid)
-    index = segment_of_hit.unsqueeze(-1).expand(-1, -1, segments.shape[-1])
-    return torch.gather(segments, 1, index)
+def __getattr__(name: str):
+    """Lazily preserve historical imports of experimental broken-helix symbols."""
+    if name not in _BROKEN_HELIX_COMPAT_NAMES:
+        raise AttributeError(name)
+    try:
+        from . import broken_helix_model
+    except ImportError:  # Direct script execution.
+        import broken_helix_model
+    value = getattr(broken_helix_model, name)
+    globals()[name] = value
+    return value

@@ -22,8 +22,11 @@ simulation -> ROOT/geometry JSON -> loaders -> solver -> aligned geometry
 | `alignment_artifact_layout.py` | Compatibility API for paths and target-layer naming | None |
 | `project_config.py` | Typed TOML configuration and validation | None |
 | `ml_alignment.py` | Analytic-Jacobian surface solver | AlignDerivLib only |
-| `ml_alignment_autograd.py` | Autograd surface and joint track/geometry solvers | None |
-| `helix_model.py` | Shared six-parameter helix, Newton intersections, curvature scaling, broken-helix segments and the Highland kink prior | None |
+| `ml_alignment_autograd.py` | Production autograd surface solver, helix initialization, measurement refit and block-LM geometry solver | None |
+| `helix_model.py` | Production six-parameter helix, intersections, point seed and independent single-helix measurement Gauss–Newton fit | None |
+| `broken_helix_model.py` | Experimental material nodes, Highland prior and broken-helix segments | None |
+| `alignment_experiments.py` | Historical Adam refits, joint Adam alignment and learned hit weighting | None |
+| `alignment_diagnostics.py` | Residual reporting and optional truth-geometry comparison | None |
 | `ml_alignment_helix.py` | Frozen-helix holdout alignment | None |
 | `material_artifact.py` | Per-track material-node artifact from ACTS ROOT output | None |
 | `validate_helix_model.py` | Holdout validation, acceptance gates, paired single/broken-helix comparison | None |
@@ -125,9 +128,12 @@ reference before clipping windows or assigning segments.
 non-holdout measurement refit is minimised. Both solvers minimise the *same*
 half-chi2 over the same component mask; only the descent differs.
 
-`gauss-newton` is the default and runs through `fit_broken_helix` with zero
-material nodes, i.e. the identical solver the Gate 4 single arm uses. `adam` is
-the pre-Iteration-14 first-order refit, kept only so that finding stays
+`gauss-newton` is the default. Its production implementation lives in
+`helix_model.py` and directly fits one six-parameter helix to local measurements;
+it does not import the holdout validator or enter the broken-helix zero-node
+branch. A regression test compares its residual, solution and Newton decrement
+against that historical zero-node path. `adam` is the pre-Iteration-14
+first-order refit, kept in `alignment_experiments.py` so the finding remains
 reproducible: on real data every one of its rows stops short of a stationary
 point (Newton decrement median ~12 against a 1e-6 threshold), which inflated the
 held-out residual by a factor of 2.7-3.9 on the LOC0 groups and was previously

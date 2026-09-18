@@ -44,36 +44,40 @@ from project_config import (
     load_project_config,
 )
 try:
+    from .broken_helix_model import (
+        broken_helix_track_parameters,
+        assign_hit_segments,
+        highland_kink_sigma,
+        node_arc_lengths,
+    )
     from .helix_model import (
         S_MAX,
         accept_newton_candidate,
         assemble_track_parameters,
-        broken_helix_track_parameters,
-        assign_hit_segments,
         closest_helix_points,
         fit_helix_points_gauss_newton,
         helix_point,
         helix_tangent,
-        highland_kink_sigma,
         intersect_plane,
-        node_arc_lengths,
         require_stationary_helix_point_fit,
         split_track_parameters,
     )
 except ImportError:  # Direct script execution.
+    from broken_helix_model import (
+        broken_helix_track_parameters,
+        assign_hit_segments,
+        highland_kink_sigma,
+        node_arc_lengths,
+    )
     from helix_model import (
         S_MAX,
         accept_newton_candidate,
         assemble_track_parameters,
-        broken_helix_track_parameters,
-        assign_hit_segments,
         closest_helix_points,
         fit_helix_points_gauss_newton,
         helix_point,
         helix_tangent,
-        highland_kink_sigma,
         intersect_plane,
-        node_arc_lengths,
         require_stationary_helix_point_fit,
         split_track_parameters,
     )

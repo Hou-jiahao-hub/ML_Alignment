@@ -196,6 +196,16 @@ def test_engine_returns_none_weights_when_disabled():
     assert weights is None
 
 
+def test_hit_quality_engine_is_loaded_only_when_enabled():
+    m = load_module()
+    sys.modules.pop("alignment_experiments", None)
+    engine = m.AlignmentEngine(N_SENSORS, use_hit_weights=True)
+
+    assert engine.use_hit_weights is True
+    assert type(engine).__module__ == "alignment_experiments"
+    assert "alignment_experiments" in sys.modules
+
+
 def test_normalize_hit_weights_semantics_are_untouched():
     """No all-ones short circuit was introduced: float64 keeps its 1e-12 offset."""
     m = load_module()

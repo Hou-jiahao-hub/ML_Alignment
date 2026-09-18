@@ -810,7 +810,9 @@ joint 直接在输入的错位几何上求解，输入几何只在 calibration �
 SMT seed 与 measurement refit 都按逐轨迹 Newton decrement 检查驻点；任一路径的
 非驻点比例超过 0.1% 都必须停止，预算耗尽不能当作收敛。
 
-公共数学位于 `helix_model.py`。两个调用脚本共享参数顺序
+生产单 helix 数学与独立 measurement Gauss--Newton 拟合位于 `helix_model.py`；
+材料节点、Highland prior 和 broken-helix 实验位于 `broken_helix_model.py`，历史 Adam
+对照位于 `alignment_experiments.py`。各路径共享参数顺序
 `(x0,y0,z0,psi0,tan_lambda,rho)`、`rho/1e-4` 优化缩放、Newton 最近点/平面求交、
 `|s|<=1200 mm` 和数值容差。初始化禁止回退到目标层数据；任一初始化阶段无有效轨迹
 或求交失败率超过 5% 时直接失败。

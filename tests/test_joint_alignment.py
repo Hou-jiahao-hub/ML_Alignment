@@ -815,6 +815,7 @@ def test_free_joint_fit_recovers_hidden_shift_tilt_and_masks_strip_component():
         make_plot=False,
     )
 
+    sys.modules.pop("alignment_experiments", None)
     result = m.run_joint_alignment(
         batches,
         geometry,
@@ -822,6 +823,7 @@ def test_free_joint_fit_recovers_hidden_shift_tilt_and_masks_strip_component():
         active_dof=(0, 1, 3, 4),
         initial_track_params=tracks,
     )
+    assert "alignment_experiments" in sys.modules
 
     correction = result["predicted_deltas"]
     assert result["best_total_loss"] <= result["last_total_loss"]

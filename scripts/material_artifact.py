@@ -31,14 +31,14 @@ import numpy as np
 import torch
 
 try:  # Direct script execution and package import must both work.
-    from .helix_model import highland_kink_sigma
+    from .broken_helix_model import highland_kink_sigma
     from .experiment_manifest import (
         finalize_experiment_manifest,
         write_experiment_manifest,
     )
     from .project_config import absolute_project_path, add_config_argument, load_project_config
 except ImportError:  # pragma: no cover - exercised by direct execution
-    from helix_model import highland_kink_sigma
+    from broken_helix_model import highland_kink_sigma
     from experiment_manifest import (
         finalize_experiment_manifest,
         write_experiment_manifest,
