@@ -237,6 +237,8 @@ class TrackBatches:
     fit_mask: torch.Tensor | None = None
     fit_span: torch.Tensor | None = None
     selection_stats: dict[str, int] = field(default_factory=dict)
+    # Variance before STRIP_Y_FLOOR; diagnostic only, never read by a solver.
+    raw_covariances: torch.Tensor | None = None
 
 
 @dataclass
@@ -426,6 +428,11 @@ def build_track_batches(
     max_hits = max(len(indices) for _, indices, _fit_span in selected)
     measured = torch.zeros((n_tracks, max_hits, 2), dtype=inputs.measured_local.dtype)
     covariance = torch.ones((n_tracks, max_hits, 2), dtype=inputs.covariances.dtype)
+    raw_covariance = (
+        None
+        if inputs.raw_covariances is None
+        else torch.ones((n_tracks, max_hits, 2), dtype=inputs.raw_covariances.dtype)
+    )
     sensor_idx = torch.zeros((n_tracks, max_hits), dtype=torch.long)
     hit_mask = torch.zeros((n_tracks, max_hits), dtype=torch.bool)
     loc1_mask = torch.zeros((n_tracks, max_hits), dtype=torch.bool)
@@ -442,6 +449,8 @@ def build_track_batches(
         index = torch.tensor(indices, dtype=torch.long)
         measured[track_index, :count] = inputs.measured_local[index]
         covariance[track_index, :count] = inputs.covariances[index]
+        if raw_covariance is not None:
+            raw_covariance[track_index, :count] = inputs.raw_covariances[index]
         sensor_idx[track_index, :count] = inputs.hit_sensor_ids[index]
         hit_mask[track_index, :count] = True
         loc1_mask[track_index, :count] = inputs.loc1_valid[index]
@@ -475,6 +484,7 @@ def build_track_batches(
             "retained_tracks": len(selected),
             "excluded_tracks": len(groups) - len(selected),
         },
+        raw_covariances=raw_covariance,
     )
 
 

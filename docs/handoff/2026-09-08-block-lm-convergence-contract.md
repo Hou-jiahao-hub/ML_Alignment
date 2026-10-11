@@ -268,6 +268,9 @@ CI，**上界 ≤ 1.01** 为非劣性通过。复用 `validate_helix_model.paire
 
 ## 11. 下一步（**尚未做**）
 
+> **2026-10-10 处置**：event split 已移除，下列「同一 train event-key hash」两臂无法按原样执行；
+> 已宣告被 Iteration 29/30 替代，理由与未覆盖项见 `docs/history/ml_optimization_log.md` Iteration 33 §E。
+
 1. 在 `docs/history/ml_optimization_log.md` 写预注册条目（**跑任何真实数据之前**）；
 2. 跑真实 train **A 臂**：`git checkout e9c63b2`，`experiment_manifest` finalize，
    存 `summary_A.json`；核对 `predicted_deltas` 与既有基线逐位相同；

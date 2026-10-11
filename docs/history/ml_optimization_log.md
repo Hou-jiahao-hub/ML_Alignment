@@ -2836,3 +2836,173 @@ misaligned/aligned RMS（tx、ty 单位 mm，rz 单位 rad）：
 几何更差”；但 acceptance JSON 的两个预注册诊断元数据字段缺失，因此按 fail-closed
 规则，**当前修改整体未完全通过本次工程闭环**。这是字段契约失败，不改变几何 truth
 通过的事实，也不授权使用 truth 调参或改选候选。
+
+---
+
+## Iteration 30 — acceptance schema-3.1 修复后的 100k 全事件闭环
+
+**日期**：2026-09-10
+**性质**：Iteration 29 工程字段契约的修复验证；输入、算法参数、候选选择规则和一次性
+truth-veto 阈值均保持不变。run tag 为 `closure-schema31-100k-20260910`。
+
+### 修复与验证
+
+根因是全事件流程移除 event split 时同时删掉了 acceptance JSON 的
+`profile_type`／`verdict_eligible` 字段，只在顶层 summary 保留
+`acceptance_scope=diagnostic_only`。修复将 acceptance schema 从 3.0 升为 3.1，成功和
+fail-closed 产物均显式写入 `profile_type=diagnostic_only`、
+`verdict_eligible=false`，且 `write_experiment_summary.py` 对两项执行 fail-closed 复查。
+定向测试先观察到缺字段失败，修复后为 `38 passed, 1 deselected`；完整
+`make test` 为 `570 passed, 3 skipped, 11 deselected`，`make test-shell` 通过。
+
+### 闭环结果
+
+主 manifest（schema 2）与 truth-veto manifest（schema 2）均为 `completed`，两者
+source snapshot 均为 `written`、各含 139 个文件。主运行复用 Iteration 29 的冻结输入
+哈希；98,958 input tracks 中保留 61,482。SMT seed 与 measurement refit 的终态
+non-stationary fraction 均为 0，非有限 decrement 均为 0。
+
+block-LM preregistration version 为 2，`best_iteration=13`、
+`stop_reason=all_blocks_terminal`；2,268 blocks 全部为 interior `converged`，
+budget-exhausted、rank-deficient、intersection-failed、boundary 均为 0；
+`min_components_delta_accepted=0`、`min_components_end_minus_start=0`。
+
+production acceptance 从 misaligned baseline
+`[4, 1002.2362008145352, 1543.7135270312644]` 改善至
+`[0, 0.9694442432274074, 0]`，四个 layer/component 均通过。最终候选冻结为
+`aligned_transforms_closure-schema31-100k-20260910_joint_free.json`，没有运行 polish。
+最终 acceptance JSON 为 schema 3.1，且明确记录 `profile_type=diagnostic_only`、
+`verdict_eligible=false`、`profile_identity_verified=true`。
+
+候选冻结后只执行一次 geometry truth-veto（seed 6006、2,000 paired sensor
+bootstrap）。六项 nominal ratio / 95% CI 上界为：
+
+| layer/DOF | ratio | CI upper |
+|---|---:|---:|
+| 17:8 tx | 0.00616720 | 0.00651634 |
+| 17:8 ty | 0.00951357 | 0.01017928 |
+| 17:8 rz | 0.00746449 | 0.00796759 |
+| 24:4 tx | 0.01498277 | 0.01565493 |
+| 24:4 ty | 0.31917439 | 0.33565704 |
+| 24:4 rz | 0.01104834 | 0.01157299 |
+
+六项 CI 上界均严格 `<1.0`，truth verdict 为 `passed=true`。因此本轮数值收敛、ACTS
+回灌、production acceptance、诊断元数据契约及一次性几何 truth 判据全部通过；当前
+多处修改通过本次工程闭环。acceptance 与 truth 仍分别属于 `diagnostic_only` 和
+`post_hoc_truth_veto_only`，不构成 blind validation 或独立泛化声明。
+
+---
+
+## Iteration 33 — Schur P1 统计误差预算诊断与 L1 处置（预注册）
+
+**日期**：2026-10-10。**状态**：预注册，写于任何 P1 数据运行之前。
+**上游**：`plan.md` §4 Q1 / Phase P1；`docs/handoff/2026-10-08-schur-phase0-baseline-and-implementation-map.md`
+§5.1、§6.2（F1、F4）。**性质**：`diagnostic_only`，不得回灌求解器调参；truth 不参与任何计算。
+
+### A. 规格修订：P1 行集（关闭 F1）
+
+plan.md §4 Q1 要求在 `--no-event-split` 行集上运行；该开关与整个 event split 机制已于
+2026-09-10 移除，不再引用。P1 行集改为**当前全量事件口径 + 生产筛选**，与 P0.1 基线
+`schur-p0-fixedtrack-20260922` 完全相同：
+
+- 输入：P0.1 manifest 中的 `geometry` / `states` / `nominal_geometry`，SHA256 必须与之逐字节一致；
+- 筛选：`build_track_batches`，target `17:8,24:4`，≥8 非 target hit，非 target 折线跨度 ≥300 mm，
+  `max_tracks=0`；
+- 初始化：`seed_helices`（**2000 次**，照抄 `run_surface_helix_experiment.sh` joint_free 阶段）
+  → `require_stationary_helix_point_fit` → `fit_helices_to_measurements`（生产 GN，含非驻点闸门）；
+  CPU float64；
+- 身份闸门：retained tracks 必须为 61,482，refit `n_components` 必须为 1,154,761；
+  任一不符即停止，不读任何比值。
+
+### B. 计算定义
+
+- 径迹为 ref-only refit 结果；在 `reference_gauge_frame(refit)` 的 5 参 gauge 帧中，用
+  `helix_model.measurement_residual_jacobian` 求白化 Jacobian：ref 行（非 target、有效求交）给出
+  `Γ_ref = BᵀWB`；target 行给出白化 `B_tgt`。target 行通过直接构造 `MeasurementFitInputs`
+  得到，**不**放宽 `_non_target_fit_mask` 的断言。
+- `P_k = (B Γ_ref⁻¹ Bᵀ)_kk`（mm²），经 `validate_helix_model.predictive_covariance`
+  （`damping=PRODUCTION_DAMPING=0.0`）计算；rank-deficient 行比例上限沿用
+  `MAX_RANK_DEFICIENT_ROW_FRACTION=1e-3`，超过即 `inconclusive`。
+- target 分量集合：`hit_mask ∧ is_target ∧ 求交有效`；LOC1 另需 `loc1_mask`（1D strip LOC1 排除）。
+- `V_k` 为生产所用方差（含 `STRIP_Y_FLOOR`）；`V_raw,k` 为未加 floor 的方差（F4 透传）。
+  floor active ⇔ `V_raw,k < V_k`。
+- 残差 `r_k = m_k − ŷ_k`（未白化，mm）在两套 target 几何上计算，非 target 几何均为 nominal：
+  `input`（P0.1 输入错位几何）与 `aligned`（P0.1 fixed-track 输出几何
+  `aligned_transforms_schur-p0-fixedtrack-20260922_joint_free.json`，SHA256
+  `2b445fed…ef2eabb`）。ref-only refit 不读 target 几何，因此两套几何共用同一组径迹。
+- 内插 / 外推：按 `build_track_batches` 的 hit 顺序（径向半径、|z|），target hit 前后都有非 target
+  fit hit 为 `interpolation`，仅前有为 `forward_extrapolation`，仅后有为 `backward_extrapolation`。
+
+### C. 输出（每个分层）
+
+主单元为 {17:8, 24:4} × {LOC0, LOC1} 共 4 格（汇总所有 regime 与 floor 状态）；
+子分层为 主单元 × regime × floor 状态。每格报告：分量数、径迹数；`V̄`、`V̄_raw`、`P̄`；
+`R_stat = ΣP / ΣV`（即 `tr(BΓ_ref⁻¹Bᵀ)/tr(V)`）与 `ΣP / ΣV_raw`；per-component `P/V` 的中位数；
+`M̄_aligned`、`M̄_input`（残差平方均值）；`U = M̄_aligned − V̄ − P̄`（未解释项）；
+`mean r²/(V+P)` 与 `mean r²/V`（aligned）。另报每 sensor target 分量数的中位数。
+
+### D. 判读规则（按主单元，固定于运行前）
+
+- `statistical_important` ⇔ `R_stat ≥ 0.10`；
+- `model_dominated` ⇔ `U > P̄` 且 `U > 0.10·V̄`；
+- 总体结论：
+  1. 任一主单元 `statistical_important ∧ ¬model_dominated` → **outcome 1**（径迹统计不确定度重要，
+     继续 Schur，预期相对 fixed-track 信息量下降、不确定度更可信）；
+  2. 否则若任一主单元 `model_dominated` → **outcome 2**（模型误差主导，Schur 仍可做但须下调
+     truth 改善预期，且声明 `S⁻¹` 不是完整物理协方差）；
+  3. 否则 → **outcome 3**（两项都小：Schur 的统计收益预期很小）。
+- 已知偏差，不做修正、只报告：`aligned` 残差来自 fixed-track 对这些 target hit 的 3-DOF/sensor 拟合，
+  `M̄_aligned` 约偏低 `3 / n_sensor` 量级，用每 sensor 分量数中位数界定。`M̄_input` 含注入错位，
+  只作对照，不进入判读。
+- P1 结果可以支撑「是否继续 Schur」以及**运行前写入**的 H1 判据修订，不得用于选择 damping、
+  floor、收敛阈值、筛选或模型变体。H1「truth RMS ≥10%」判据本轮不修订。
+
+### E. L1 真实两臂的处置
+
+`2026-09-08-block-lm-convergence-contract.md` §11 要求 A/B 两臂共用「同一 train event-key hash」。
+event split 移除后此条件无法满足。v2 收敛契约的代码已在 Iteration 29/30 的 100k 全事件闭环中运行
+（2,268/2,268 interior `converged`，budget-exhausted / rank-deficient / intersection-failed 均为 0，
+`min_components_delta_accepted=0`），P0.1 也证明 HEAD `2b8cd3e` 与之数值等价
+（decrement/component p99 7.77e-7 < 1e-6）。**因此宣告 L1 真实两臂被 Iteration 29/30 替代，
+不再单独执行**；roadmap M1 的「L1 完成」前置视为满足。
+
+替代**不覆盖**的部分（不得引申）：
+
+- 未运行 A 臂（`e9c63b2`），不能宣称 v1→v2 在真实数据上的 truth 差异或几何等价；
+- `clipped_step_fraction=0.825`：`lm_max_step_t/r` 解后裁剪承担了大部分步长控制，这一点未经审计，
+  留给 Schur P6（全局收敛契约）以先红后绿的回归处理。
+
+### F. 结果（2026-10-10，本段只回填，不改上文任何定义或阈值）
+
+运行 `schur-p1-error-budget-20261010`（manifest schema 2，`completed`，源码快照 `written`，
+耗时 4,763 s）。产物：`data/experiments/surface_helix/Vol17_Lay8__Vol24_Lay4/schur-p1-error-budget-20261010/`
+（`error_budget.json`、`strata.csv`、`components.csv.gz`）。
+
+**身份闸门 `passed`**：四项输入 SHA256 与 P0.1 一致；retained 61,482 / excluded 37,476；
+refit `n_components=1,154,761`，`chi2_per_component=0.7635026065294721`（与 P0.1 逐位相同）；
+seed 与 refit 非驻点行比例均为 0；rank-deficient 行 0，target 分量因求交失败或 rank 丢弃均为 0。
+`Γ_ref` 条件数 p50 1.19e5、p99 2.47e5、max 6.4e8。
+
+| 主单元 | n | V̄ (mm²) | P̄ (mm²) | R_stat | M̄_aligned | U | r²/(V+P) | r²/V | 判读 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 17:8 LOC0 | 71,345 | 2.25e-4 | 1.30e-4 | 0.577 | 4.57e-4 | 1.02e-4 | 1.29 | 2.03 | stat |
+| 17:8 LOC1 | 71,345 | 2.25e-4 | 7.42e-4 | 3.30 | 1.04e-3 | 7.47e-5 | 1.20 | 4.63 | stat |
+| 24:4 LOC0 | 71,842 | 1.85e-3 | 4.39e-4 | 0.238 | 2.30e-3 | 1.49e-5 | 1.01 | 1.25 | stat |
+| 24:4 LOC1 | 71,842 | 1.44 | 5.12e-3 | 0.0036 | 1.38 | −0.066 | 0.95 | 0.96 | — |
+
+**总体结论：outcome 1（径迹统计不确定度重要）**。三个主单元 `statistical_important`，
+无一 `model_dominated`。
+
+必须同时记录的事实（不改变判读，但限制其解读）：
+
+- **regime 分层退化**：两层 target 全部为内插，仅 17:8 有 5 个 backward extrapolation 分量，
+  无 forward extrapolation。plan 要求的内插 / 外推对比在本行集上不可得。
+- **floor 分层为空**：target 方差按层、按分量都是常数；24:4 LOC1 原始方差本身就是 1.44 mm²，
+  因此 `STRIP_Y_FLOOR` 在 target 分量上从未生效。plan §3.2 关于「floor-active LOC1 pull」的保留意见
+  对这两层 target 不适用。
+- **17:8 LOC0 靠近 model 边界**：U/P̄ = 0.79。若按 `3/n_sensor·M̄` 粗略补回 fixed-track 自由度偏差
+  （+2.3e-5），U ≈ 1.25e-4，仍 < P̄（1.30e-4），但余量只有约 4%。outcome 1 不依赖该单元：
+  17:8 LOC1（U/P̄=0.10）与 24:4 LOC0（加偏差上界后 U ≲ 1.4e-4 < P̄=4.4e-4）各自独立满足。
+- 24:4 LOC1（ty 方向）由测量方差主导（R_stat 0.0036），Schur 对它的统计修正预期可忽略；
+  这与已知的 24:4 ty 在信息下限一致。
+- 本结果是 `diagnostic_only`：不修订 H1 判据（WP3 待用户决定），不用于任何求解器参数选择。

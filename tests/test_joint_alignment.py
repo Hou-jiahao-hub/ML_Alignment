@@ -171,6 +171,70 @@ def test_build_track_batches_is_deterministic_and_preserves_1d_mask():
     assert torch.allclose(a.covariances[a.hit_mask][:, 1], torch.ones(6))
 
 
+def test_build_track_batches_carries_unfloored_variance_in_covariance_order():
+    m = load_module()
+    rows = []
+    for track_nr, n_hits in ((11, 3), (12, 2)):
+        for j in range(n_hits):
+            rows.append(
+                dict(
+                    event_nr=1,
+                    track_nr=track_nr,
+                    sensor_idx=j,
+                    volume_id=24 if j == 0 else 10,
+                    layer_id=4 if j == 0 else j,
+                    module_id=j + 1,
+                    g_x_smt=10.0 * (3 - j),
+                    g_y_smt=0.0,
+                    g_z_smt=float(j),
+                    l_x_hit=0.0,
+                    l_y_filled=0.0,
+                    loc1_valid=True,
+                    var0=0.01 * (j + 1),
+                    var1=0.04 * (j + 1),
+                )
+            )
+    frame = pd.DataFrame(rows)
+    inputs = _make_inputs(m, frame)
+    inputs.covariances = inputs.raw_covariances.clone()
+    floored = torch.tensor(frame.volume_id.to_numpy() == 24)
+    inputs.covariances[floored, 1] = m.STRIP_Y_FLOOR
+
+    batches = m.build_track_batches(inputs, ((24, 4),), min_hits=1, min_span=0.0)
+
+    assert batches.raw_covariances.shape == batches.covariances.shape
+    assert torch.equal(batches.raw_covariances[~batches.hit_mask], torch.ones(1, 2))
+    assert torch.equal(batches.covariances[~batches.hit_mask], torch.ones(1, 2))
+    floor_active = (batches.raw_covariances < batches.covariances) & batches.hit_mask[..., None]
+    assert torch.equal(
+        floor_active[..., 1], batches.is_target & batches.hit_mask
+    )
+    assert not floor_active[..., 0].any()
+    unchanged = ~floor_active & batches.hit_mask[..., None]
+    assert torch.equal(batches.raw_covariances[unchanged], batches.covariances[unchanged])
+
+
+def test_build_track_batches_leaves_raw_variance_absent_when_input_has_none():
+    m = load_module()
+    frame = pd.DataFrame(
+        [
+            dict(
+                event_nr=1, track_nr=1, sensor_idx=j,
+                volume_id=17 if j == 0 else 10, layer_id=8 if j == 0 else j,
+                module_id=j + 1, g_x_smt=10.0 * (j + 1), g_y_smt=0.0, g_z_smt=0.0,
+                l_x_hit=0.0, l_y_filled=0.0, loc1_valid=True, var0=0.01, var1=0.04,
+            )
+            for j in range(3)
+        ]
+    )
+    inputs = _make_inputs(m, frame)
+    inputs.raw_covariances = None
+
+    batches = m.build_track_batches(inputs, ((17, 8),), min_hits=1, min_span=0.0)
+
+    assert batches.raw_covariances is None
+
+
 def _initialization_frame(target_x=200.0, target_measurement=0.0):
     rows = []
     for index, x in enumerate(np.linspace(0.0, 400.0, 9)):
