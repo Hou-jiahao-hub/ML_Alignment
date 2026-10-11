@@ -3006,3 +3006,115 @@ seed 与 refit 非驻点行比例均为 0；rank-deficient 行 0，target 分量
 - 24:4 LOC1（ty 方向）由测量方差主导（R_stat 0.0036），Schur 对它的统计修正预期可忽略；
   这与已知的 24:4 ty 在信息下限一致。
 - 本结果是 `diagnostic_only`：不修订 H1 判据（WP3 待用户决定），不用于任何求解器参数选择。
+
+---
+
+## Iteration 34 — Schur P2 / P3 / P4：径迹块前置、Jacobian 闭合与三 oracle（预注册）
+
+**日期**：2026-10-11。**状态**：预注册，写于 `scripts/joint_alignment_schur.py` 及任何相关测试、
+任何数据运行之前。**上游**：`plan.md` Phase P2、P3、P4，§3.3–§3.7、§3.10、§8.1–§8.2、§8.4；
+P1 决策笔记 `docs/handoff/2026-10-10-schur-p1-error-budget-decision.md`。
+**性质**：合成验证 + 一次 `diagnostic_only` 小样本诊断。不实现 ρ、λ 自适应、`schur-lm` CLI、
+稀疏累加、diagonal-only 消融；不修改 `run_block_lm_alignment`、`lm_max_step_t/r`、收敛常量、
+`STRIP_Y_FLOOR`。H1 判据（WP3）本轮不修订，最迟在 Level D 全量运行前定下。truth 不参与任何计算；
+合成测试里的「真值」只是生成数据用的已知参数。
+
+### A. 共同约定
+
+- 残差：`r = m − ŷ`，按分量白化 `r / sqrt(max(V, 1e-8))`，`V` 为生产方差（含 `STRIP_Y_FLOOR`）。
+  `F = ½·Σ r_white²`。分量集合与生产一致：`hit_mask ∧ 求交有效`，LOC1 另需 `loc1_mask`；
+  1D strip LOC1、padding、求交失败的位置在残差和全部 Jacobian 中精确为 0。
+- 几何参数：仅 target sensor 的 active DOF `(tx, ty, rz)`，局部组合沿用 `apply_alignment_torch`
+  （`c = c0 + R0·δt`，`R = R0·R(δr)`）。几何 Jacobian 以无量纲变量 `u` 表示：`a = s ⊙ u`，
+  `s = (1 mm, 1 mm, 0.01 rad)`，与 block-LM 的 `physical_scales` 相同。非 target 几何固定，ref 行的 `A ≡ 0`。
+- 径迹参数：生产 5 参 gauge 帧 `θ = (o0, o1, ψ0, tanλ, ρ/1e-4)`，帧由 `reference_gauge_frame(当前物理 helix)`
+  构造；θ 不再额外缩放。
+- `Γ = Γ_ref + Γ_tgt`，组成写死，不提供开关。
+- 全部线性代数用 float64。局部 5×5 块只做 Cholesky 解（`cholesky_ex`），失败显式报告，不求显式逆。
+- 数值秩：`torch.linalg.matrix_rank` 的默认容差（`max(m, n)·eps·σ_max`）。
+- 本轮不启用 damping floor（ε = 0，plan §3.7 的 B 阶段）：`D_a = diag(C)`，`D_θ = diag(Γ)`，
+  只取 active 方向。只有出现可复现的数值失败时，才另写预注册引入分组 floor。
+
+### B. P3：Jacobian 闭合判据
+
+- 有限差分：中心差分，float64，步长 `h = 1e-6`（`u` 与 `θ` 各自的单位下）。
+- 逐元素通过条件：`|J_ad − J_fd| ≤ 1e-6·|J_ad| + 1e-8·max_col|J_ad|`，
+  其中 `max_col` 是同一列（同一参数）全部行的最大绝对值。第二项防止结构上接近 0 的元素
+  因舍入噪声被误判，同时远小于任何物理上有意义的导数。
+- 结构零必须精确为 0（不走容差）：ref 行的 `A`、1D strip LOC1 行、padding、求交失败行。
+- 分层统计（报告 max 与 p99 的相对误差、通过率）：sensor、DOF、LOC0/LOC1、strip 类型（1D/2D）、
+  倾角（`|cos α|`，α 为径迹方向与面法向的夹角）；`|cos α| < 0.3` 记为近平行入射。
+  **通过 ⇔ 所有分层的通过率均为 100%。**
+- 与生产路径一致（相对 Frobenius 差 ≤ `1e-10`，只差 BLAS 归约顺序）：
+  (1) 单 sensor 的 `C_s`、`c_s`（由 `A` 组装，已乘 `s`）与 `_block_lm_linearized_block` 在同一
+  `fixed_mask` 上返回的 `fisher`、`gradient` 一致；
+  (2) `B` 的 ref 行与 `helix_model.measurement_residual_jacobian` 一致；
+  (3) `EPS_COVARIANCE == MEASUREMENT_VARIANCE_FLOOR == 1e-8`（两条白化路径的下限相同）。
+
+### C. P2：径迹块与协方差前置
+
+- **对称与正定**（合成）：`Γ_ref`、`Γ` 对称（相对 Frobenius 非对称度 ≤ `1e-12`），Cholesky 成功；
+  `λ_min(Γ − Γ_ref) ≥ −1e-12·λ_max(Γ)`。
+- **ref-only 驻点**：复用 `helix_model.measurement_newton_decrement`（`βᵀΓ_ref⁻¹β`），
+  阈值沿用 `MEASUREMENT_NEWTON_DECREMENT_STATIONARY = 1e-6`。只作初始化质量诊断，
+  不是联合求解开始后的逐步收敛要求。
+- **gauge 生命周期**（合成）：
+  (1) 在帧 F0 中接受 `δθ` 后 unpack 得物理 helix `p1`；用 `p1` 重建 F1 后 pack，再 unpack，与 `p1` 的差
+  ≤ `1e-12`（相对）；
+  (2) 负对照：把 F1 中算出的第二步增量错用到 F0 上，得到的物理 helix 与正确结果的差必须
+  ≥ `1e-6`（相对），证明测试能抓出「跨帧复用增量」；
+  (3) 模块 API 只接受物理 helix 作为线性化输入，不接受上一轮的 5 维增量。
+- **合成 MC pull 标定**：真值 helix 穿过一组合成平面，按已知 `V` 加高斯噪声，
+  `N_rep = 4000`，种子 `20261011`。帧固定为真值 helix 自身的 gauge 帧（真值 θ 的 offset 为 0），
+  在该帧中做 ref-only GN 至 `βᵀΓ⁻¹β ≤ 1e-12`。
+  pull 有两种：`(θ̂ − θ_true)_i / sqrt((Γ_ref(θ̂)⁻¹)_ii)`，以及 target 预测残差 `r_k / sqrt(V_k + P_k)`。
+  分层：ref hit 数 {8, 16}、tanλ {0.2, 1.5}、target 位置 {内插, 外推}。
+  **通过 ⇔ 每格每个量的 `|mean| ≤ 0.05` 且 `|std − 1| ≤ 0.05`**
+  （N = 4000 时 std 的标准误约 0.011，0.05 约为 4.5σ，所以 30+ 个格子不会因偶然性误判）。
+  另设一格 floor-active 的 strip LOC1 target 分量：只报告，不判定——floor 是有意的方差放大，pull 宽度预期 < 1。
+- **小样本真实数据诊断**（`scripts/analysis/measure_track_block_conditioning.py`）：
+  - 输入与 P0.1 / P1 相同（`geometry` / `states` / `nominal_geometry` 三项 SHA256 与 P0.1 manifest 逐字节一致，
+    否则停止），生产筛选，`max_tracks=2000`（即 `build_track_batches` 的前 2000 条保留径迹，
+    加载上限 `4×max_tracks`，与生产 CLI 相同）；seed 迭代 2000 次 → `require_stationary_helix_point_fit` →
+    生产 GN refit（含非驻点闸门）；target 几何取输入错位几何、alignment = 0
+    （即 Schur 求解器将来的起点）。
+  - 报告：retained 径迹数、ref / target 分量数；`Γ_ref` 与 `Γ` 的条件数（p50/p90/p99/max）、
+    数值秩、Cholesky 失败数、非有限数；ref-only Newton decrement 分布及超过 1e-6 的行数；
+    `tr(Γ_tgt)/tr(Γ_ref)` 的分布。
+  - P3 闭合在真实径迹上的复核：从保留径迹中按种子 `20261011` 无放回抽 200 条，判据同 §B。
+  - 判定：非有限数 = 0、Cholesky 失败 = 0、真实径迹 P3 闭合 100% 通过。条件数与秩只报告，
+    不设阈值（本轮不据此调任何参数）。manifest 的 `command` 必须是可原样执行的完整命令。
+
+### D. P4：三 oracle、阻尼安全与归因
+
+- 数据层级：Level A 为纯代数随机问题（控制条件数 ≤ `1e6`，并记录实际值）；
+  Level B 为真实 helix 与求交代码在合成平面上生成的线性化（≥ 3 条径迹、≥ 2 个 target sensor，
+  至少一对 sensor 被同一条径迹共同穿过，至少一个 sensor 不与其他 sensor 共享径迹）。
+- **稠密 vs Schur**（λ = 0 与 λ = 1，λ = 1 时用 §A 的 `D_a`、`D_θ`）：
+  `‖δa_S − δa_D‖/‖δa_D‖ < 1e-8`，`‖δθ_S − δθ_D‖/‖δθ_D‖ < 1e-8`（δθ 为所有径迹拼接；δa 用 `u` 单位）。
+- **代数性质**（相对容差 `1e-10`）：`S_t` 对称；`G = 0 ⇒ S = C, b = c`；
+  `Γ_ref ← κ·Γ_ref`，κ ∈ {1e4, 1e8} 时 `‖S − C‖/‖C‖` 随 κ 单调减小，κ = 1e8 时 ≤ `1e-6`（趋于 fixed-track）；
+  多径迹累加等于逐径迹和；共享径迹的 sensor 对产生非零非对角块；不共享的 sensor 对的非对角块**精确为 0**
+  （不构造该块）。
+- **Woodbury**（λ = 0，通过公开调用 `schur_reduce(..., lam=0.0)`）：测试内独立组装稠密
+  `R = V + B_tgt Γ_ref⁻¹ B_tgtᵀ`（不调用模块的组装函数），要求 `‖S − A_tgtᵀR⁻¹A_tgt‖_F/‖S‖_F < 1e-8`；
+  在 `β_ref = 0` 的 ref-only 驻点上，要求 `‖b − A_tgtᵀR⁻¹r_tgt‖/‖b‖ < 1e-8`。
+  （白化坐标下 `V = I`；这里的 `R⁻¹` 用稠密 `torch.linalg.solve` 求，与模块里逐径迹的 Cholesky 路径相互独立。）
+- **大阻尼极限**：λ ∈ {1e2, 1e4, 1e6, 1e8}，`D_a = diag(C)`，`D_θ = diag(Γ)`。
+  - 联合阻尼（生产形式）：`‖δ(1e6)‖/‖δ(1e4)‖ ≤ 0.02`，`‖δ(1e8)‖/‖δ(1e6)‖ ≤ 0.02`，对 δa、δθ 分别成立；
+    且 `‖δ(1e8)‖ ≤ 1e-6·‖δ(0)‖`。λ = 1e2 只报告（问题维度较大时 1e2 可能还未进入渐近区）。
+  - 负对照 `_geometry_only_damped_step`（只阻尼 C，**只在测试文件里定义**）：λ = 1e8 时
+    `‖δa‖ ≤ 1e-6·‖δa(0)‖`，且 `‖δθ + Γ⁻¹β‖/‖Γ⁻¹β‖ ≤ 1e-4`（target-inclusive 的纯径迹吸收极限）。
+  - 用源码 grep 断言 `scripts/joint_alignment_schur.py` 中不存在 `geometry_only` 字样。
+- **归因**（Level B，纯几何注入，无噪声）：在 ref-only refit 后的径迹上，对两个 target sensor 注入
+  `±(10 µm, 10 µm, 0.1 mrad)`。λ = 0 的联合 GN 步定义
+  `f_geo = −⟨r_tgt, A_tgt δa⟩ / ‖r_tgt‖²`，`f_trk = −⟨r_tgt, B_tgt δθ⟩ / ‖r_tgt‖²`（白化内积）。
+  **通过 ⇔** `f_geo ≥ 0.99`、`|f_trk| ≤ 0.01`、`‖s⊙δu − a_inj‖/‖a_inj‖ ≤ 1e-3`，
+  且 `+` 与 `−` 两次注入恢复出的 δa 满足 `‖δa₊ + δa₋‖/‖δa₊‖ ≤ 1e-3`（符号反演）。
+  负对照（几何-only 阻尼，λ = 1e8）的 `f_trk` 只报告；唯一断言是它严格大于联合步的 `f_trk`。
+
+### E. 门出口与停止条件
+
+P3 全部通过 + P4 全部通过 + P2 合成项全部通过 + 小样本诊断的 §C 判定通过，才记为
+「P2–P4 通过」。任一失败即按 plan §18 停下来排查；**不放宽本条目中的任何容差**。
+如确需修改容差，必须先在新的 Iteration 写明数值理由，再重跑。
