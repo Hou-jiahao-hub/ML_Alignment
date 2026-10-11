@@ -24,12 +24,13 @@ step, the global decrement with its rank test, and the terminal state.  The
 sensors, so there are no per-sensor damping, terminal states or retirement.
 Legacy per-DOF post-solve step clipping does not exist on this path.
 
-Production scale (plan.md §P7, Iteration 38): the reduced system is
+Production scale (plan.md §P7/§P8, Iteration 38): the reduced system is
 assembled as CSC from its 3x3 coordinate blocks and solved with SuperLU
 (``solve_geometry_sparse``); the decrement and rank test run per connected
 component of the sensor coupling graph (``global_stationarity_sparse``).
-There is no LM loop yet.  The ``*_dense`` helpers, ``global_stationarity``
-included, remain tiny-problem oracles.
+``schur_lm_loop`` chains the contract functions into the joint LM iteration
+and ``run_schur_lm_alignment`` runs it on the helix model.  The ``*_dense``
+helpers, ``global_stationarity`` included, remain tiny-problem oracles.
 """
 
 from __future__ import annotations
@@ -334,6 +335,25 @@ def linearize_tracks(
         target_sensors=inputs.target_sensors,
         active_dof=active_dof,
     )
+
+
+def whitened_residuals(
+    parameters: torch.Tensor,
+    batches,
+    geometry,
+    alignment: torch.Tensor | None = None,
+    active_dof: Sequence[int] = DEFAULT_ACTIVE_DOF,
+    chunk_hits: int = 65_536,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Residuals of ``linearize_tracks`` without the Jacobians, and the valid components."""
+    active_dof = tuple(int(dof) for dof in active_dof)
+    parameters = parameters.detach().to(device="cpu", dtype=DTYPE)
+    inputs = _hit_inputs(parameters, batches, geometry, alignment, active_dof)
+    residual = torch.zeros((*inputs.is_target.shape, 2), dtype=DTYPE)
+    for start in range(0, len(inputs.track_index), chunk_hits):
+        t, h, arguments = inputs.chunk(start, start + chunk_hits)
+        residual[t, h] = _BATCHED_HIT_RESIDUAL(*arguments)
+    return residual, inputs.component_mask
 
 
 def commit_track_step(parameters: torch.Tensor, delta_theta: torch.Tensor) -> torch.Tensor:
@@ -1046,3 +1066,399 @@ def global_terminal_status(
         return SCHUR_LM_STATUS_CONVERGED
     return SCHUR_LM_STATUS_BUDGET_EXHAUSTED
 
+
+def structural_free_mask(blocks: JointNormalBlocks) -> torch.Tensor:
+    """Geometry DOFs with information at this linearisation: ``diag(C) > 0`` per sensor.
+
+    A DOF with exactly zero information is an inactive direction (plan.md §3.7
+    step A): it is removed from the solve, never damped or floored.
+    """
+    information, _gradient = blocks.geometry_information()
+    return information.diagonal(dim1=-2, dim2=-1) > 0.0
+
+
+@dataclass(frozen=True)
+class ObjectiveEvaluation:
+    """``F = 0.5 sum r^2`` on the frozen ref + target components."""
+
+    objective: float
+    chi2_ref: float
+    chi2_tgt: float
+    n_components_ref: int
+    n_components_tgt: int
+    lost: bool
+    finite: bool
+
+
+def evaluate_objective(
+    residual: torch.Tensor,
+    valid: torch.Tensor,
+    frozen: torch.Tensor,
+    is_ref: torch.Tensor,
+    is_target: torch.Tensor,
+) -> ObjectiveEvaluation:
+    """Score a trial on the frozen set; ``lost`` if any frozen component is no longer valid."""
+    squared = torch.where(frozen, residual, torch.zeros_like(residual)).square()
+    ref = frozen & is_ref.unsqueeze(-1)
+    tgt = frozen & is_target.unsqueeze(-1)
+    chi2_ref = float(squared[ref].sum())
+    chi2_tgt = float(squared[tgt].sum())
+    return ObjectiveEvaluation(
+        objective=0.5 * float(squared.sum()),
+        chi2_ref=chi2_ref,
+        chi2_tgt=chi2_tgt,
+        n_components_ref=int(ref.sum()),
+        n_components_tgt=int(tgt.sum()),
+        lost=bool((frozen & ~valid).any()),
+        finite=math.isfinite(chi2_ref) and math.isfinite(chi2_tgt),
+    )
+
+
+class HelixSchurModel:
+    """The production single-helix model as seen by ``schur_lm_loop``.
+
+    ``values`` are the physical active alignment of the target sensors that
+    carry target hits [n, k]; ``tracks`` are physical helices [T, 6].  Track
+    increments are committed through ``commit_track_step``, so the gauge frame
+    is rebuilt from the physical state at every linearisation.
+    """
+
+    def __init__(self, batches, geometry, active_dof: Sequence[int] = DEFAULT_ACTIVE_DOF):
+        self.batches = batches
+        self.geometry = geometry
+        self.active_dof = tuple(int(dof) for dof in active_dof)
+        hit_mask = batches.hit_mask.to("cpu")
+        is_target = batches.is_target.to("cpu") & hit_mask
+        self.target_sensors = torch.unique(batches.sensor_idx.to("cpu")[is_target])
+        self.is_target = is_target
+        self.is_ref = hit_mask & ~is_target
+
+    def alignment(self, values: torch.Tensor) -> torch.Tensor:
+        alignment = torch.zeros((len(self.geometry.centers), 6), dtype=DTYPE)
+        alignment[self.target_sensors[:, None], torch.tensor(self.active_dof)] = values
+        return alignment
+
+    def linearize(self, values, tracks) -> TrackLinearization:
+        return linearize_tracks(tracks, self.batches, self.geometry, self.alignment(values), self.active_dof)
+
+    def evaluate(self, values, tracks, frozen) -> ObjectiveEvaluation:
+        residual, valid = whitened_residuals(
+            tracks, self.batches, self.geometry, self.alignment(values), self.active_dof
+        )
+        return evaluate_objective(residual, valid, frozen, self.is_ref, self.is_target)
+
+    def advance_tracks(self, tracks, delta_theta):
+        return commit_track_step(tracks, delta_theta)
+
+
+@dataclass(frozen=True)
+class SchurLMResult:
+    values: torch.Tensor
+    tracks: torch.Tensor
+    status: str
+    reason: str
+    lam: float
+    iterations: list
+    trials: list
+    stationarity: GlobalStationarity | None
+    #: (block, active column) pairs without information at the last linearisation.
+    structurally_absent: list
+
+
+class _NumericalFailure(Exception):
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _finite_linearization(lin: TrackLinearization) -> bool:
+    return all(
+        bool(torch.isfinite(tensor).all())
+        for tensor in (lin.residual, lin.geometry_jacobian, lin.track_jacobian)
+    )
+
+
+def _attribution(lin: TrackLinearization, delta_u, delta_theta) -> tuple[float, float]:
+    """First-order target-residual change split into ``|A du|^2`` and ``|B dtheta|^2``."""
+    target = (lin.component_mask & lin.is_target.unsqueeze(-1)).to(DTYPE)
+    geometry = (lin.geometry_jacobian @ delta_u[lin.block_index.clamp_min(0)].unsqueeze(-1)).squeeze(-1)
+    track = (lin.track_jacobian @ delta_theta[:, None, :, None]).squeeze(-1)
+    return float((geometry * target).square().sum()), float((track * target).square().sum())
+
+
+def schur_lm_loop(
+    model,
+    values: torch.Tensor,
+    tracks: torch.Tensor,
+    bounds: torch.Tensor,
+    *,
+    lambda_init: float = SCHUR_LM_LAMBDA_INIT,
+    max_iters: int = SCHUR_LM_MAX_ITERS,
+    solve=solve_geometry_sparse,
+    stationarity=global_stationarity_sparse,
+) -> SchurLMResult:
+    """The joint LM iteration of plan.md §P8 under the Iteration 37 contract.
+
+    Each outer iteration linearises at the current point, freezes its valid
+    ref + target components, and checks stationarity on the undamped system
+    before stepping.  Retries reuse that linearisation and change only lambda;
+    a rejected trial changes nothing else.  ``max_iters`` counts steps: the
+    point reached by the last one is still checked.
+    """
+    lam = float(lambda_init)
+    stall = 0
+    iterations, trials = [], []
+    report = None
+    absent = []
+    rank_deficient = False
+    status = reason = None
+    for iteration in range(max_iters + 1):
+        try:
+            lin = model.linearize(values, tracks)
+            if not _finite_linearization(lin):
+                raise _NumericalFailure("non_finite_linearization")
+            blocks = normal_blocks(lin)
+            undamped = schur_reduce(blocks, 0.0)
+        except TrackBlockFactorizationError:
+            status, reason = SCHUR_LM_STATUS_NUMERICAL_FAILURE, "track_block_factorization"
+            break
+        except _NumericalFailure as failure:
+            status, reason = SCHUR_LM_STATUS_NUMERICAL_FAILURE, failure.reason
+            break
+        structural = structural_free_mask(blocks)
+        absent = torch.nonzero(~structural).tolist()
+        free = free_geometry_mask(values, undamped.rhs, bounds) & structural
+        report = stationarity(blocks, undamped, free)
+        rank_deficient = report.rank_deficient
+        iterations.append({
+            "iteration": iteration,
+            "lam": lam,
+            "lambda2_geo": report.lambda2_geo,
+            "lambda2_trk_max": report.lambda2_trk_max,
+            "rank_deficient": report.rank_deficient,
+            "min_scaled_eigenvalue": report.min_scaled_eigenvalue,
+            "null_gradient_max": report.null_gradient_max,
+            "largest_component_dof": report.largest_component_dof,
+            "n_free": report.n_free,
+            "n_structurally_absent": len(absent),
+        })
+        if report.stationary:
+            status = global_terminal_status(rank_deficient=rank_deficient, stationary=True)
+            reason = "stationary"
+            break
+        if iteration == max_iters:
+            break
+
+        frozen = lin.component_mask
+        before = evaluate_objective(lin.residual, frozen, frozen, lin.is_ref, lin.is_target)
+        d_a, d_theta = marquardt_scales(blocks)
+        # Only so that schur_reduce can build the damped system: these rows are
+        # pinned at du = 0 by restrict_to_free, so the value never enters a solve.
+        d_a = torch.where(structural, d_a, torch.ones_like(d_a))
+        accepted = saturated = ladder_lost = False
+        try:
+            for attempt in range(1 + SCHUR_LM_MAX_RETRIES):
+                try:
+                    system = schur_reduce(blocks, lam, (d_a, d_theta))
+                    step = feasible_joint_step(system, values, free, bounds, lin.active_dof, solve=solve)
+                except TrackBlockFactorizationError as error:
+                    raise _NumericalFailure("track_block_factorization") from error
+                except (RuntimeError, torch.linalg.LinAlgError) as error:
+                    raise _NumericalFailure("geometry_factorization") from error
+                delta_u = step.alpha * step.delta_u
+                delta_theta = step.alpha * step.delta_theta
+                predicted = joint_model_reduction(blocks, delta_u, delta_theta).predicted
+                trial_values = apply_geometry_step(values, step.delta_u, step.alpha, bounds, lin.active_dof)
+                trial_tracks = model.advance_tracks(tracks, delta_theta)
+                after = model.evaluate(trial_values, trial_tracks, frozen)
+                valid = after.finite and not after.lost
+                actual = before.objective - after.objective
+                try:
+                    rho = gain_ratio(actual if valid else math.nan, predicted)
+                except ModelReductionError as error:
+                    raise _NumericalFailure("non_positive_predicted_reduction") from error
+                decision = update_damping(lam, rho, valid)
+                ladder_lost = ladder_lost or after.lost
+                geometry_part, track_part = _attribution(lin, delta_u, delta_theta)
+                trials.append({
+                    "iteration": iteration,
+                    "attempt": attempt,
+                    "lam": lam,
+                    "branch": decision.branch,
+                    "accepted": decision.accepted,
+                    "reject_reason": (
+                        None if decision.accepted
+                        else "component_loss" if after.lost
+                        else "non_finite" if not after.finite
+                        else "insufficient_decrease"
+                    ),
+                    "alpha": step.alpha,
+                    "n_resolves": step.n_resolves,
+                    "n_free": int(step.free.sum()),
+                    "n_structurally_absent": len(absent),
+                    "objective_before": before.objective,
+                    "objective_after": after.objective,
+                    "chi2_ref_before": before.chi2_ref,
+                    "chi2_ref_after": after.chi2_ref,
+                    "chi2_tgt_before": before.chi2_tgt,
+                    "chi2_tgt_after": after.chi2_tgt,
+                    "n_components_ref": before.n_components_ref,
+                    "n_components_tgt": before.n_components_tgt,
+                    "predicted": predicted,
+                    "actual": actual,
+                    "rho": rho,
+                    "geo_step_norm": float(delta_u.norm()),
+                    "track_step_norm": float(delta_theta.norm()),
+                    "target_geometry_part": geometry_part,
+                    "target_track_part": track_part,
+                })
+                lam = decision.lam
+                if decision.accepted:
+                    values, tracks = trial_values, trial_tracks
+                    stall = update_stall_count(stall, step.alpha)
+                    accepted = True
+                    break
+                if decision.saturated:
+                    saturated = True
+                    break
+        except _NumericalFailure as failure:
+            status, reason = SCHUR_LM_STATUS_NUMERICAL_FAILURE, failure.reason
+            break
+        if not accepted:
+            status = global_terminal_status(
+                retries_exhausted=True,
+                component_loss_seen=ladder_lost,
+                rank_deficient=rank_deficient,
+            )
+            reason = "damping_ceiling" if saturated else "damping_retries"
+            break
+        if stall >= SCHUR_LM_STALL_ITERS:
+            status = global_terminal_status(constraint_stalled=True, rank_deficient=rank_deficient)
+            reason = "constraint_stalled"
+            break
+    if status is None:
+        status = global_terminal_status(rank_deficient=rank_deficient)
+        reason = "outer_iters"
+    return SchurLMResult(
+        values=values,
+        tracks=tracks,
+        status=status,
+        reason=reason,
+        lam=lam,
+        iterations=iterations,
+        trials=trials,
+        stationarity=report,
+        structurally_absent=absent,
+    )
+
+
+def run_schur_lm_alignment(
+    batches,
+    geometry,
+    config,
+    active_dof: Sequence[int] = DEFAULT_ACTIVE_DOF,
+    initial_track_params=None,
+    *,
+    lambda_init: float = SCHUR_LM_LAMBDA_INIT,
+    max_iters: int = SCHUR_LM_MAX_ITERS,
+    solve=solve_geometry_sparse,
+    stationarity=global_stationarity_sparse,
+):
+    """Fit target geometry and every track jointly with ``schur-lm``.
+
+    Same inputs and result keys as ``run_block_lm_alignment``, so the pipeline
+    can switch solvers.  Runs on CPU in float64 whatever ``config.gpu`` says,
+    and the outer budget is ``SCHUR_LM_MAX_ITERS``, not ``config.lm_max_iters``;
+    there is no per-DOF step clipping.  ``history`` is the target chi2 per
+    frozen target component after each accepted step.
+    """
+    from ml_alignment_autograd import _target_alignment_evaluation, seed_helices
+
+    active_dof = tuple(int(dof) for dof in active_dof)
+    if initial_track_params is None:
+        initial_track_params = seed_helices(batches, device=torch.device("cpu"), dtype=DTYPE)
+    tracks = initial_track_params.detach().to(device="cpu", dtype=DTYPE)
+    model = HelixSchurModel(batches, geometry, active_dof)
+    zero = torch.zeros((len(geometry.centers), 6), dtype=DTYPE)
+    initial_loss, initial_invalid, initial_residuals, initial_mask = _target_alignment_evaluation(
+        tracks, zero, batches, geometry
+    )
+    if initial_invalid > config.joint_max_invalid_fraction:
+        raise ValueError(
+            "Initial schur-lm helices exceed the invalid-intersection limit: "
+            f"{initial_invalid:.2%} > {config.joint_max_invalid_fraction:.2%}."
+        )
+    bounds = geometry_bounds(active_dof, config.joint_clamp_t, config.joint_clamp_r)
+    values = torch.zeros((len(model.target_sensors), len(active_dof)), dtype=DTYPE)
+    result = schur_lm_loop(
+        model, values, tracks, bounds,
+        lambda_init=lambda_init, max_iters=max_iters, solve=solve, stationarity=stationarity,
+    )
+    alignment = model.alignment(result.values)
+    final_loss, final_invalid, final_residuals, final_mask = _target_alignment_evaluation(
+        result.tracks, alignment, batches, geometry
+    )
+    if final_invalid > config.joint_max_invalid_fraction:
+        raise ValueError(
+            "schur-lm result exceeds the invalid-intersection limit: "
+            f"{final_invalid:.2%} > {config.joint_max_invalid_fraction:.2%}."
+        )
+    accepted = [row for row in result.trials if row["accepted"]]
+    history = [row["chi2_tgt_after"] / max(row["n_components_tgt"], 1) for row in accepted]
+    best_iteration = int(min(range(len(history)), key=history.__getitem__)) if history else -1
+    report = result.stationarity
+    summary = {
+        "preregistration_version": SCHUR_LM_PREREGISTRATION_VERSION,
+        "status": result.status,
+        "reason": result.reason,
+        "lambda_init": float(lambda_init),
+        "final_lambda": result.lam,
+        "outer_iterations": len(result.iterations),
+        "accepted_steps": len(accepted),
+        "rejected_trials": len(result.trials) - len(accepted),
+        "component_loss_rejections": sum(row["reject_reason"] == "component_loss" for row in result.trials),
+        "max_resolves": max((row["n_resolves"] for row in result.trials), default=0),
+        "min_alpha": min((row["alpha"] for row in accepted), default=1.0),
+        "structurally_absent": [
+            [int(model.target_sensors[block]), active_dof[column]]
+            for block, column in result.structurally_absent
+        ],
+        "n_target_sensors": len(model.target_sensors),
+        "n_tracks": int(tracks.shape[0]),
+    }
+    if report is not None:
+        summary["final_stationarity"] = {
+            "lambda2_geo": report.lambda2_geo,
+            "lambda2_trk_max": report.lambda2_trk_max,
+            "n_free": report.n_free,
+            "rank_deficient": report.rank_deficient,
+            "lambda2_is_lower_bound": report.lambda2_is_lower_bound,
+            "min_scaled_eigenvalue": report.min_scaled_eigenvalue,
+            "null_gradient_max": report.null_gradient_max,
+            "largest_component_dof": report.largest_component_dof,
+        }
+    return {
+        "solver": "schur-lm",
+        "predicted_deltas": alignment.numpy(),
+        "track_params": result.tracks.numpy(),
+        "final_residuals": final_residuals.detach().cpu(),
+        "final_component_mask": final_mask.detach().cpu(),
+        "initial_residuals": initial_residuals.detach().cpu(),
+        "initial_component_mask": initial_mask.detach().cpu(),
+        "history": history,
+        "checkpoint_history": [(-1, float(initial_loss))] + [
+            (int(row["iteration"]), value) for row, value in zip(accepted, history)
+        ],
+        "best_total_loss": min([float(initial_loss)] + history),
+        "last_total_loss": float(final_loss),
+        "best_iteration": best_iteration,
+        "stopped_early": result.status != SCHUR_LM_STATUS_BUDGET_EXHAUSTED,
+        "stop_reason": result.reason,
+        "initial_total_loss": float(initial_loss),
+        "initial_invalid_fraction": initial_invalid,
+        "invalid_fraction": final_invalid,
+        "invalid_history": [initial_invalid, final_invalid],
+        "schur_lm_summary": summary,
+        "schur_lm_iterations": result.iterations,
+        "schur_lm_trials": result.trials,
+    }

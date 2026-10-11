@@ -1673,6 +1673,17 @@ def run_block_lm_alignment(
     }
 
 
+def select_joint_solver(config):
+    """The free-mode geometry solver named by ``config.joint_solver``."""
+    if config.joint_solver == "block-lm":
+        return run_block_lm_alignment
+    if config.joint_solver == "schur-lm":
+        from joint_alignment_schur import run_schur_lm_alignment
+
+        return run_schur_lm_alignment
+    return run_joint_alignment
+
+
 def run_joint_alignment(
     batches,
     geometry,
@@ -2450,11 +2461,7 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
         batches.layer_id,
         target_layers,
     )
-    solver = (
-        run_block_lm_alignment
-        if config.joint_solver == "block-lm"
-        else run_joint_alignment
-    )
+    solver = select_joint_solver(config)
     result = solver(
         batches,
         geometry,
@@ -2582,6 +2589,7 @@ def write_alignment_summary(result, output_path):
         "solver",
         "stop_reason",
         "block_lm_summary",
+        "schur_lm_summary",
     )
     summary = {key: _json_ready(result[key]) for key in retained_keys if key in result}
     if "predicted_deltas" in result:
@@ -2931,9 +2939,13 @@ def build_argument_parser():
     p.add_argument("--joint-iters", type=int, default=JOINT_ITERS)
     p.add_argument(
         "--joint-solver",
-        choices=("block-lm", "adam"),
+        choices=("block-lm", "schur-lm", "adam"),
         default=JOINT_SOLVER,
-        help="Free-mode geometry solver; block-lm keeps non-target-refitted tracks fixed.",
+        help=(
+            "Free-mode geometry solver; block-lm keeps non-target-refitted tracks fixed, "
+            "schur-lm fits geometry and tracks jointly (Schur-reduced LM, CPU float64, "
+            "no per-DOF step caps)."
+        ),
     )
     p.add_argument("--lm-max-iters", type=int, default=LM_MAX_ITERS)
     p.add_argument("--lm-initial-damping", type=float, default=LM_INITIAL_DAMPING)
