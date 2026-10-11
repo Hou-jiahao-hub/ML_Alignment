@@ -3327,3 +3327,159 @@ truth 指标，不能用来宣称 Schur 会改善对齐。P5（跨 sensor 协方
 **不能引申的地方**：这是受控单螺旋高斯模型下的代数与线性化闭合。它说明 `Γ_ref⁻¹` 正确传播到跨 sensor
 残差相关，因而 Schur 的 `S_ij` 在统计上有正确的来源；它**不**说明真实数据的 pull 正常（floor、多次散射、
 模型误差都不在内），也**不**说明 Schur 会改善对齐。几何 score 空间 `Cov(b) = S`、M1、P6 仍未做。
+
+---
+
+## Iteration 37 — Schur P6：全局收敛与约束契约（预注册）
+
+**日期**：2026-10-11。**状态**：预注册（§B 常量经用户确认后冻结），写于
+`tests/test_joint_schur_convergence_contract.py`、`tests/test_joint_schur_constraints.py` 及任何契约代码之前。
+**上游**：`plan.md` §3.8、§P6、§7、§14；理论评审 `docs/handoff/2026-09-22-schur-joint-alignment-theory-review.md`
+§4、§5.1、§5.2、§9 Q3–Q5；旧契约 `docs/handoff/2026-09-08-block-lm-convergence-contract.md`；
+交接 `docs/handoff/2026-10-11-schur-p5-cross-sensor-covariance.md`。
+**范围**：只定义契约并在 Level A/B 合成问题上回归。不实现 `schur-lm` 循环（P8）、不做生产稀疏累加与求解后端（P7）、
+不读 ROOT、不碰 truth、不跑 λ_init 敏感性扫描（只预注册网格）。不修改 `run_block_lm_alignment`、`BLOCK_LM_*`、
+`LM_MAX_STEP_*`、`JOINT_CLAMP_*`；`test_block_lm_blocks_are_decoupled_across_target_sensors` 保持绿色——
+旧契约只对 `block-lm` 有效，本条目只约束 `schur-lm`。
+
+**宣称边界（先声明）**：契约通过只说明「`schur-lm` 何时接受一步、何时报收敛、何时报失败」在合成问题上自洽，
+并与独立 oracle 一致。它**不**说明真实数据上会收敛，也**不**说明 Schur 会改善对齐。
+
+### A. 定义（沿用 Iteration 34 §A 的白化、`u` 尺度、5 参 gauge 帧、float64、Cholesky、`D_a = diag(C)`、`D_θ = diag(Γ)`、floor = 0）
+
+记联合变量 `p = (δu, δθ)`，`F = ½ rᵀr`，`g = (c, β)`，`H` 为无阻尼联合 GN 矩阵。
+
+1. **模型与 ρ**（plan §3.8，理论评审 §5.1 的自洽组合）：
+   - 预测下降用**无阻尼** GN 联合二次模型 `L(0) − L(p) = −gᵀp − ½pᵀHp`，在**实际执行的步**上计算；
+     λ 只决定步，不进入模型。按块计算：`gᵀp = Σ_pairs cᵀδu_s + Σ_t β_tᵀδθ_t`，
+     `pᵀHp = Σ_pairs (δu_sᵀCδu_s + 2δu_sᵀGδθ_t) + Σ_t δθ_tᵀΓ_tδθ_t`（同一 hit 只依赖一个 sensor，故无直接 `C_ij`）。
+   - 实际下降 = `F(a, θ) − F(a + s⊙αδu, θ ⊕ αδθ)`，`δθ` 为 Schur 回代结果，`⊕` 为 `commit_track_step`；
+     在冻结的 ref + target 有效分量集合上求和，float64。**不做内层径迹重拟合。**
+   - `ρ = 实际 / 预测`。对 LM 步 `pᵀ(H+λD)p − ½α pᵀHp > 0`，故 `α ∈ (0,1]`、`p ≠ 0` 时预测下降严格为正；
+     预测 ≤ 0 或非有限 ⇒ `numerical_failure`（不是拒步）。线性残差下 `ρ ≡ 1`。
+2. **试探步无效**：任一冻结有效分量（ref 或 target）消失、任一残差非有限 ⇒ 无效，按拒步处理并累计 `component_loss`。
+   拒步不更新几何、径迹、有效集、权重；同一外层迭代内的重试复用同一线性化，只改 λ。
+3. **约束**：箱约束只作用在几何上，`|a_k| ≤ JOINT_CLAMP_T`（tx, ty）、`≤ JOINT_CLAMP_R`（rz），与 block-LM 的
+   可行域相同（这是可行域，进 KKT）；径迹无约束。
+   - 活动集：`free = _block_lm_free_dof_mask(a, b, −clamp, clamp, BLOCK_LM_BOUND_ATOL)`，梯度用**无阻尼约化梯度**
+     `b = c − GΓ⁻¹β`（= 联合 KKT 中径迹梯度消去后的几何分量）。只读符号，与 block-LM 相同。
+   - 冻结 DOF 从联合系统中**删除**：`S_F = S[F,F]`、`b_F = b[F]`；径迹消元与 F 无关，回代时冻结分量 `δu = 0`。
+   - 可行性：整条联合步 `(δu, δθ)` **统一缩放** `α = min(1, max{α' : a + α' s⊙δu 可行})`，方向不变；
+     预测下降在 `αp` 上重算，记录 `step_truncation_alpha`。阻挡 DOF 落点按 `BLOCK_LM_BOUND_ATOL` 吸附到界上（只消舍入）。
+     **禁止逐分量 clamp；`schur-lm` 不调用 `lm_max_step_t/r`**（plan §3.8.1）。
+   - 耦合系统里，梯度指向界内的自由 DOF 仍可能被 LM 步推向界外，此时 `α = 0`。处理：把阻挡 DOF 加入冻结集，
+     在同一线性化下重解，直到 `α > 0` 或自由集为空（标准原始活动集法）。不重算 Jacobian，不计入 λ 重试。
+4. **全局驻点**（`lam = 0` 的 Schur 系统，块 LDLᵀ 恒等式）：
+   `λ²_joint = gᵀH⁻¹g = λ²_geo + λ²_trk`，`λ²_geo = b_Fᵀ S_F⁻¹ b_F`，`λ²_trk = Σ_t λ²_trk,t`，`λ²_trk,t = β_tᵀΓ_t⁻¹β_t`。
+   λ² 是剩余 Newton 步在 GN 信息度量下的长度²（单位：统计 σ²，无量纲）。
+5. **秩**：`Ŝ = D^{-½} S_F D^{-½}`，`D = diag(S_F)`；eigh。`μ_k ≤ τ` 的方向为弱方向：从 `λ²_geo` 的求和中剔除，
+   置 `lambda2_is_lower_bound = True`，报告 `null_gradient_max = max |v_kᵀ D^{-½} b_F|`。不加任何正则
+   （沿用 `_block_lm_decrement` 的反偏小设计：正则只会让 decrement 偏小）。`diag(S_F)` 有非正元 ⇒ `rank_deficient`。
+   本轮只给 oracle 规模的稠密 eigh；生产规模实现属于 P7。
+6. **逐 sensor 量**（`S_ii`、逐 sensor 的 `b`）只作描述，不参与终态，**不存在退休**：共享径迹使 sensor j 的移动改变 sensor i 的 `b_i`。
+
+### B. 预注册常量（`SCHUR_LM_PREREGISTRATION_VERSION = 1`）
+
+| 常量 | 值 | 理由 |
+|---|---:|---|
+| `schur_lm_lambda_init` | 1e-3 | 显式设定，**不从** `LM_INITIAL_DAMPING` 继承。Marquardt 缩放下 λ 是相对曲率比例，1e-3 让首步几乎是 GN 步；敏感性由下面的扫描检验 |
+| `lambda_increase_factor` | 10 | 与 Moré/Nielsen 常用值一致；8 级从 1e-3 到 1e5 |
+| `lambda_decrease_factor` | 10 | 对称；避免好步后 λ 下降过慢拖累二次收敛 |
+| `rho_accept_min` | 1e-4 | Moré (1978) 取值：只要求实际下降为正且不是数值噪声 |
+| `rho_increase_threshold` | 0.25 | 接受但模型偏乐观 ⇒ 收紧 |
+| `rho_decrease_threshold` | 0.75 | 模型可信 ⇒ 放松 |
+| `lambda_min` / `lambda_max` | 1e-12 / 1e12 | 与 block-LM 同值；重新论证：`λ = 1e12` 时步约为 GN 步的 1e-12，已低于 float64 下 F 的可分辨下降 |
+| `max_lm_retries` | 8 | 每外层迭代；理由同 block-LM §3：8 级后步约为 GN 的 1e-8 且方向趋于最速下降，光滑目标必降；仍不降 ⇒ 光滑性被证伪（求交有效性分支） |
+| `schur_lm_max_iters` | 60 | 外层预算，显式设定；Iteration 30 的 block-LM 在 13 次迭代内收敛，60 给出约 4 倍余量 |
+| `epsilon_geo` | 1e-2 | `λ²_geo ≤ 1e-2` ⇔ 剩余几何 Newton 步在信息度量下总长 ≤ 0.1σ。**不沿用**每 component 1e-6：口径从「逐 block、按分量数归一」改为「全局、按统计 σ」 |
+| `epsilon_trk` | 1e-2 | `max_t λ²_trk,t ≤ 1e-2`，每条径迹剩余步 ≤ 0.1σ；与几何同一语义 |
+| `rank_tol` (τ) | 1e-4 | 与 `FISHER_EIGEN_FLOOR` 同值。Jacobi 缩放后 `μ ≤ 1e-4` ⇔ 该组合方向的 σ 比单 DOF 对角信息给出的 σ 大 100 倍以上；对 3×3 块，Jacobi 缩放与「相对最大特征值」两种口径相差不超过 3 倍 |
+| `alpha_stall` / `stall_iters` | 1e-3 / 3 | 连续 3 个接受步的 `α < 1e-3` ⇒ `constraint_stalled`。阻挡 DOF 每步落到界上并在下一步按 KKT 冻结，所以持续的极小 α 只可能来自不同 DOF 轮流阻挡（锯齿），值得报告 |
+| ε-floor | 0 | Iteration 34 §A；无需 ε 扫描 |
+
+**λ 更新规则**（确定性、单调，四分支；plan §3.8.2 推荐形式的展开，9 个常量全部有作用）：
+
+| 条件 | 动作 |
+|---|---|
+| 试探步无效，或 `ρ < rho_accept_min` | 拒步；`λ ← min(10λ, lambda_max)` |
+| `ρ < rho_increase_threshold` | 接受；`λ ← min(10λ, lambda_max)` |
+| `ρ < rho_decrease_threshold` | 接受；λ 不变 |
+| 其余 | 接受；`λ ← max(λ/10, lambda_min)` |
+
+λ 已在 `lambda_max` 仍被拒，或重试用尽 ⇒ 本次外层迭代失败，运行终止。
+
+**λ_init 敏感性网格**（P8 执行，本轮不跑）：{1e-5, 1e-3, 1e-1}；全部收敛到同一盆地时，终态几何差须在
+`1e-6 mm / 1e-7 rad` 内（roadmap M3 的等价容差），否则报告为求解器敏感，不得解释为数据决定。
+
+### C. 全局终态（plan §P6.2）
+
+优先级（高者覆盖低者）：
+
+1. `numerical_failure`：预测下降 ≤ 0 或非有限、`TrackBlockFactorizationError`、Jacobian/残差非有限于当前（已接受）状态；
+2. `intersection_failed`：重试用尽且过程中出现过 `component_loss` 拒步；
+3. `rank_deficient`：最后一次线性化存在弱方向（§A.5），或 `diag(S_F)` 有非正元。**既秩亏又达阈值 ⇒ 报 `rank_deficient`**；
+   秩亏不提前停步，但永不报 `converged`；强方向上 `λ²_geo ≤ ε_geo` 且 `λ²_trk` 达标时停止，状态 `rank_deficient`；
+4. `constraint_stalled`：§B 的 stall 规则；
+5. `converged`：每次外层迭代**开始时**检查，`λ²_geo ≤ ε_geo` 且 `max_t λ²_trk,t ≤ ε_trk`（自由集为空时 `λ²_geo = 0`：
+   KKT 点）；
+6. `budget_exhausted`：外层预算用尽，或重试用尽 / λ 到顶而无 `component_loss`（`reason` 区分 `outer_iters` /
+   `damping_ceiling` / `damping_retries`）。
+
+旧契约替代表见 `docs/handoff/2026-10-11-schur-global-convergence-contract.md`。
+
+### D. 判据（合成回归；容差为数值容差，非统计）
+
+- **R1 模型**：块计算的 `gᵀp`、`pᵀHp` 与稠密联合 `H, g`（`solve_joint_dense` 的组装）一致，相对差 ≤ 1e-10。
+- **R2 ρ**：Level A（线性残差，实际 F 由 `r + Aδa + Bδθ` 直接计算，与模型路径独立）下，λ ∈ {0, 1e-3, 1, 1e3}、
+  α ∈ {1, 0.3}：`|ρ − 1| ≤ 1e-10`。**反证**：用未截断步算分母而执行 α 步时 `|ρ − 1| > 0.1`。
+- **R3 λ 规则**：四分支各至少一例；λ 在上下界饱和；`lambda_max` 处被拒 ⇒ `budget_exhausted`（`damping_ceiling`）；
+  有 `component_loss` ⇒ `intersection_failed`。
+- **R4 decrement**：`λ²_geo + λ²_trk` 与稠密 `gᵀH⁻¹g` 相对差 ≤ 1e-10（无约束与有冻结 DOF 两种）。
+- **R5 秩**：人为构造一个几何组合方向信息 ≈ 0 的问题 ⇒ `rank_deficient`、`lambda2_is_lower_bound`、`null_gradient_max > 0`；
+  满秩问题这三项为否 / 0。
+- **R6 耦合（替代解耦回归）**：Level B `shared_topology_problem`，在联合驻点处只移动 sensor 1 ⇒ 与之共享径迹的
+  sensor 0 的 `|b_0|` 离开 0（> 1e-6 量级），而不共享的 sensor 2 只在数值噪声内变化。说明「converged 永久退休」在 Schur 下不成立。
+- **R7 KKT oracle**：极小问题（≤ 3 个几何 DOF），独立枚举全部活动集求解等式约束 QP，取可行且满足 KKT 符号条件的解；
+  构造最优点落在界上的情形，契约函数（活动集 + 删除 + 统一缩放）迭代后到达同一点（≤ 1e-10），
+  且该点 `λ²_geo`（自由集上）为 0、终态 `converged`。
+- **R8 统一缩放**：`α` 使阻挡 DOF 恰在界上、其余可行；`(δu, δθ)` 方向与未缩放步余弦为 1；缩放步上不出现
+  `LM_MAX_STEP_*` 截断（一个远超 `lm_max_step_t/r` 的步在 `α = 1` 时原样通过）。
+- **R9 stall**：合成 α 序列 ⇒ `constraint_stalled`；`α` 序列中有一个 ≥ `alpha_stall` 即重置计数。
+- **R10 终态优先级**：表驱动，覆盖 §C 的每一对相邻优先级。
+- **R11 回归不变**：P2–P5 全部测试与 `test_block_lm_blocks_are_decoupled_across_target_sensors` 保持绿色；
+  `scripts/joint_alignment_schur.py` 中不出现 `LM_MAX_STEP`。
+
+### E. 门出口
+
+R1–R11 全部通过 + 契约交接文档成文 = **P6 通过（合成层）**。之后才允许 P7（稀疏累加）与 P8（`schur-lm` 循环）。
+任一失败就停下排查，**不放宽本条目中的任何阈值**；如需修改，先另写 Iteration 说明数值理由。
+真实数据上的 `schur-lm` 运行仍须另写预注册（plan §14 的其余字段，含 H1 判据 / WP3）。
+
+### F. 结果（2026-10-11，本段只回填，不改上文任何定义或阈值）
+
+**总体：P6 通过（合成层）**（§E 门出口：R1–R11 全部通过，契约交接已成文）。
+测试：`tests/test_joint_schur_convergence_contract.py` 44 项 + `tests/test_joint_schur_constraints.py` 21 项，全部是快速测试（约 3 s）。
+`make test`：777 passed / 3 skipped / 14 deselected / 0 failed（P5 结束时为 712，本轮新增 65）；`make test-shell` exit 0；
+Schur slow 测试（P2–P5）33 passed；`test_block_lm_blocks_are_decoupled_across_target_sensors` 仍为绿。
+
+**先红**：实现前，contract 文件在收集阶段就失败（`SCHUR_LM_STATUS_*` 不存在）；constraints 文件 20 failed / 1 passed。
+通过的那一项是 R11 的静态 guard（模块里本来就没有 clipping），它是防回退用的，不构成红绿证据。
+
+**关键数字**：
+- R1 / R2 / R4 的代数一致性都在 1e-10 内；R2 反证：用未截断步算分母、执行 α = 0.3 步时 ρ = 0.51（理论值 2α − α²）。
+- R6（Level B，注入 0.05 mm / 2e-4 rad）：联合 GN 8 步后三个 sensor 的逐 sensor decrement 为 2.6e-27 / 5.2e-28 / 4.0e-28，
+  全局 `λ²_geo` 为 4.1e-27，`max λ²_trk` 为 5.0e-27，Jacobi 缩放最小特征值为 0.43。sensor 1 的 tx 移动 0.1 mm 后：
+  共享径迹的 sensor 0 为 **0.198**（大于 ε_geo），sensor 1 本身为 4.91，独立的 sensor 2 仍为 1.0e-27；fixed-track 的 `c_0` 只在舍入内变化。
+- R7：3 个种子 × 3 种界配置（1 / 2 / 3 个 DOF 落在界上），活动集驱动器到达枚举 KKT 点，几何误差 ≤ 1e-10；λ = 1e-3 的阻尼版本同样到达。
+  耦合步把界上 DOF 推出界（α = 0）时冻结并重解，一次重解后得到预期步。
+
+**实现过程中的偏差（如实记录）**：
+1. 测试侧的 bug：KKT 测试里 `-solve(...)[:3].abs()` 的运算优先级写错，导致界为负、oracle 无可行点。
+   修正为 `solve(...)[:3].abs()`；契约代码没有改动。
+2. R6 中 `c_0` 不变的断言，测试内容差从 1e-12 放到 1e-10：实测差 1.3e-12，`c_0` 本身就是 1e-12 量级，差值是重算线性化的舍入。
+   这一项不在 §D 的预注册判据里，§D 的阈值都没有改。
+3. §A.3 中「α = 0 时冻结并重解」这一条，是在写测试之前补进预注册的。
+
+**不能引申的地方**：这些只是契约函数在线性或小规模合成问题上的自洽性，以及它们与独立 oracle 的一致性。没有 LM 循环（P8），
+没有稀疏实现（P7）；`global_stationarity` 只是稠密 oracle。真实数据上会不会收敛、Schur 会不会改善对齐，都没有测。
+λ_init 扫描留到 P8。

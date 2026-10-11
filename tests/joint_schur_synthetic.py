@@ -224,3 +224,37 @@ def shared_topology_problem(noise_seed=3, injection=None, n_tracks=10, seed=1):
         injection=injection,
         noise_seed=noise_seed,
     )
+
+
+def dense_joint_system(lin):
+    """``J``, ``r``, ``H = J^T J`` and ``g = J^T r`` from the raw component rows.
+
+    Columns are ``(du per block, dtheta per track)``.  Built row by row from the
+    linearisation, independently of ``normal_blocks``; oracle-sized only.
+    """
+    n_tracks, n_hits = lin.is_target.shape
+    n, k = len(lin.target_sensors), lin.geometry_jacobian.shape[-1]
+    size = n * k + 5 * n_tracks
+    rows, residuals = [], []
+    for t in range(n_tracks):
+        for h in range(n_hits):
+            for component in range(2):
+                if not bool(lin.component_mask[t, h, component]):
+                    continue
+                row = torch.zeros(size, dtype=DTYPE)
+                block = int(lin.block_index[t, h])
+                if block >= 0:
+                    row[block * k : (block + 1) * k] = lin.geometry_jacobian[t, h, component]
+                row[n * k + 5 * t : n * k + 5 * (t + 1)] = lin.track_jacobian[t, h, component]
+                rows.append(row)
+                residuals.append(lin.residual[t, h, component])
+    jacobian, residual = torch.stack(rows), torch.stack(residuals)
+    return jacobian, residual, jacobian.T @ jacobian, jacobian.T @ residual
+
+
+def shifted_linear_residual(lin, du, dtheta):
+    """Level A residual ``r + A du + B dtheta``: the exact residual of a linear problem."""
+    target = (lin.block_index >= 0).unsqueeze(-1)
+    geometry = (lin.geometry_jacobian @ du[lin.block_index.clamp_min(0)].unsqueeze(-1)).squeeze(-1)
+    track = (lin.track_jacobian @ dtheta[:, None, :, None]).squeeze(-1)
+    return (lin.residual + geometry * target + track) * lin.component_mask

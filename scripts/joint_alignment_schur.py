@@ -16,13 +16,23 @@ non-target geometry is fixed, so reference rows have no geometry derivative.
 Track increments live in the production five-parameter gauge frame, which is
 rebuilt from the physical helix at every linearisation and never reused.
 
-Only what the algebraic oracles need exists here: no gain ratio, no damping
-adaptation, no sparse production accumulation.  The ``*_dense`` helpers are
-for tiny oracle problems and must not be used at production scale.
+The global ``schur-lm`` convergence and constraint contract (plan.md §P6,
+Iteration 37) lives here as pure functions: the undamped joint model and gain
+ratio, the damping rule, the box active set with a uniformly scaled feasible
+step, the global decrement with its rank test, and the terminal state.  The
+2026-09-08 block-LM contract is not reused: shared tracks couple the target
+sensors, so there are no per-sensor damping, terminal states or retirement.
+Legacy per-DOF post-solve step clipping does not exist on this path.
+
+There is no LM loop and no sparse production accumulation yet.  The
+``*_dense`` helpers, ``global_stationarity`` included, are for tiny oracle
+problems and must not be used at production scale.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import math
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -36,13 +46,80 @@ from helix_model import (
     reference_gauge_frame,
     unpack_gauge_fixed_track_parameters,
 )
-from ml_alignment_autograd import DEFAULT_ACTIVE_DOF, apply_alignment_torch
+from ml_alignment_autograd import (
+    BLOCK_LM_BOUND_ATOL,
+    DEFAULT_ACTIVE_DOF,
+    JOINT_CLAMP_R,
+    JOINT_CLAMP_T,
+    _block_lm_free_dof_mask,
+    apply_alignment_torch,
+)
 
 #: Units of the dimensionless geometry increment, identical to block-LM's
 #: ``physical_scales``: mm for translations, 10 mrad for rotations.
 GEOMETRY_SCALES = (1.0, 1.0, 1.0, 0.01, 0.01, 0.01)
 N_TRACK_PARAMETERS = 5
 DTYPE = torch.float64
+
+#: Pre-registration of the ``schur-lm`` contract (``ml_optimization_log.md``
+#: Iteration 37 §B).  Independent of ``BLOCK_LM_PREREGISTRATION_VERSION``: the
+#: block-LM constants govern ``block-lm`` only and none is inherited here.
+SCHUR_LM_PREREGISTRATION_VERSION = 1
+#: Set explicitly, not taken from ``LM_INITIAL_DAMPING``.  With Marquardt
+#: scaling lambda is a relative curvature fraction; 1e-3 makes the first step
+#: nearly Gauss-Newton.  Its influence is checked by the scan below (P8).
+SCHUR_LM_LAMBDA_INIT = 1.0e-3
+SCHUR_LM_LAMBDA_INIT_SCAN = (1.0e-5, 1.0e-3, 1.0e-1)
+SCHUR_LM_LAMBDA_INCREASE = 10.0
+SCHUR_LM_LAMBDA_DECREASE = 10.0
+#: Moré (1978): accept any real decrease that is not rounding noise; tighten
+#: below 0.25, relax above 0.75.
+SCHUR_LM_RHO_ACCEPT_MIN = 1.0e-4
+SCHUR_LM_RHO_INCREASE_THRESHOLD = 0.25
+SCHUR_LM_RHO_DECREASE_THRESHOLD = 0.75
+#: At 1e12 the step is ~1e-12 of the Gauss-Newton step, below the decrease a
+#: float64 objective can resolve.
+SCHUR_LM_LAMBDA_MIN = 1.0e-12
+SCHUR_LM_LAMBDA_MAX = 1.0e12
+#: Rejections per outer iteration.  Eight decades leave a ~1e-8 step along
+#: steepest descent, which must descend on a smooth objective; failing that
+#: falsifies smoothness (intersection validity) and is reported, not retried.
+SCHUR_LM_MAX_RETRIES = 8
+#: Outer budget; block-LM converged in 13 iterations in Iteration 30.
+SCHUR_LM_MAX_ITERS = 60
+#: The decrement is the squared length of the remaining Newton step in the
+#: Gauss-Newton information metric, i.e. in statistical sigma.  1e-2 means the
+#: geometry, and every single track, has less than 0.1 sigma left to move.
+#: This is a global quantity; the per-component 1e-6 of block-LM is not reused.
+SCHUR_LM_EPSILON_GEO = 1.0e-2
+SCHUR_LM_EPSILON_TRK = 1.0e-2
+#: Eigenvalue floor of the Jacobi-scaled reduced information.  Below it a
+#: combination of DOFs is at least 100x less constrained than its diagonal
+#: information suggests.
+SCHUR_LM_RANK_TOL = 1.0e-4
+#: Consecutive accepted steps with ``alpha`` below ``SCHUR_LM_ALPHA_STALL``
+#: before the run is ``constraint_stalled``.
+SCHUR_LM_ALPHA_STALL = 1.0e-3
+SCHUR_LM_STALL_ITERS = 3
+
+SCHUR_LM_STATUS_CONVERGED = "converged"
+SCHUR_LM_STATUS_BUDGET_EXHAUSTED = "budget_exhausted"
+SCHUR_LM_STATUS_RANK_DEFICIENT = "rank_deficient"
+SCHUR_LM_STATUS_INTERSECTION_FAILED = "intersection_failed"
+SCHUR_LM_STATUS_NUMERICAL_FAILURE = "numerical_failure"
+SCHUR_LM_STATUS_CONSTRAINT_STALLED = "constraint_stalled"
+SCHUR_LM_TERMINAL_STATUSES = (
+    SCHUR_LM_STATUS_CONVERGED,
+    SCHUR_LM_STATUS_BUDGET_EXHAUSTED,
+    SCHUR_LM_STATUS_RANK_DEFICIENT,
+    SCHUR_LM_STATUS_INTERSECTION_FAILED,
+    SCHUR_LM_STATUS_NUMERICAL_FAILURE,
+    SCHUR_LM_STATUS_CONSTRAINT_STALLED,
+)
+
+
+class ModelReductionError(ArithmeticError):
+    """The joint model predicts no decrease: a numerical failure, not a rejection."""
 
 
 class TrackBlockFactorizationError(torch.linalg.LinAlgError):
@@ -505,3 +582,290 @@ def track_block_diagnostics(blocks: JointNormalBlocks) -> dict[str, dict[str, to
         "gamma_ref": _symmetric_block_summary(blocks.gamma_ref),
         "gamma": _symmetric_block_summary(blocks.gamma),
     }
+
+
+@dataclass(frozen=True)
+class ModelReduction:
+    """Undamped joint Gauss-Newton model at a step ``p``: ``g^T p``, ``p^T H p``
+    and the predicted decrease ``-g^T p - p^T H p / 2``."""
+
+    gradient_step: float
+    curvature: float
+    predicted: float
+
+
+def joint_model_reduction(
+    blocks: JointNormalBlocks, delta_u: torch.Tensor, delta_theta: torch.Tensor
+) -> ModelReduction:
+    """Predicted decrease of ``F`` at the step actually executed.
+
+    The model is the undamped one: lambda only chooses the step, so the gain
+    ratio compares like with like and equals one on linear residuals.  Target
+    hits depend on one sensor each, so ``C`` has no cross-sensor term.
+    """
+    du = delta_u[blocks.pair_block]
+    dtheta = delta_theta[blocks.pair_track]
+    gradient_step = float(
+        torch.einsum("pi,pi->", blocks.c, du) + torch.einsum("ti,ti->", blocks.beta, delta_theta)
+    )
+    curvature = float(
+        torch.einsum("pi,pij,pj->", du, blocks.C, du)
+        + 2.0 * torch.einsum("pi,pij,pj->", du, blocks.G, dtheta)
+        + torch.einsum("ti,tij,tj->", delta_theta, blocks.gamma, delta_theta)
+    )
+    return ModelReduction(gradient_step, curvature, -gradient_step - 0.5 * curvature)
+
+
+def gain_ratio(actual: float, predicted: float) -> float:
+    """``rho = actual / predicted``; NaN when the trial objective is not finite.
+
+    An LM step scaled by ``alpha`` in (0, 1] always has a positive predicted
+    decrease, so a non-positive or non-finite one is a numerical failure.
+    """
+    predicted = float(predicted)
+    if not math.isfinite(predicted) or predicted <= 0.0:
+        raise ModelReductionError(f"Predicted joint decrease is {predicted!r}.")
+    actual = float(actual)
+    return actual / predicted if math.isfinite(actual) else math.nan
+
+
+@dataclass(frozen=True)
+class DampingDecision:
+    accepted: bool
+    lam: float
+    branch: str
+    #: Rejected while lambda was already at its ceiling: the outer iteration
+    #: has failed and the run must stop.
+    saturated: bool
+
+
+def update_damping(lam: float, rho: float, valid: bool = True) -> DampingDecision:
+    """The four-branch deterministic damping rule of Iteration 37 §B."""
+    lam = float(lam)
+    raised = min(lam * SCHUR_LM_LAMBDA_INCREASE, SCHUR_LM_LAMBDA_MAX)
+    if not valid or not math.isfinite(rho) or rho < SCHUR_LM_RHO_ACCEPT_MIN:
+        return DampingDecision(False, raised, "reject", lam >= SCHUR_LM_LAMBDA_MAX)
+    if rho < SCHUR_LM_RHO_INCREASE_THRESHOLD:
+        return DampingDecision(True, raised, "accept_increase", False)
+    if rho < SCHUR_LM_RHO_DECREASE_THRESHOLD:
+        return DampingDecision(True, lam, "accept_keep", False)
+    lowered = max(lam / SCHUR_LM_LAMBDA_DECREASE, SCHUR_LM_LAMBDA_MIN)
+    return DampingDecision(True, lowered, "accept_decrease", False)
+
+
+def geometry_bounds(
+    active_dof: Sequence[int],
+    clamp_t: float = JOINT_CLAMP_T,
+    clamp_r: float = JOINT_CLAMP_R,
+) -> torch.Tensor:
+    """Physical half-widths of the box ``|a| <= bound``, block-LM's feasible region."""
+    return torch.tensor([clamp_t if dof < 3 else clamp_r for dof in active_dof], dtype=DTYPE)
+
+
+def free_geometry_mask(
+    values: torch.Tensor, gradient: torch.Tensor, bounds: torch.Tensor
+) -> torch.Tensor:
+    """DOFs that may still move: not on a bound whose gradient points outwards.
+
+    ``values`` are the physical active alignment [n, k]; ``gradient`` is the
+    undamped reduced gradient ``b = c - G Gamma^-1 beta`` (only its sign is read).
+    """
+    return _block_lm_free_dof_mask(values, gradient, -bounds, bounds)
+
+
+def restrict_to_free(system: SchurSystem, free: torch.Tensor) -> SchurSystem:
+    """Delete frozen DOFs from the reduced system.
+
+    Track elimination does not depend on which geometry DOFs are frozen, so
+    deleting rows and columns of the joint system is ``S[F, F]``, ``b[F]``.
+    Frozen DOFs keep an identity row and a zero right-hand side, which pins
+    them at ``du = 0`` without changing the free block.
+    """
+    free = free.to(DTYPE)
+    mask = free[system.rows].unsqueeze(-1) * free[system.cols].unsqueeze(-2)
+    pinned = torch.diag_embed(1.0 - free)[system.rows] * (system.rows == system.cols)[:, None, None]
+    return dataclasses.replace(
+        system, values=system.values * mask + pinned, rhs=system.rhs * free
+    )
+
+
+def _physical_step(delta_u: torch.Tensor, active_dof: Sequence[int]) -> torch.Tensor:
+    scales = torch.tensor([GEOMETRY_SCALES[dof] for dof in active_dof], dtype=DTYPE)
+    return delta_u * scales
+
+
+def step_to_bound(
+    values: torch.Tensor,
+    delta_u: torch.Tensor,
+    bounds: torch.Tensor,
+    active_dof: Sequence[int],
+) -> tuple[float, torch.Tensor]:
+    """Largest ``alpha`` in [0, 1] keeping ``values + alpha * step`` in the box.
+
+    Returns ``alpha`` and the DOFs that block it.  ``alpha = 0`` means a DOF on
+    its bound is pushed outwards by the coupled step.
+    """
+    step = _physical_step(delta_u, active_dof)
+    room = torch.where(step > 0.0, bounds - values, -bounds - values)
+    with torch.no_grad():
+        limits = torch.where(step != 0.0, room / step, torch.full_like(step, math.inf))
+    limits = limits.clamp_min(0.0)
+    alpha = min(1.0, float(limits.min())) if limits.numel() else 1.0
+    blocking = (limits <= alpha) & (step != 0.0) if alpha < 1.0 else torch.zeros_like(step, dtype=torch.bool)
+    return alpha, blocking
+
+
+def apply_geometry_step(
+    values: torch.Tensor,
+    delta_u: torch.Tensor,
+    alpha: float,
+    bounds: torch.Tensor,
+    active_dof: Sequence[int],
+) -> torch.Tensor:
+    """``values + alpha * step`` with the blocking DOFs snapped onto their bound.
+
+    The snap only removes rounding of ``alpha * step``; anything beyond
+    ``BLOCK_LM_BOUND_ATOL`` outside the box is an error, never a clamp.
+    """
+    moved = values + alpha * _physical_step(delta_u, active_dof)
+    excess = moved.abs() - bounds
+    if bool((excess > BLOCK_LM_BOUND_ATOL).any()):
+        raise ValueError("Geometry step leaves the box; scale it with step_to_bound first.")
+    return torch.where(excess > 0.0, torch.sign(moved) * bounds, moved)
+
+
+@dataclass(frozen=True)
+class FeasibleStep:
+    delta_u: torch.Tensor
+    delta_theta: torch.Tensor
+    alpha: float
+    free: torch.Tensor
+    n_resolves: int
+
+
+def feasible_joint_step(
+    system: SchurSystem,
+    values: torch.Tensor,
+    free: torch.Tensor,
+    bounds: torch.Tensor,
+    active_dof: Sequence[int],
+    solve=None,
+) -> FeasibleStep:
+    """Solve on the free set and scale the whole joint step to stay feasible.
+
+    When the coupled step drives a bound DOF outwards (``alpha = 0``), that DOF
+    joins the frozen set and the same linearisation is solved again.  The
+    returned ``delta_u``/``delta_theta`` are unscaled; the executed step is
+    ``alpha`` times both, and the model decrease must be taken there.
+    """
+    solve = solve_geometry_dense if solve is None else solve
+    free = free.clone()
+    n_resolves = 0
+    while True:
+        restricted = restrict_to_free(system, free)
+        delta_u = solve(restricted) if bool(free.any()) else torch.zeros_like(system.rhs)
+        alpha, blocking = step_to_bound(values, delta_u, bounds, active_dof)
+        if alpha > 0.0 or not bool(free.any()):
+            return FeasibleStep(delta_u, restricted.back_substitute(delta_u), alpha, free, n_resolves)
+        free &= ~blocking
+        n_resolves += 1
+
+
+def update_stall_count(count: int, alpha: float) -> int:
+    """Consecutive accepted steps whose ``alpha`` fell below ``SCHUR_LM_ALPHA_STALL``."""
+    return count + 1 if alpha < SCHUR_LM_ALPHA_STALL else 0
+
+
+@dataclass(frozen=True)
+class GlobalStationarity:
+    lambda2_geo: float
+    lambda2_trk: torch.Tensor
+    lambda2_trk_max: float
+    n_free: int
+    rank_deficient: bool
+    lambda2_is_lower_bound: bool
+    min_scaled_eigenvalue: float
+    null_gradient_max: float
+
+    @property
+    def stationary(self) -> bool:
+        """Both thresholds met.  Not ``converged`` on its own: see ``rank_deficient``."""
+        return (
+            self.lambda2_geo <= SCHUR_LM_EPSILON_GEO
+            and self.lambda2_trk_max <= SCHUR_LM_EPSILON_TRK
+        )
+
+
+def global_stationarity(
+    blocks: JointNormalBlocks,
+    system: SchurSystem,
+    free: torch.Tensor | None = None,
+    rank_tol: float = SCHUR_LM_RANK_TOL,
+) -> GlobalStationarity:
+    """Joint Newton decrement ``g^T H^-1 g = b_F^T S_F^-1 b_F + sum_t beta_t^T Gamma_t^-1 beta_t``.
+
+    Needs the undamped system.  The geometry part is summed in the eigenbasis
+    of the Jacobi-scaled ``S_F`` without any regularisation: directions at or
+    below ``rank_tol`` are dropped, which makes the value a lower bound and
+    the run ``rank_deficient``.  Dense eigh: oracle-sized problems only.
+    """
+    if system.lam != 0.0:
+        raise ValueError("The decrement is defined on the undamped system (lam = 0).")
+    lambda2_trk = torch.einsum("ti,ti->t", blocks.beta, system.track_step)
+    trk_max = float(lambda2_trk.max()) if lambda2_trk.numel() else 0.0
+    if free is None:
+        free = torch.ones_like(system.rhs, dtype=torch.bool)
+    keep = free.flatten()
+    n_free = int(keep.sum())
+    if n_free == 0:
+        return GlobalStationarity(0.0, lambda2_trk, trk_max, 0, False, False, math.nan, 0.0)
+    information = system.to_dense()[keep][:, keep]
+    gradient = system.rhs.flatten()[keep]
+    diagonal = information.diagonal()
+    if not bool((diagonal > 0.0).all()):
+        return GlobalStationarity(math.nan, lambda2_trk, trk_max, n_free, True, True, math.nan, math.nan)
+    scale = diagonal.rsqrt()
+    scaled = information * scale[:, None] * scale[None, :]
+    eigenvalues, eigenvectors = torch.linalg.eigh(0.5 * (scaled + scaled.T))
+    projection = eigenvectors.T @ (gradient * scale)
+    weak = eigenvalues <= rank_tol
+    strong = ~weak
+    lambda2_geo = float((projection[strong].square() / eigenvalues[strong]).sum())
+    return GlobalStationarity(
+        lambda2_geo=lambda2_geo,
+        lambda2_trk=lambda2_trk,
+        lambda2_trk_max=trk_max,
+        n_free=n_free,
+        rank_deficient=bool(weak.any()),
+        lambda2_is_lower_bound=bool(weak.any()),
+        min_scaled_eigenvalue=float(eigenvalues[0]),
+        null_gradient_max=float(projection[weak].abs().max()) if bool(weak.any()) else 0.0,
+    )
+
+
+def global_terminal_status(
+    *,
+    numerical_failure: bool = False,
+    retries_exhausted: bool = False,
+    component_loss_seen: bool = False,
+    rank_deficient: bool = False,
+    constraint_stalled: bool = False,
+    stationary: bool = False,
+) -> str:
+    """One run-level state, highest priority first (Iteration 37 §C).
+
+    Rank deficiency outranks stationarity: the decrement is then a lower bound,
+    and a biased-low statistic must not certify convergence.  Retries that run
+    out without any component loss are a damping ceiling, i.e. budget.
+    """
+    if numerical_failure:
+        return SCHUR_LM_STATUS_NUMERICAL_FAILURE
+    if retries_exhausted and component_loss_seen:
+        return SCHUR_LM_STATUS_INTERSECTION_FAILED
+    if rank_deficient:
+        return SCHUR_LM_STATUS_RANK_DEFICIENT
+    if constraint_stalled:
+        return SCHUR_LM_STATUS_CONSTRAINT_STALLED
+    if stationary:
+        return SCHUR_LM_STATUS_CONVERGED
+    return SCHUR_LM_STATUS_BUDGET_EXHAUSTED
