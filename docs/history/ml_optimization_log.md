@@ -3483,3 +3483,77 @@ Schur slow 测试（P2–P5）33 passed；`test_block_lm_blocks_are_decoupled_ac
 **不能引申的地方**：这些只是契约函数在线性或小规模合成问题上的自洽性，以及它们与独立 oracle 的一致性。没有 LM 循环（P8），
 没有稀疏实现（P7）；`global_stationarity` 只是稠密 oracle。真实数据上会不会收敛、Schur 会不会改善对齐，都没有测。
 λ_init 扫描留到 P8。
+
+## Iteration 38 — Schur P7 / P8：生产稀疏累加与 `schur-lm` 联立 LM 循环（预注册）
+
+**日期**：2026-10-11。**状态**：预注册，写于 `tests/test_joint_schur_sparse.py`、`tests/test_joint_schur_solver.py`
+及任何 P7 / P8 代码之前。两个后端决策（秩检验按连通分量做稠密 eigh；本轮接入 CLI 但不跑真实数据）经用户确认。
+**上游**：`plan.md` §P7、§P8、§9、§12；Iteration 37（契约，全部沿用，不改任何常量）；
+交接 `docs/handoff/2026-10-11-schur-global-convergence-contract.md`。
+**范围**：Level A / B 合成问题。不读 ROOT、不碰 truth、不跑真实数据上的 `schur-lm`（那需要 plan §14 其余字段 + WP3 的独立预注册）。
+不修改 `run_block_lm_alignment`、`BLOCK_LM_*`、`LM_MAX_STEP_*`、`JOINT_CLAMP_*`、`SCHUR_LM_*`。
+
+**宣称边界（先声明）**：P7 通过只说明稀疏路径与稠密 oracle 代数一致、确定、可扩展到生产规模；P8 通过只说明循环按 Iteration 37
+契约执行，并在受控合成注入上收敛到正确的解。两者都**不**说明真实数据上会收敛，也**不**说明 Schur 会改善对齐。
+
+### A. 定义
+
+1. **稀疏后端**：`SchurSystem` 的 3×3 块（键已由 `torch.unique` 排序）按行展开成 COO，再转成 `scipy.sparse` CSC，
+   float64。步求解用 `scipy.sparse.linalg.splu`（`permc_spec="MMD_AT_PLUS_A"`、`diag_pivot_thresh=0`、`SymmetricMode`），
+   只用于 `lam > 0` 的系统和 `restrict_to_free` 后的受限系统；接口与 `solve_geometry_dense` 相同，作为 `feasible_joint_step(solve=)` 传入。
+   分解失败（奇异）⇒ `numerical_failure`。
+2. **生产版驻点与秩检验**：在自由 DOF 上取块图（off-diagonal 块的结构）的连通分量（`scipy.sparse.csgraph.connected_components`），
+   每个分量单独切出稠密子块，做 Jacobi 缩放 + eigh + 投影，`λ²_geo` 按分量求和，弱方向数、`null_gradient_max` 取并 / 取最大。
+   S 在置换下块对角，所以数学上与 Iteration 37 §A.5 的全局 eigh 等价，定义不变。最坏情况是单个 6804 维分量
+   （61k 条径迹把 17:8 与 24:4 连成一个二部图，预计如此）：矩阵与特征向量各约 370 MB，每个外层迭代只做一次（≤ 60 次），
+   每次约 1 分钟，可以接受。记录 `largest_component_dof`。稠密 `global_stationarity` 保留为 oracle。
+3. **结构性零方向**（plan §3.7 第 A 步）：线性化后某 sensor 某 DOF 的 `diag(C)` 恰为 0（例如只有 LOC0 的 target 上的 ty），
+   该 DOF 视为不活动方向：从自由集删除（`restrict_to_free` 钉成 `δu = 0`），`D_a` 的对应位置置 1 只为了让 `schur_reduce` 能构造
+   （该行随后被钉住，取值不影响任何解），且不进入秩检验。逐个报告 `structurally_absent`。**这不是 floor**：这些方向根本不被求解。
+4. **非线性目标**：`F = ½ Σ r²`，求和范围是冻结的 ref + target 有效分量集合；白化方式与 `linearize_tracks` 完全相同
+   （同一个 `_hit_residual`）。在线性化点上 `F_eval` 必须等于 `½‖lin.residual‖²`。冻结集合中的任一分量在试探点失效 ⇒ `lost`。
+5. **循环**：plan §P8 的 15 步加 Iteration 37 §A–C，不增删任何语义。每个外层迭代先在当前点线性化，构造 `lam = 0` 的系统，
+   求活动集（箱约束 ∧ 结构活动），检查驻点（迭代**开始时**），然后进入 λ 重试：`schur_reduce(λ)` → `feasible_joint_step` →
+   在 `αp` 上算预测下降 → `apply_geometry_step` + `commit_track_step` → `F_eval` → `gain_ratio` → `update_damping`。
+   重试复用同一线性化；拒步不改任何状态；外层预算是 `SCHUR_LM_MAX_ITERS`，**不用** `config.lm_max_iters`；
+   箱约束半宽取 `config.joint_clamp_t/r`；全程 CPU float64，忽略 `config.gpu`；不出现 `lm_max_step_t/r`。
+   入口处的 invalid-intersection 检查与 block-lm 相同（`joint_max_invalid_fraction`）。
+6. **逐 trial 日志**（plan §P8 必需项）：`iteration, attempt, lam, branch, accepted, reject_reason, alpha, n_resolves, n_free,
+   n_structurally_absent, F_before/after, chi2_ref/tgt before/after, n_components_ref/tgt, predicted, actual, rho,
+   geo_step_norm, track_step_norm`，以及 target 行上一阶归因 `‖Aδu‖²`、`‖Bδθ‖²`。每个外层迭代另记
+   `lambda2_geo, lambda2_trk_max, rank_deficient, min_scaled_eigenvalue, largest_component_dof`。
+
+### B. 常量
+
+无新增数值常量。沿用 Iteration 37 §B 全部 `SCHUR_LM_*`（版本 1）。λ_init 扫描网格 {1e-5, 1e-3, 1e-1} 与等价容差
+`1e-6 mm / 1e-7 rad` 在本轮的 Level B 上执行。
+
+### C. 判据（数值容差，非统计）
+
+P7：
+- **S1 组装**：CSC 与 `SchurSystem.to_dense()` 逐元相对差 ≤ 1e-14，且对称（Level A、Level B、有冻结 DOF 三种）。
+- **S2 求解**：`solve_geometry_sparse` 与 `solve_geometry_dense` 相对差 ≤ 1e-10；`feasible_joint_step(solve=sparse)` 与 dense 版相同
+  （含 α = 0 重解路径）。
+- **S3 驻点**：分量版与稠密 `global_stationarity` 一致：`λ²_geo`、`λ²_trk` 相对差 ≤ 1e-10，`rank_deficient`、`lambda2_is_lower_bound`
+  相同，`min_scaled_eigenvalue`、`null_gradient_max` 相对差 ≤ 1e-8。覆盖多分量拓扑、秩亏、冻结 DOF。
+- **S4 确定性**：同一输入两次运行逐位相同；打乱径迹顺序后相对差 ≤ 1e-12。
+- **S5 规模**（slow）：Level A 随机拓扑，2268 块、61k 条径迹、每条 2–4 个 target：约化、组装、splu、分量驻点全部完成，
+  且全程不调用 `to_dense`（monkeypatch 成抛错）。记录耗时与最大分量，不设阈值。
+
+P8：
+- **L1 线性**：Level A 线性残差（目标由 `shifted_linear_residual` 给出）上，每个接受步 `|ρ − 1| ≤ 1e-10`，
+  终点与稠密 GN 解相对差 ≤ 1e-10，终态 `converged`。
+- **L2 受控注入**（Level B `shared_topology_problem`，±注入）：终态 `converged`；几何误差小于注入量；正负注入的修正符号相反；
+  每个接受步无分量丢失；接受步上 `F` 严格下降。
+- **L3 大阻尼**：`λ = 1e10` 时，首个 trial 的 `‖δu‖`、`‖δθ‖` ≤ 1e-8 × GN 步。
+- **L4 失败路径**：Γ 不正定 ⇒ `numerical_failure`；每个 trial 都丢分量 ⇒ `intersection_failed`；`max_iters = 1` 且未驻点 ⇒ `budget_exhausted`；
+  最优点在界上 ⇒ `converged` 且终点 DOF 在界上；几何弱方向 ⇒ `rank_deficient`（永不报 `converged`）。
+- **L5 λ_init 扫描**：Level B 上三个 λ_init 都 `converged`，两两终态几何差 ≤ 1e-6 mm / 1e-7 rad。
+- **L6 结构零方向**：一个 target 只有 LOC0 ⇒ 其 ty 被报告为 `structurally_absent` 并保持 0，不抛错，其余 DOF 照常收敛。
+- **L7 接入**：`--joint-solver schur-lm` 可解析并分派到 `run_schur_lm_alignment`；默认仍为 `block-lm`；
+  `test_block_lm_blocks_are_decoupled_across_target_sensors` 与 P2–P6 全部保持绿色；模块里仍不出现 `LM_MAX_STEP`。
+
+### D. 门出口
+
+S1–S5 通过 ⇒ **P7 通过（合成层）**；L1–L7 通过 ⇒ **P8 通过（受控注入层）**。任一失败就停下排查，**不放宽本条目中的任何阈值**；
+如需修改，先另写 Iteration 说明数值理由。之后才允许 Level C（小 ROOT 子集）与 P9 / P11，且真实数据运行须另写预注册。
