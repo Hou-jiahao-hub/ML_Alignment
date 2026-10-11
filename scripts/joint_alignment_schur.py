@@ -24,9 +24,12 @@ step, the global decrement with its rank test, and the terminal state.  The
 sensors, so there are no per-sensor damping, terminal states or retirement.
 Legacy per-DOF post-solve step clipping does not exist on this path.
 
-There is no LM loop and no sparse production accumulation yet.  The
-``*_dense`` helpers, ``global_stationarity`` included, are for tiny oracle
-problems and must not be used at production scale.
+Production scale (plan.md §P7, Iteration 38): the reduced system is
+assembled as CSC from its 3x3 coordinate blocks and solved with SuperLU
+(``solve_geometry_sparse``); the decrement and rank test run per connected
+component of the sensor coupling graph (``global_stationarity_sparse``).
+There is no LM loop yet.  The ``*_dense`` helpers, ``global_stationarity``
+included, remain tiny-problem oracles.
 """
 
 from __future__ import annotations
@@ -37,6 +40,9 @@ from dataclasses import dataclass
 from typing import Sequence
 
 import torch
+from scipy.sparse import csc_matrix, csr_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.sparse.linalg import splu
 
 from helix_model import (
     MeasurementFitInputs,
@@ -198,24 +204,44 @@ class TrackLinearization:
     active_dof: tuple[int, ...]
 
 
-def linearize_tracks(
-    parameters: torch.Tensor,
-    batches,
-    geometry,
-    alignment: torch.Tensor | None = None,
-    active_dof: Sequence[int] = DEFAULT_ACTIVE_DOF,
-    chunk_hits: int = 65_536,
-) -> TrackLinearization:
-    """Linearise all ref and target components at ``(alignment, parameters)``.
+@dataclass(frozen=True)
+class _HitInputs:
+    """Per-hit arguments of ``_hit_residual`` at one ``(alignment, parameters)`` point."""
 
-    ``parameters`` are physical helices [T, 6]; the gauge frame is built from
-    them here.  Target rows are assembled directly, so the production
-    ``_non_target_fit_mask`` guard is neither used nor relaxed.
-    """
-    active_dof = tuple(int(dof) for dof in active_dof)
-    parameters = parameters.detach().to(device="cpu", dtype=DTYPE)
+    component_mask: torch.Tensor
+    is_target: torch.Tensor
+    block_index: torch.Tensor
+    target_sensors: torch.Tensor
+    track_index: torch.Tensor
+    hit_index: torch.Tensor
+    arguments: tuple
+    k: int
+
+    def chunk(self, start: int, stop: int):
+        t = self.track_index[start:stop]
+        h = self.hit_index[start:stop]
+        (theta, origin, axis0, axis1, measured, variance, mask, centers0, rotations0, alignment,
+         sensor_idx, embedding) = self.arguments
+        s = sensor_idx[t, h]
+        return t, h, (
+            theta[t],
+            torch.zeros((len(t), self.k), dtype=DTYPE),
+            origin[t],
+            axis0[t],
+            axis1[t],
+            measured[t, h],
+            variance[t, h],
+            mask[t, h],
+            centers0[s],
+            rotations0[s],
+            alignment[s],
+            embedding,
+        )
+
+
+def _hit_inputs(parameters, batches, geometry, alignment, active_dof) -> _HitInputs:
     hit_mask = batches.hit_mask.to("cpu")
-    n_tracks, n_hits = hit_mask.shape
+    n_tracks, _n_hits = hit_mask.shape
     if parameters.shape != (n_tracks, 6):
         raise ValueError("parameters must have shape [tracks, 6].")
     centers0 = geometry.centers.to(DTYPE)
@@ -250,45 +276,62 @@ def linearize_tracks(
 
     origin, axis0, axis1 = reference_gauge_frame(parameters)
     theta = pack_gauge_fixed_track_parameters(parameters)
-    embedding = geometry_embedding(active_dof)
     track_index, hit_index = torch.nonzero(hit_mask, as_tuple=True)
-    k = len(active_dof)
+    return _HitInputs(
+        component_mask=component_mask,
+        is_target=is_target,
+        block_index=block_index,
+        target_sensors=target_sensors,
+        track_index=track_index,
+        hit_index=hit_index,
+        arguments=(
+            theta, origin, axis0, axis1, measured, variance, component_mask, centers0, rotations0,
+            alignment, sensor_idx, geometry_embedding(active_dof),
+        ),
+        k=len(active_dof),
+    )
+
+
+def linearize_tracks(
+    parameters: torch.Tensor,
+    batches,
+    geometry,
+    alignment: torch.Tensor | None = None,
+    active_dof: Sequence[int] = DEFAULT_ACTIVE_DOF,
+    chunk_hits: int = 65_536,
+) -> TrackLinearization:
+    """Linearise all ref and target components at ``(alignment, parameters)``.
+
+    ``parameters`` are physical helices [T, 6]; the gauge frame is built from
+    them here.  Target rows are assembled directly, so the production
+    ``_non_target_fit_mask`` guard is neither used nor relaxed.
+    """
+    active_dof = tuple(int(dof) for dof in active_dof)
+    parameters = parameters.detach().to(device="cpu", dtype=DTYPE)
+    inputs = _hit_inputs(parameters, batches, geometry, alignment, active_dof)
+    n_tracks, n_hits = inputs.is_target.shape
+    k = inputs.k
     residual = torch.zeros((n_tracks, n_hits, 2), dtype=DTYPE)
     geometry_jacobian = torch.zeros((n_tracks, n_hits, 2, k), dtype=DTYPE)
     track_jacobian = torch.zeros((n_tracks, n_hits, 2, N_TRACK_PARAMETERS), dtype=DTYPE)
-    for start in range(0, len(track_index), chunk_hits):
-        t = track_index[start : start + chunk_hits]
-        h = hit_index[start : start + chunk_hits]
-        s = sensor_idx[t, h]
-        arguments = (
-            theta[t],
-            torch.zeros((len(t), k), dtype=DTYPE),
-            origin[t],
-            axis0[t],
-            axis1[t],
-            measured[t, h],
-            variance[t, h],
-            component_mask[t, h],
-            centers0[s],
-            rotations0[s],
-            alignment[s],
-            embedding,
-        )
+    for start in range(0, len(inputs.track_index), chunk_hits):
+        t, h, arguments = inputs.chunk(start, start + chunk_hits)
         residual[t, h] = _BATCHED_HIT_RESIDUAL(*arguments)
         d_theta, d_u = _BATCHED_HIT_JACOBIAN(*arguments)
         track_jacobian[t, h] = d_theta
         # Reference geometry is fixed: its rows carry no geometry derivative.
-        geometry_jacobian[t, h] = d_u * is_target[t, h, None, None]
+        geometry_jacobian[t, h] = d_u * inputs.is_target[t, h, None, None]
+    hit_mask = batches.hit_mask.to("cpu")
     return TrackLinearization(
         parameters=parameters,
         residual=residual,
         geometry_jacobian=geometry_jacobian,
         track_jacobian=track_jacobian,
-        component_mask=component_mask,
-        is_target=is_target,
-        is_ref=hit_mask & ~is_target,
-        block_index=block_index,
-        target_sensors=target_sensors,
+        component_mask=inputs.component_mask,
+        is_target=inputs.is_target,
+        is_ref=hit_mask & ~inputs.is_target,
+        block_index=inputs.block_index,
+        target_sensors=inputs.target_sensors,
         active_dof=active_dof,
     )
 
@@ -518,6 +561,38 @@ def solve_geometry_dense(system: SchurSystem) -> torch.Tensor:
     """``du = -S^-1 b`` by a dense solve; oracle-sized problems only."""
     n, k = system.rhs.shape
     return -torch.linalg.solve(system.to_dense(), system.rhs.reshape(n * k)).reshape(n, k)
+
+
+def to_sparse(system: SchurSystem) -> csc_matrix:
+    """``S`` as CSC.  Block keys are sorted, so the assembly is deterministic."""
+    n, k = system.rhs.shape
+    offsets = torch.arange(k)
+    rows = (system.rows[:, None, None] * k + offsets[None, :, None]).expand(-1, k, k)
+    cols = (system.cols[:, None, None] * k + offsets[None, None, :]).expand(-1, k, k)
+    return csc_matrix(
+        (
+            system.values.reshape(-1).numpy(),
+            (rows.reshape(-1).numpy(), cols.reshape(-1).numpy()),
+        ),
+        shape=(n * k, n * k),
+    )
+
+
+def solve_geometry_sparse(system: SchurSystem) -> torch.Tensor:
+    """``du = -S^-1 b`` by SuperLU with symmetric ordering and diagonal pivots.
+
+    A singular factor raises ``RuntimeError``; the loop reports it as a
+    numerical failure.
+    """
+    n, k = system.rhs.shape
+    factor = splu(
+        to_sparse(system),
+        permc_spec="MMD_AT_PLUS_A",
+        diag_pivot_thresh=0.0,
+        options={"SymmetricMode": True},
+    )
+    solution = factor.solve(system.rhs.reshape(n * k).numpy())
+    return -torch.from_numpy(solution).reshape(n, k)
 
 
 def solve_joint_dense(
@@ -786,6 +861,8 @@ class GlobalStationarity:
     lambda2_is_lower_bound: bool
     min_scaled_eigenvalue: float
     null_gradient_max: float
+    #: Free DOF of the largest coupled component the eigendecomposition saw.
+    largest_component_dof: int = 0
 
     @property
     def stationary(self) -> bool:
@@ -794,6 +871,48 @@ class GlobalStationarity:
             self.lambda2_geo <= SCHUR_LM_EPSILON_GEO
             and self.lambda2_trk_max <= SCHUR_LM_EPSILON_TRK
         )
+
+
+@dataclass(frozen=True)
+class _ScaledDecrement:
+    lambda2_geo: float
+    weak: bool
+    min_scaled_eigenvalue: float
+    null_gradient_max: float
+
+
+def _scaled_decrement(
+    information: torch.Tensor, gradient: torch.Tensor, rank_tol: float
+) -> _ScaledDecrement | None:
+    """``b^T S^-1 b`` over the strong eigendirections of the Jacobi-scaled ``S``.
+
+    ``None`` when ``diag(S)`` has a non-positive entry.
+    """
+    diagonal = information.diagonal()
+    if not bool((diagonal > 0.0).all()):
+        return None
+    scale = diagonal.rsqrt()
+    scaled = information * scale[:, None] * scale[None, :]
+    eigenvalues, eigenvectors = torch.linalg.eigh(0.5 * (scaled + scaled.T))
+    projection = eigenvectors.T @ (gradient * scale)
+    weak = eigenvalues <= rank_tol
+    strong = ~weak
+    return _ScaledDecrement(
+        lambda2_geo=float((projection[strong].square() / eigenvalues[strong]).sum()),
+        weak=bool(weak.any()),
+        min_scaled_eigenvalue=float(eigenvalues[0]),
+        null_gradient_max=float(projection[weak].abs().max()) if bool(weak.any()) else 0.0,
+    )
+
+
+def _track_decrement(blocks: JointNormalBlocks, system: SchurSystem, free):
+    if system.lam != 0.0:
+        raise ValueError("The decrement is defined on the undamped system (lam = 0).")
+    lambda2_trk = torch.einsum("ti,ti->t", blocks.beta, system.track_step)
+    trk_max = float(lambda2_trk.max()) if lambda2_trk.numel() else 0.0
+    if free is None:
+        free = torch.ones_like(system.rhs, dtype=torch.bool)
+    return lambda2_trk, trk_max, free
 
 
 def global_stationarity(
@@ -809,37 +928,94 @@ def global_stationarity(
     below ``rank_tol`` are dropped, which makes the value a lower bound and
     the run ``rank_deficient``.  Dense eigh: oracle-sized problems only.
     """
-    if system.lam != 0.0:
-        raise ValueError("The decrement is defined on the undamped system (lam = 0).")
-    lambda2_trk = torch.einsum("ti,ti->t", blocks.beta, system.track_step)
-    trk_max = float(lambda2_trk.max()) if lambda2_trk.numel() else 0.0
-    if free is None:
-        free = torch.ones_like(system.rhs, dtype=torch.bool)
+    lambda2_trk, trk_max, free = _track_decrement(blocks, system, free)
     keep = free.flatten()
     n_free = int(keep.sum())
     if n_free == 0:
         return GlobalStationarity(0.0, lambda2_trk, trk_max, 0, False, False, math.nan, 0.0)
-    information = system.to_dense()[keep][:, keep]
-    gradient = system.rhs.flatten()[keep]
-    diagonal = information.diagonal()
-    if not bool((diagonal > 0.0).all()):
+    result = _scaled_decrement(
+        system.to_dense()[keep][:, keep], system.rhs.flatten()[keep], rank_tol
+    )
+    if result is None:
         return GlobalStationarity(math.nan, lambda2_trk, trk_max, n_free, True, True, math.nan, math.nan)
-    scale = diagonal.rsqrt()
-    scaled = information * scale[:, None] * scale[None, :]
-    eigenvalues, eigenvectors = torch.linalg.eigh(0.5 * (scaled + scaled.T))
-    projection = eigenvectors.T @ (gradient * scale)
-    weak = eigenvalues <= rank_tol
-    strong = ~weak
-    lambda2_geo = float((projection[strong].square() / eigenvalues[strong]).sum())
+    return GlobalStationarity(
+        lambda2_geo=result.lambda2_geo,
+        lambda2_trk=lambda2_trk,
+        lambda2_trk_max=trk_max,
+        n_free=n_free,
+        rank_deficient=result.weak,
+        lambda2_is_lower_bound=result.weak,
+        min_scaled_eigenvalue=result.min_scaled_eigenvalue,
+        null_gradient_max=result.null_gradient_max,
+        largest_component_dof=n_free,
+    )
+
+
+def coupling_components(system: SchurSystem) -> tuple[int, torch.Tensor]:
+    """Connected components of the sensor graph whose edges are off-diagonal blocks."""
+    n = system.n_blocks
+    off = system.rows != system.cols
+    graph = csr_matrix(
+        (
+            torch.ones(int(off.sum()), dtype=DTYPE).numpy(),
+            (system.rows[off].numpy(), system.cols[off].numpy()),
+        ),
+        shape=(n, n),
+    )
+    n_components, labels = connected_components(graph, directed=False)
+    return int(n_components), torch.from_numpy(labels).to(torch.long)
+
+
+def global_stationarity_sparse(
+    blocks: JointNormalBlocks,
+    system: SchurSystem,
+    free: torch.Tensor | None = None,
+    rank_tol: float = SCHUR_LM_RANK_TOL,
+) -> GlobalStationarity:
+    """``global_stationarity`` for production: one dense eigh per coupled component.
+
+    ``S`` is block diagonal over the connected components of the coupling
+    graph, so the spectrum and the decrement are their union and sum; only a
+    component's own block is ever densified (Iteration 38 §A.2).
+    """
+    lambda2_trk, trk_max, free = _track_decrement(blocks, system, free)
+    n_free = int(free.sum())
+    if n_free == 0:
+        return GlobalStationarity(0.0, lambda2_trk, trk_max, 0, False, False, math.nan, 0.0)
+    k = system.rhs.shape[1]
+    n_components, labels = coupling_components(system)
+    matrix = to_sparse(system).tocsr()
+    gradient = system.rhs.flatten()
+    dof_free = free.flatten()
+    dof_label = labels.repeat_interleave(k)
+    lambda2_geo, weak, largest = 0.0, False, 0
+    min_eigenvalue, null_max = math.inf, 0.0
+    for component in range(n_components):
+        dofs = torch.nonzero((dof_label == component) & dof_free, as_tuple=True)[0]
+        if len(dofs) == 0:
+            continue
+        index = dofs.numpy()
+        information = torch.from_numpy(matrix[index][:, index].toarray())
+        result = _scaled_decrement(information, gradient[dofs], rank_tol)
+        if result is None:
+            return GlobalStationarity(
+                math.nan, lambda2_trk, trk_max, n_free, True, True, math.nan, math.nan, len(dofs)
+            )
+        lambda2_geo += result.lambda2_geo
+        weak = weak or result.weak
+        min_eigenvalue = min(min_eigenvalue, result.min_scaled_eigenvalue)
+        null_max = max(null_max, result.null_gradient_max)
+        largest = max(largest, len(dofs))
     return GlobalStationarity(
         lambda2_geo=lambda2_geo,
         lambda2_trk=lambda2_trk,
         lambda2_trk_max=trk_max,
         n_free=n_free,
-        rank_deficient=bool(weak.any()),
-        lambda2_is_lower_bound=bool(weak.any()),
-        min_scaled_eigenvalue=float(eigenvalues[0]),
-        null_gradient_max=float(projection[weak].abs().max()) if bool(weak.any()) else 0.0,
+        rank_deficient=weak,
+        lambda2_is_lower_bound=weak,
+        min_scaled_eigenvalue=min_eigenvalue,
+        null_gradient_max=null_max,
+        largest_component_dof=largest,
     )
 
 
@@ -869,3 +1045,4 @@ def global_terminal_status(
     if stationary:
         return SCHUR_LM_STATUS_CONVERGED
     return SCHUR_LM_STATUS_BUDGET_EXHAUSTED
+
