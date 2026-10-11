@@ -273,6 +273,29 @@ def test_objective_at_the_linearisation_point_is_half_the_residual_norm():
     assert evaluation.n_components_ref + evaluation.n_components_tgt == int(lin.component_mask.sum())
 
 
+@pytest.mark.slow
+def test_lambda_init_scan_reaches_the_same_geometry():
+    """Iteration 37 §B grid; equivalence 2 sqrt(eps_geo) sigma per DOF (Iteration 39).
+
+    Each converged run is within sqrt(eps_geo) of the optimum in the S metric,
+    hence within sqrt(eps_geo) sigma_i per DOF, and two runs within twice that.
+    """
+    runs = {lam: _level_b_run(1.0, noise_seed=3, lambda_init=lam) for lam in J.SCHUR_LM_LAMBDA_INIT_SCAN}
+    estimates = {}
+    for lam, (problem, result) in runs.items():
+        assert result["schur_lm_summary"]["status"] == J.SCHUR_LM_STATUS_CONVERGED, lam
+        estimates[lam] = _estimated(problem, result)[0]
+    _optimum, sigma = _dense_joint_optimum(problem)
+    reference = estimates[J.SCHUR_LM_LAMBDA_INIT]
+    tolerance = 2.0 * J.SCHUR_LM_EPSILON_GEO ** 0.5
+    for lam, estimate in estimates.items():
+        difference = (estimate - reference).abs()
+        in_sigma = float((difference / sigma).max())
+        print(f"\nL5 lambda_init={lam:g}: max |d tx,ty| = {float(difference[:, :2].max()):.3g} mm, "
+              f"max |d rz| = {float(difference[:, 2].max()):.3g} rad, max |d|/sigma = {in_sigma:.3g}")
+        assert in_sigma <= tolerance, lam
+
+
 def test_loc0_only_target_has_a_structurally_absent_ty():
     """Without rz, ty on a LOC0-only target has exactly zero information at every point."""
     truth = syn.make_tracks(10, seed=1)
