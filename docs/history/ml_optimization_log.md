@@ -3627,3 +3627,139 @@ L5'：Level B（`shared_topology_problem`，Iteration 38 的注入，noise_seed 
 **L5' 通过**：三个 λ_init 都 `converged`。相对 λ_ref = 1e-3：λ_init = 1e-5 的最大差为 6.95e-5 mm / 1.74e-6 rad = **1.39e-3σ**，
 λ_init = 1e-1 为 5.35e-6 mm / 3.01e-7 rad = **9.4e-5σ**，都远低于 0.2σ。至此 **P8 通过（受控注入层，Iteration 38 L1–L4、L6、L7 + Iteration 39 L5'）**。
 Iteration 38 §E 中按原判据的未通过结果保留不改。
+
+## Iteration 40 — roadmap M1：fixed-track 可观测性与参考层注入（Schur P0.3，预注册）
+
+**日期**：2026-10-11。**状态**：预注册，写于 `scripts/analysis/measure_alignment_observability.py`、
+`tests/test_measure_alignment_observability.py` 及任何 M1 数据运行之前。口径经用户确认（truth 用法、子样本重复、参考层臂设计、幅度与预算）。
+**上游**：roadmap `2026-09-07-alignment-methodology-roadmap.md` §M1；`plan.md` §P0.3、§P9；理论评审 §5.4；
+实现图 `2026-10-08-schur-phase0-baseline-and-implementation-map.md` §6.1；交接 `2026-10-11-schur-p7-p8-sparse-and-loop.md`。
+**性质**：只测量，不改求解器。对象是生产 `block-lm`（fixed-track），不涉及 `schur-lm`。产物是 P9 的对照基线。
+
+**宣称边界（先声明）**：M1 只回答「fixed-track 求解器在本行集上哪些 (sensor, 模式) 由数据决定、哪些受正则或参考几何支配」。
+它不评价 Schur，不修改生产 floor、damping、clipping 或任何阈值，也不构成 H1 的 truth 结果。
+
+### A. 输入、行集与求解器
+
+- 输入与行集同 P0.1 / P1（Iteration 33 §A）：input / states / nominal_geometry 的 SHA256 等于 P0.1 manifest；
+  `build_track_batches`（target `17:8,24:4`，≥8 非 target hit，跨度 ≥300 mm，`max_tracks = 0`）；
+  `seed_helices`（2000 次）→ `require_stationary_helix_point_fit` → GN `fit_helices_to_measurements`；CPU float64。
+  身份闸门：retained 61,482、refit `n_components` 1,154,761，任一不符即停。
+- seed 与 refit **只算一次并缓存**。fixed-track 下 refit 只读非 target 几何，seed 不读几何，所以所有 target 注入臂共用同一组径迹。
+- 求解器：直接调 `run_block_lm_alignment(batches, geometry, config, (0,1,5), initial_track_params=refit)`，`config` 取
+  `AlignmentRunConfig` 默认值（与 CLI 默认值同源）且 `lm_max_iters = 60`，与 P0.1 命令逐项相同：`fisher_eigen_floor` 1e-4，
+  `lm_max_step_t/r` 0.1 mm / 5e-3，clamp 1.5 mm / 0.05。不经过 `validate_against_truth`，不 export。
+- **等价性核对**（任何臂读数之前）：control（a = 0 注入）的输出几何与 P0.1 `aligned_transforms_schur-p0-fixedtrack-20260922_joint_free.json`
+  相比，平移差 ≤ 1e-6 mm、rz 差 ≤ 1e-8 rad，否则停止。
+- 注入一律在内存中改 `geometry.centers / rotations` 的对应行，约定同求解器（`apply_alignment_torch`：`c' = c + R·δt`，`R' = R·R(δrot)`）。
+  其余行逐位不变。`geometry.transforms` 因此过期，本脚本不使用也不导出它。
+
+### B. 谱（S）
+
+- 在缓存径迹上，用 `joint_alignment_schur.linearize_tracks → normal_blocks → geometry_information()` 逐 sensor 求无正则 C（u 单位，
+  与 block-LM 的 Fisher 一致，`tests/test_joint_schur_jacobians.py` 已锁定），取两个点：`a = 0` 与 control 收敛点 `a*`。
+- Jacobi 缩放：`Ĉ = D^{-½} C D^{-½}`，`D = diag(C)`；特征值 μ_0 ≤ μ_1 ≤ μ_2、单位特征向量 w_k。
+- **预注册分类**（在 `a*` 上，任何注入读数之前固定）：`μ_k > τ = 1e-4`（= `SCHUR_LM_RANK_TOL`）为 **declared observable**；
+  否则为 weak。`diag(C)` 有零元 ⇒ 该 DOF 为 structurally absent，sensor 只在其余 DOF 上做 Jacobi 缩放。
+- 同时报告：每 sensor 的 target 分量数（LOC0 / LOC1）、**是否只有 LOC0**（回答 Level C 的问题）、
+  `σ_i = sqrt(diag(C⁻¹))`（物理单位，满秩 sensor）、block-LM 口径的 weak 标记（unit 缩放 Fisher 上 `eig ≤ max_eig·1e-4`）。
+
+### C. target 注入（T）——主判据
+
+- 整层确定值注入，两个 target 层同时：tx、ty 各 ±0.5 mm，rz ±0.02 rad（同 Iteration 32，也是实际错位尺度）。
+  fixed-track 下 sensor 之间精确解耦，同时注入不影响逐 sensor 读数。
+- 响应矩阵（物理单位）`K_i[:, d] = −(â_i(+δ_d) − â_i(−δ_d)) / (2δ_d)`，理想 K = I。
+  已知的精确偏差：rz 注入时平移经 `R(δ)` 复合，`K[tx/ty, rz]` 含 `J·â_0` 项（u 单位约 5e-3），不做修正。
+- 模式斜率：`K_u = S⁻¹ K S`（`S = diag(GEOMETRY_SCALES)`），`K_z = D^{½} K_u D^{-½}`，`s_ik = w_kᵀ K_z w_k`。
+- **独立重复**：按 `event_id % 4`（`batches.event_track_ids[:, 0]`）把径迹分成 4 个事件不相交子样本，每个子样本独立做 6 个注入运行。
+  子样本的分类用该子样本径迹在全量 `a*` 处的 C 重新计算。
+- **主单元**：target 层 × 模式秩 k ∈ {0, 1, 2}，共 6 格；只纳入该模式 declared observable、且 ±运行中该 sensor 都 `converged` 的 sensor。
+- **统计量**：格内 sensor 平均斜率；95% CI 由 sensor bootstrap 给出（B = 10,000，种子 20261011，百分位法）。
+- **主判据**：每格在全量样本和 4 个子样本上的 CI 都完全落在 `[0.9, 1.1]` 内 ⇒ 该格 `observable_confirmed`。
+  任一越界 ⇒ 该格标为 `unobservable / prior-dominated`，不得宣称已对齐。另报每格 sensor 斜率落在 [0.9, 1.1] 之外的比例，以及 weak 模式的斜率（只描述）。
+
+### D. Fisher floor（F）——次判据，diagnostic_only
+
+- 全量样本，`fisher_eigen_floor ∈ {1e-3, 1e-5}`，对照为 control（1e-4），其余全同。
+- geometry truth：`δ_true = R_misᵀ(c_nom − c_mis)`，`rz_true` 由 `R_misᵀR_nom` 分解，与 `alignment_diagnostics.validate_against_truth` 同一公式。
+  误差 `e = â − δ_true`。
+- 逐 target 层 × DOF（6 格）：`ratio = RMS(e_floor′) / RMS(e_1e-4)`，用 sensor 配对 bootstrap 求 95% CI（B = 10,000，种子 20261011）。
+  纳入两臂都有数据的 sensor。**次判据**：两个 floor 的 CI 上界都 ≤ 1.01。
+- 附报（不碰 truth）：`|â_floor′ − â_1e-4| / σ_i` 的分布。
+- **用途限制**：只报告，不用于选择 floor 或任何求解器参数；生产 floor 不变。这是 M1 中**唯一**读取 truth 的地方。
+
+### E. 参考层（R）——次判据
+
+- 臂：retained 径迹上出现的**每个**非 target `(volume, layer)` × {tx, ty, rz} × ±。幅度为平移 10 μm、rz 0.1 mrad，整层同一 local 值。
+- **线性响应**：从缓存 refit 出发，在扰动后的几何上重做 GN refit（warm start），在 `a*` 上重新线性化得 `c′`，
+  `Δâ = −S·C⁻¹(c′ − c)`（C、c 取原径迹在 `a*` 处的值，只对满秩 sensor）。传递偏差取反对称部分 `b = (Δâ(+) − Δâ(−)) / 2`。
+- **预算判据**：对每个（参考层 × DOF 臂，target 层 × target DOF），`RMS_sensors(b) ≤ median_sensors(σ_i)`（同层同 DOF）。
+  超出的组合逐一列出，标为「参考敏感」。这是 P9 中与 Schur 对比的对照量。
+- **非线性核对**：按 `max(RMS(b)/median σ)` 选前 2 个臂，各在 ± 扰动下从 a = 0 跑完整 block-LM（refit 同上）。
+  `b_nl = (â(+) − â(−)) / 2` 与线性 `b` 比较：两臂中 ±都 `converged` 的 sensor，≥95% 满足每个 DOF `|b_nl − b| ≤ 0.1σ_i`。
+  不通过时线性响应表仍报告，但标为 `linearity_unverified`。
+
+### F. 门出口与停止条件
+
+- 身份闸门或 §A 的等价性核对不通过 ⇒ 停止，不读任何臂。
+- control 中非 `converged` 的 sensor 逐一列出，不进入 §C 主单元。
+- 不在看到数据后改任何阈值、幅度、种子或分类规则；如需修改，另写 Iteration。冒烟子集（`--max-tracks`）的数字不进入判据。
+- **M1 总体**：§C 全部 6 格 `observable_confirmed` ⇒ M1 主判据通过；§D、§E 的结论单独报告，不并入主判据。
+
+### G. 结果（2026-10-12，本段只回填，不改上文任何定义、阈值或幅度）
+
+运行 `m1-fixed-track-observability-20261011`，8 个阶段 manifest 全部 `completed`（schema 2，源码快照 written）。
+产物：`data/experiments/surface_helix/Vol17_Lay8__Vol24_Lay4/m1-fixed-track-observability-20261011/`
+（`report/m1_result.json`、`spectrum/spectrum_{full,sub0..3}.npz`、`spectrum/per_sensor.csv`、`reference-linear/arms/*.npz`）。
+
+**闸门**：身份闸门 `passed`（retained 61,482；refit `n_components` 1,154,761）。§A 等价性 `passed`：control 与 P0.1 输出几何
+平移最大差 2.3e-14 mm、rz 9.5e-17 rad；13 次迭代 `all_blocks_terminal`，**2268/2268 `converged`**。
+
+**§B 谱**：2268 个 target sensor 都有数据；**只有 LOC0 的 sensor 0 个**、structurally absent DOF 0 个；Jacobi 口径 weak 模式 0 个，
+block-LM 口径 weak 0 个。`a*` 处最小 μ_0 = 0.435（17:8）/ 0.348（24:4），中位 0.90 / 0.51。σ_i 中位数：
+17:8 tx 1.95 μm、ty 1.93 μm、rz 9.2e-5 rad；24:4 tx 6.6 μm、**ty 160 μm**、rz 1.9e-4 rad。`a = 0` 与 `a*` 的 μ 最多差 0.048（17:8）/ 0.64（24:4）。
+
+**§C 主判据：通过（6/6 格 `observable_confirmed`）**。全量与 4 个子样本的 CI 都在 [0.9, 1.1] 内：
+
+| 格 | 全量 mean [95% CI] | 子样本 mean 范围 | 子样本最差 CI 端点 | 落在 band 外的 sensor 比例（最大） |
+|---|---|---|---|---|
+| 17:8 mode0 | 1.0003 [0.9996, 1.0010] | 0.9999–1.0004 | 0.9991 / 1.0011 | 0 |
+| 17:8 mode1 | 1.00000 [1.00000, 1.00000] | 1.00000 | — | 0 |
+| 17:8 mode2 | 0.9997 [0.9990, 1.0004] | 0.9995–1.0001 | 0.9988 / 1.0009 | 0 |
+| 24:4 mode0 | 0.9990 [0.9984, 0.9995] | 0.9891–0.9918 | 0.9858 | 3.6% |
+| 24:4 mode1 | 0.9998 [0.9997, 0.9999] | 0.9955–0.9957 | 0.9932 | 1.4% |
+| 24:4 mode2 | 0.9997 [0.9995, 1.0000] | 0.9963–0.9977 | 0.9951 | 1.2% |
+
+每格 sensor 数：全量 1092 / 1176，子样本 1090–1092 / 1168–1175（其余为某臂未 `converged`，部分子样本臂以 `iteration_budget` 停止）。
+
+**§D floor（diagnostic_only）：按判据通过，但为平凡通过**。floor 1e-3 与 1e-5 两臂的输出几何与逐 sensor 状态**与 control 逐位相同**，
+12 格 truth RMS 比值全部恰为 1.0000 [1.0000, 1.0000]，几何差 0。原因：本行集每个 sensor 的 unit 缩放 Fisher 特征值比都大于 1e-3，
+`fisher_eigen_floor` 在 [1e-5, 1e-3] 内从未生效。**这说明 floor 在本行集上不起作用，不说明结果对一个起作用的正则稳健。**
+
+**§E 参考层**：28 个非 target 层 × 3 DOF × ±，共 168 个线性响应臂。504 个（参考臂 × target 层 × target DOF）组合中，
+**5 个超出预算（「参考敏感」）**，全部是 volume 17 的内层 → 17:8：
+
+| 参考臂 | → target | RMS 偏差 | 中位 σ | 比值 |
+|---|---|---:|---:|---:|
+| 17:6 ty（10 μm） | 17:8 ty | 15.2 μm | 1.93 μm | 7.89 |
+| 17:2 ty | 17:8 ty | 7.96 μm | 1.93 μm | 4.12 |
+| 17:6 tx | 17:8 tx | 4.36 μm | 1.95 μm | 2.24 |
+| 17:4 ty | 17:8 ty | 2.71 μm | 1.93 μm | 1.41 |
+| 17:4 tx | 17:8 tx | 2.30 μm | 1.95 μm | 1.18 |
+
+偏差完全相干（17:6 ty → 17:8 ty：均值 = RMS = 15.2 μm，传递系数 1.52）。24:4 也受影响（17:6 ty → 24:4 ty RMS 38 μm），
+但相对 24:4 ty 的 σ（160 μm）比值只有 0.24。非线性核对：选中的 17:6 ty、17:2 ty 两臂，2268 个 sensor 全部满足 `|b_nl − b| ≤ 0.1σ_i`
+（fraction 1.0）⇒ `linearity verified`。
+
+**耗时**：prepare 82 min（seed 69 min，与冒烟争用 CPU），control 28 min；全量 block-LM 一臂 26–55 min（视并行争用），
+子样本一臂 12–24 min；reference-linear 7.5 h（与 target 并行）。
+
+**解读边界（不得引申）**：
+1. 主判据通过只说明 fixed-track block-LM 对 target 自身的整层注入线性恢复；fixed-track 下径迹不随 target 几何变化，
+   这在很大程度上是求解器结构的直接结果（与 Iteration 32 的结论一致），不是对径迹吸收的检验。
+2. Jacobi 口径的 observable 只说明 DOF 之间不共线，不说明绝对精度高：24:4 ty 的 σ 为 160 μm，仍被判为 observable。
+   P9 比较 S 的谱时必须同时报告绝对 σ，不能只比 Jacobi 特征值。
+3. floor 次判据是平凡通过（见 §D），不能用来论证正则无关性。
+4. 参考敏感是 fixed-track 在**本模拟**（非 target 几何精确为 nominal）中的线性响应；它给出参考几何误差到 target 的传递系数，
+   不说明真实探测器的参考几何误差有多大。这正是 P9 中 Schur 需要对照的量：Schur 不改变参考几何，但会把径迹不确定度传播进几何信息。
+5. 本结果不读 H1 truth、不修订 WP3、不用于任何求解器参数选择。M1（P0.3）至此完成，P9 的前置条件满足。
