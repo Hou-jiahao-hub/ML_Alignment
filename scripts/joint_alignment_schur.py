@@ -1039,6 +1039,98 @@ def global_stationarity_sparse(
     )
 
 
+def diagonal_only(system: SchurSystem) -> SchurSystem:
+    """P11 ablation (Iteration 43): drop every ``S_ij``, i != j, after accumulation.
+
+    ``b = c - G Gamma^-1 beta`` and the track terms stay complete; this is not a
+    separate one-sensor elimination per sensor.
+    """
+    keep = system.rows == system.cols
+    return dataclasses.replace(
+        system, rows=system.rows[keep], cols=system.cols[keep], values=system.values[keep]
+    )
+
+
+def _diagonal_values(system: SchurSystem) -> torch.Tensor:
+    """``S_ii`` [n, k, k] in block order."""
+    keep = system.rows == system.cols
+    blocks = torch.zeros((system.n_blocks, *system.values.shape[1:]), dtype=DTYPE)
+    blocks[system.rows[keep]] = system.values[keep]
+    return blocks
+
+
+def diagonal_block_rank_deficient(
+    system: SchurSystem, rank_tol: float = SCHUR_LM_RANK_TOL, free: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Per block: a free DOF without positive diagonal, or a Jacobi-scaled eigenvalue <= ``rank_tol``."""
+    blocks = _diagonal_values(system)
+    if free is None:
+        free = torch.ones_like(system.rhs, dtype=torch.bool)
+    flags = torch.zeros(system.n_blocks, dtype=torch.bool)
+    for block in range(system.n_blocks):
+        index = torch.nonzero(free[block], as_tuple=True)[0]
+        if len(index):
+            sub = blocks[block][index][:, index]
+            result = _scaled_decrement(sub, torch.zeros(len(index), dtype=DTYPE), rank_tol)
+            flags[block] = result is None or result.weak
+    return flags
+
+
+def solve_geometry_diagonal(system: SchurSystem, rank_tol: float = SCHUR_LM_RANK_TOL) -> torch.Tensor:
+    """``du_i = -S_ii^-1 b_i`` per block; rank-deficient blocks are pinned at ``du_i = 0``.
+
+    Pinning only keeps the step defined; ``run_diagonal_only_loop`` reports such
+    blocks as undefined, never as a zero correction, and no block is regularised.
+    """
+    blocks = _diagonal_values(system)
+    deficient = diagonal_block_rank_deficient(system, rank_tol)
+    eye = torch.eye(blocks.shape[-1], dtype=DTYPE).expand_as(blocks)
+    safe = torch.where(deficient[:, None, None], eye, blocks)
+    step = -torch.linalg.solve(safe, system.rhs.unsqueeze(-1)).squeeze(-1)
+    return torch.where(deficient[:, None], torch.zeros_like(step), step)
+
+
+def global_stationarity_diagonal(
+    blocks: JointNormalBlocks,
+    system: SchurSystem,
+    free: torch.Tensor | None = None,
+    rank_tol: float = SCHUR_LM_RANK_TOL,
+) -> GlobalStationarity:
+    """The diagonal-only arm's own decrement ``sum_i b_i^T S_ii^-1 b_i`` and per-block rank test."""
+    lambda2_trk, trk_max, free = _track_decrement(blocks, system, free)
+    n_free = int(free.sum())
+    if n_free == 0:
+        return GlobalStationarity(0.0, lambda2_trk, trk_max, 0, False, False, math.nan, 0.0)
+    diagonal = _diagonal_values(system)
+    lambda2_geo, weak, largest = 0.0, False, 0
+    min_eigenvalue, null_max = math.inf, 0.0
+    for block in range(system.n_blocks):
+        index = torch.nonzero(free[block], as_tuple=True)[0]
+        if len(index) == 0:
+            continue
+        result = _scaled_decrement(diagonal[block][index][:, index], system.rhs[block][index], rank_tol)
+        if result is None:
+            return GlobalStationarity(
+                math.nan, lambda2_trk, trk_max, n_free, True, True, math.nan, math.nan, len(index)
+            )
+        lambda2_geo += result.lambda2_geo
+        weak = weak or result.weak
+        min_eigenvalue = min(min_eigenvalue, result.min_scaled_eigenvalue)
+        null_max = max(null_max, result.null_gradient_max)
+        largest = max(largest, len(index))
+    return GlobalStationarity(
+        lambda2_geo=lambda2_geo,
+        lambda2_trk=lambda2_trk,
+        lambda2_trk_max=trk_max,
+        n_free=n_free,
+        rank_deficient=weak,
+        lambda2_is_lower_bound=weak,
+        min_scaled_eigenvalue=min_eigenvalue,
+        null_gradient_max=null_max,
+        largest_component_dof=largest,
+    )
+
+
 def global_terminal_status(
     *,
     numerical_failure: bool = False,
@@ -1350,6 +1442,25 @@ def schur_lm_loop(
         stationarity=report,
         structurally_absent=absent,
     )
+
+
+def run_diagonal_only_loop(model, values, tracks, bounds, **kwargs) -> tuple[SchurLMResult, torch.Tensor]:
+    """The P11 diagonal-only arm through ``schur_lm_loop`` (Iteration 43; no CLI).
+
+    Returns the result with rank-deficient blocks' values set to NaN, and the
+    per-block deficiency flags at the final point.  With every block full rank
+    and both arms converged it shares the full arm's fixed point ``b = 0``.
+    """
+    result = schur_lm_loop(
+        model, values, tracks, bounds,
+        solve=solve_geometry_diagonal, stationarity=global_stationarity_diagonal, **kwargs,
+    )
+    blocks = normal_blocks(model.linearize(result.values, result.tracks))
+    deficient = diagonal_block_rank_deficient(
+        schur_reduce(blocks, 0.0), free=structural_free_mask(blocks)
+    )
+    values = torch.where(deficient[:, None], torch.full_like(result.values, math.nan), result.values)
+    return dataclasses.replace(result, values=values), deficient
 
 
 def run_schur_lm_alignment(

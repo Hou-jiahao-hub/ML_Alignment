@@ -3763,3 +3763,328 @@ block-LM 口径 weak 0 个。`a*` 处最小 μ_0 = 0.435（17:8）/ 0.348（24:4
 4. 参考敏感是 fixed-track 在**本模拟**（非 target 几何精确为 nominal）中的线性响应；它给出参考几何误差到 target 的传递系数，
    不说明真实探测器的参考几何误差有多大。这正是 P9 中 Schur 需要对照的量：Schur 不改变参考几何，但会把径迹不确定度传播进几何信息。
 5. 本结果不读 H1 truth、不修订 WP3、不用于任何求解器参数选择。M1（P0.3）至此完成，P9 的前置条件满足。
+
+---
+
+## Iteration 41 — WP3：H1 判据修订与真实数据 `schur-lm` 的 plan §14 预注册
+
+**日期**：2026-10-12。**状态**：预注册。写于任何真实数据 `schur-lm` 运行（Level C/D）之前，也写于任何 H1 truth 读取之前。
+**决定人**：用户（2026-10-12）选择「改为非劣 + 定向改善」，本条把这一方向落成可执行的判据。
+**上游**：roadmap §H1（原判据：几何 truth RMS 相对 fixed-track 改善 ≥10%，以 paired 95% CI 上界判定）；`plan.md` §6.2、§14、§Q6；
+Iteration 29/30（fixed-track truth-veto 数字）、33（P1 outcome 1）、37–39（`schur-lm` 契约与常量）、40（M1）。
+
+### A. 修订理由（运行前依据，只用已有数字）
+
+1. 本节引用的 truth 数字全部来自 Iteration 29/30 已完成的一次性否决，本条没有新读任何 truth。fixed-track 剩余误差 RMS
+   （`compare_geometries`，Iteration 29 表）除以 M1 的 σ_C 中位数（`sqrt(diag(C⁻¹))`，Iteration 40 §G）：
+
+   | 格 | 误差 RMS | σ_C 中位 | 比 |
+   |---|---:|---:|---:|
+   | 17:8 tx | 3.19 μm | 1.95 μm | 1.6 |
+   | 17:8 ty | 4.96 μm | 1.93 μm | 2.6 |
+   | 17:8 rz | 1.57e-4 rad | 9.2e-5 rad | 1.7 |
+   | 24:4 tx | 6.98 μm | 6.6 μm | 1.06 |
+   | 24:4 ty | 166 μm | 160 μm | 1.04 |
+   | 24:4 rz | 2.27e-4 rad | 1.9e-4 rad | 1.2 |
+
+   （RMS 与中位数不是同一统计量，比值只作量级参考。）24:4 的误差基本贴着 fixed-track 自报的 σ。
+   17:8 的误差是 σ_C 的 1.6–2.6 倍，说明 fixed-track 在 17:8 上低估了自己的不确定度。这正是 Schur 预期起作用的机制：
+   共享径迹的不确定度把误差相关起来。
+2. 原判据要求六格都改善 ≥10%。这条判据把两件事混在一起：正确的 Schur 可能只让 σ 变大、不改变点估计（plan §6.3 允许这种负结果）；
+   24:4 已经贴着 σ，要再改善 10%，Schur 就得是更有效的估计量，先验上不太可能。
+3. 因此 H1 拆成三部分：**否决用的非劣判据**（任何候选都必须满足）、**只在预先指定格上的定向改善声明**、以及与 truth 无关的**参考层传递预测**（在 P9 中检验）。
+
+### B. 判据
+
+**数据与配对**：沿用 Iteration 29 的 100k 错位样本（输入哈希同 P0.1）。几何 truth 是 `misalignment_applied_v17l8_v24l4.json` 相对 nominal 的局部修正，
+公式同 `run_truth_veto_closure._local_delta`。两臂是：A = fixed-track 冻结候选 `aligned_transforms_schur-p0-fixedtrack-20260922_joint_free.json`
+（与 Iteration 30 候选数值等价）；C = Level E 之后冻结的 full Schur 候选。配对单位是 sensor。
+`ratio = RMS(e_C) / RMS(e_A)`，其中 `e = â − δ_true`。95% 上尾采用百分位 bootstrap，2000 次重抽、seed 6006（同 Iteration 29）。
+
+- **H1-P（主判据，否决）**：六格（17:8、24:4 × tx、ty、rz）的 CI 上界都 ≤ **1.01**；再加上径迹 truth 距离（见下）两项的 CI 上界都 ≤ **1.01**。
+  任一不满足 ⇒ Schur 候选被否决。
+- **径迹 truth 距离**：对 retained 径迹，在每个 hit 的 truth 位置上计算到拟合 helix 的距离（`measure_all_hit_refit.truth_distance`，
+  truth 位置取自同一 trackstates ROOT）。A 臂的径迹是 ref-only refit（fixed-track 下径迹不随几何变化），C 臂取 `schur-lm` 收敛时的径迹。
+  分 target hit 与 ref hit 两项，用 `truth_veto_gate.paired_truth_distance_ratio_ci`（事件块 bootstrap，同上 seed 与次数）。
+- **H1-D（定向改善声明，非否决）**：只针对 **17:8 tx、17:8 ty、24:4 ty** 三格。某格 CI 上界 < **0.90** ⇒ 可以声明该格「在本样本上改善」。
+  其余三格只报告，不作改善声明。按 roadmap，正式的改善声明还需要在**独立模拟样本**（同一错位文件、新事件种子）上复现。
+  本样本上的结论标为 `post_hoc_single_sample`；是否生成独立样本，另行决定并另写预注册。
+  先验预期（运行前写下）：17:8 tx/ty 有改善的可能；24:4 ty 的先验偏低（见 §A.1）。
+- **H1-R（参考层传递预测，truth 无关，在 P9 中检验）**：对 Iteration 40 §E 的 5 个参考敏感组合，Schur 的线性传递 RMS 偏差
+  ≤ **0.90** × fixed-track 的对应值 ⇒ 该组合「参考敏感性下降」。
+  **「不依赖精确 nominal 参考」次判据**（roadmap）在两个条件同时成立时通过：(i) 在 504 个组合中，凡是 fixed-track 下参考敏感的组合，
+  Schur 的 RMS 偏差都不超过 fixed-track 的 1.10 倍；(ii) 不出现新的参考敏感组合，即 fixed-track 下不敏感的组合，在 Schur 下的 RMS 偏差 ≤ 同层同 DOF 的 σ_S 中位数。
+
+**证伪条件**（roadmap）：(1) C 臂的联合目标 F 低于 A 臂在同一联合目标上的值，而六格几何或两项径迹 truth 中任一 CI **下界** > 1.0
+（chi2 更好而 truth 显著更差）；(2) H1-D 有改善，但 H1-R 的「不依赖 nominal 参考」次判据失败（改善只在精确 nominal 参考下成立）。
+
+**允许的负结果**（plan §6.3）：H1-P 通过而 H1-D 一格都不改善，是合法结论：Schur 修正了信息量，但不改善点估计。不得据此加正则、放宽阈值或删径迹。
+
+### C. plan §14 字段（真实数据 `schur-lm`，Level C/D/E/F 共用）
+
+| 字段 | 值 |
+|---|---|
+| 求解器 | `run_schur_lm_alignment`，`SCHUR_LM_PREREGISTRATION_VERSION = 1`；commit 与 dirty 状态记入每个 manifest，并附源码快照 |
+| 输入身份 | P0.1 的 input / states / nominal 三个 SHA256；retained 61,482、ref-only refit `n_components` 1,154,761（Iteration 40 §A 的身份闸门） |
+| 行集 | 全量事件，≥8 个非 target hit，非 target 跨度 ≥300 mm，`max_tracks = 0` |
+| target / DOF | `17:8,24:4`；`(tx, ty, rz)` = DOF `0,1,5` |
+| 初值 | 几何 a = 0；径迹取 Iteration 40 缓存的 ref-only refit（`prepare/cache/tracks.pt`，与 P0.1 的生产 seed→refit 同一路径） |
+| 联合阻尼 | `D_a = diag(C)`（逐 sensor），`D_θ = diag(Γ)`（逐 track，Γ = Γ_ref + Γ_tgt）；先删去 `diag(C) = 0` 的方向，不加 floor |
+| floor | ε_a = ε_θ = 0。没有 floor，所以没有 ε 扫描，也没有 `r_floor_max` 测试（plan §3.7 第 C 步不触发） |
+| λ 常量 | Iteration 37 §B：init 1e-3、×10 / ÷10、ρ 阈值 1e-4 / 0.25 / 0.75、λ ∈ [1e-12, 1e12]、每次外迭代最多 8 次重试、外层预算 60 |
+| λ_init 扫描 | {1e-5, 1e-3, 1e-1}，全量行集。等价容差按 Iteration 39：都 `converged` 时，每个 DOF 的差 ≤ 0.2σ_S |
+| 步长裁剪 | 没有 `lm_max_step_t/r`（代码里不存在这条路径，L7 已锁定） |
+| ρ | 实际联合 F 下降 ÷ 未阻尼联合 GN 模型在执行步上的下降（Iteration 37 §B） |
+| 全局收敛 | λ²_geo ≤ 1e-2 且 max_t λ²_trk ≤ 1e-2；秩容差 1e-4（Jacobi 缩放）；终态优先级按 Iteration 37 §C |
+| 约束 | 盒约束 1.5 mm / 0.05 rad；活动集 + 统一比例缩放的可行步 + KKT，按 Iteration 37 §A.3 |
+| 稀疏后端 | SuperLU（`MMD_AT_PLUS_A`、对角主元、`SymmetricMode`）；秩检验按耦合分量做稠密 eigh |
+| 臂 | A fixed-track（冻结）；B diagonal-only Schur（P11，只做函数与测试，**不接 CLI**，用户决定）；C full Schur |
+| truth 接触 | Level C/D/E 由独立 driver 直接调用 `run_schur_lm_alignment` 和 `export_joint_geometry`，**不经过** pipeline 的 `validate_against_truth`。truth 只在 Level F 读取一次 |
+| 候选冻结 | Level D 的 control（λ_init = 1e-3）在 `converged` 时就是唯一候选，由此导出几何，进入 Level E。λ_init 扫描臂不参与候选选择 |
+| 主 / 次指标 | §B 的 H1-P / H1-D / H1-R |
+| truth-veto 时机 | Level E 的 ACTS 验收完成且候选冻结之后，Level F 运行一次。失败不重跑、不换候选 |
+
+### D. 停止条件
+
+- 身份闸门失败，或 Level D control 的终态不是 `converged` ⇒ 不导出候选，不进入 Level E/F。按契约报告实际终态，不改常量重跑。
+- 本条之后不得修改 §B 的任何阈值、格选择、样本或 seed；如需修改，必须在读 H1 truth 之前另写 Iteration。
+
+---
+
+## Iteration 42 — Schur Level C / Level D control / P9：真实数据上的 `schur-lm` 与可观测性对照（预注册）
+
+**日期**：2026-10-12。**状态**：预注册，写于 `scripts/analysis/measure_schur_observability.py` 和任何真实数据 `schur-lm` 运行之前。
+写本条前只做过一次工程探针：在 M1 缓存上测线性化、约化、splu 和稠密求逆的耗时与内存，没有读任何谱或几何数值。
+探针结果：全量线性化 12 s，`schur_reduce` 0.2 s，耦合图是 1 个连通分量（2268 个 sensor，非零块 18,684），splu 0.05 s，
+6804 维稠密求逆 9 s，峰值 RSS 2.9 GB。
+**上游**：Iteration 40（M1 对照）、41（H1 判据与 §14 字段，本条全部沿用）；`plan.md` §P9、§13 Level C/D；交接 `2026-10-12-m1-fixed-track-observability.md`。
+**性质**：不读 truth，不改任何求解器常量。`schur-lm` 一律由独立 driver 调用 `run_schur_lm_alignment`，不经过 pipeline 的 `validate_against_truth`。
+
+### A. 输入
+
+- 复用 M1 缓存 `m1-fixed-track-observability-20261011/prepare/cache/{batches,tracks}.pt`。其身份闸门已经通过（Iteration 40 §G），
+  缓存文件的 SHA256 记入每个阶段的 manifest。几何 / nominal 路径同 M1 默认值。
+- 线性化点：`a = 0`；`a*` 取 M1 control（fixed-track 收敛点），径迹取缓存的 ref-only refit θ_ref；另加 `a_S*`，即本条 control 的收敛点及其径迹 θ_S*。
+- 单位：S、C、b 都用 u 单位（GEOMETRY_SCALES），物理 σ 乘回尺度。
+
+### B. Level C（小子集工程门）
+
+- 子集：`event_id % 32 == 0` 的径迹（确定性，与 M1 子样本不重合也无关），`select_rows` 截取。从 a = 0、θ_ref 出发，λ_init 1e-3。
+- 记录：终态、外层迭代数、每次外层迭代的耗时、峰值 RSS、各次线性化的 `n_components_ref/tgt`、`component_loss` 拒步数，以及子集中只有 LOC0 的 target sensor 数。
+- **门**：运行正常结束，不抛异常；终态不是 `numerical_failure`；输出全部有限。子集上 `rank_deficient` 或 `budget_exhausted` 不算失败
+  （稀疏子集上可能出现真实的弱方向），但要如实记录。门失败 ⇒ 停止，不进入 Level D。
+
+### C. Level D control 与 λ_init 扫描
+
+- control：全量行集，从 a = 0、θ_ref 出发，λ_init 1e-3（Iteration 41 §C）。保存 `values`、径迹、`schur_lm_summary`、逐迭代与逐 trial 日志。
+- **门 D1**：control 终态为 `converged`。否则停止：不导出候选，不进入 Level E/F，也不改常量重跑（Iteration 41 §D）。
+- σ_S：在 `a_S*`、θ_S* 处构造无阻尼 S（lam = 0），`σ_i = sqrt(diag(S⁻¹))`，物理单位。S⁻¹ 是全局稠密逆，包含跨 sensor 耦合。
+  这就是 Iteration 39 留待真实数据决定的「生产规模 σ_i」。
+- λ_init 扫描：{1e-5, 1e-1}，其余与 control 相同。
+- **门 D2**（Iteration 39）：两个扫描臂都 `converged`，且对每个活动 DOF 都有 `|a(λ_init) − a(1e-3)| ≤ 0.2σ_i` ⇒ `lambda_init_insensitive`。
+  否则报为 `solver_sensitive`，不导出候选。
+- **候选冻结**：D1 与 D2 都通过时，用 `export_joint_geometry` 导出 control 的几何，文件名为
+  `aligned_transforms_<run_id>_schur_lm.json`，记录 SHA256。这是 Level E/F 的唯一 Schur 候选。
+
+### D. P9 谱（描述性，外加一条硬性代数检查）
+
+在 `a = 0` 和 `a*`（两者都用 θ_ref，与 M1 同点）以及 `a_S*` 上，逐 sensor 计算：
+
+- `C_ii`（fixed-track，与 M1 的 `spectrum_full.npz` 同一定义）、`S_ii`（全局 S 的对角块）、`R_i = tr(S_ii) / tr(C_ii)`（u 单位）；
+- `σ_C = sqrt(diag(C_ii⁻¹))`、`σ_S,local = sqrt(diag(S_ii⁻¹))`、`σ_S = sqrt(diag(S⁻¹)_ii)`（全局）；
+- `S_ii` 的 Jacobi 谱 μ_k 与 observable 分类（τ = 1e-4，同 M1 §B）；
+- 全局 S 的 Jacobi 缩放谱（6804 维）：弱模（μ ≤ 1e-4）个数、最小 10 个特征值，以及对应特征向量在各 sensor / DOF 上的参与度；
+- 每个非对角块的 `ρ^S_ij = ‖S_ij‖_F / sqrt(tr S_ii · tr S_jj)`，报告分布分位数与最大的 20 对。
+
+**门 D3（代数检查，失败即停）**：Schur 消元只能减少信息。要求每个 sensor 都满足 `λ_min(C_ii − S_ii) ≥ −1e-9·‖C_ii‖_F`，
+且对每个 DOF 都有 `σ_S ≥ σ_S,local·(1 − 1e-9)` 与 `σ_S,local ≥ σ_C·(1 − 1e-9)`。任一违反就意味着组装或单位有 bug，必须停止。
+
+**运行前预测（只作记录）**：`R_i < 1` 处处成立；σ_S/σ_C 在 17:8 上明显大于 1（Iteration 41 §A.1 的过度自信）；
+全局谱可能出现局部谱看不到的跨 sensor 弱模。弱模如实报告，不用正则去掉（plan §20）。
+
+### E. P9 target 注入（主判据）
+
+- 设计与 M1 §C 相同：两个 target 层同时做整层确定性注入，tx、ty 各 ±0.5 mm，rz ±0.02 rad；全量样本加上 4 个事件不相交子样本
+  （`event_id % 4`），每个样本 6 次 `schur-lm` 运行，都从 a = 0 出发。径迹初值取该样本的 θ_ref。
+  fixed-track 下 refit 不读 target 几何，所以 θ_ref 与注入无关。
+- 响应矩阵 `K` 与模式斜率 `s_ik` 的公式同 M1（`response_matrix`、`mode_slopes`），但模式取 `S_ii` 在 `a*` 处的 Jacobi 特征向量，
+  信息矩阵也用 `S_ii`。子样本的 `S_ii` 用该子样本自己的径迹计算。
+- 可用臂：运行的 `reason == "stationary"`（终态为 `converged` 或 `rank_deficient`）。只要某个样本有一个臂不可用，该样本的所有格都记为 `not_evaluable`，按未通过处理。
+- **主单元**：target 层 × 模式秩，共 6 格；只纳入该模式在 `S_ii` 上 declared observable 的 sensor。
+  统计量与 CI 同 M1：sensor bootstrap，B = 10,000，种子 20261011。
+- **主判据**：每格在全量和 4 个子样本上的 CI 都完全落在 [0.9, 1.1] 内 ⇒ `observable_confirmed`；6 格全部通过 ⇒ P9 主判据通过。
+  同时报告与 M1 的逐格对照。
+
+### F. P9 参考层传递（H1-R）
+
+- 对 M1 的每个参考臂（28 层 × 3 DOF），在 `a*`、θ_ref 处用 ±扰动的中心差分求白化 ref 残差的变化 `dr`
+  （整层同一 local 值，10 μm / 0.1 mrad，同 M1），再令 `Δβ_t = Σ B_refᵀ dr`：
+  - fixed-track（oracle 形式）：`Δθ = −Γ_ref⁻¹Δβ`，`Δc = GΔθ`，`Δa = −C_ii⁻¹Δc`，即 `linear_transfer_oracle`；
+  - Schur：`Δb = −Σ_t G_ti Γ_t⁻¹ Δβ_t`，`Δa = −S⁻¹Δb`（全局 S，在同一点上）。
+- **门 F1（方法一致性）**：fixed-track oracle 形式的结果与 M1 基于 refit 的 `reference-linear/arms` 相比，每个臂上都要有 ≥95% 的 sensor
+  在每个 DOF 上满足 `|b_oracle − b_M1| ≤ 0.1σ_C`（同 M1 非线性核对的容差）。不通过 ⇒ H1-R 记为 `not_evaluable`，停止排查。
+- F1 通过后，按 Iteration 41 §B 判 H1-R：逐一判断 5 个参考敏感组合是否「下降」（Schur RMS ≤ 0.90 × fixed-track），
+  再判「不依赖精确 nominal 参考」次判据 (i)、(ii)。(ii) 中的 σ_S 取 `a*` 处全局 S 的边际 σ。
+
+### G. 门出口
+
+- Level C 门、D1、D2、D3、F1 中任一失败 ⇒ 停止，按实际结果报告，不改阈值或常量重跑。
+- P9 主判据（§E）与 H1-R（§F）的结论单独报告；它们都不是 Level E 的前置门。按 plan，P10、P11 在 Level E 之前完成。
+- 冒烟数字（Level C 子集）不进入任何判据。
+
+### H. 结果（2026-10-12，本段只回填，不改上文任何定义、阈值或设计）
+
+运行 `p9-schur-observability-20261012`（HEAD 2d90d14 + dirty 工作树）。9 个阶段的 manifest 全部 `completed`，均为 schema 2，源码快照为 `written`。
+产物：`data/experiments/surface_helix/Vol17_Lay8__Vol24_Lay4/p9-schur-observability-20261012/`（`report/p9_result.json`）。
+
+**Level C 门：通过**。1904 条径迹对应 1879 个 sensor，61 次外迭代（`rank_deficient`，`outer_iters`），每次 0.59 s，峰值 RSS 1.1 GB；
+`component_loss` 0 次，只有 LOC0 的 target 0 个。子集上 S 精确奇异（最小缩放特征值约 1e-15），60 步全部被接受（ρ = 1），
+但盒约束把 α 压到中位 0.0075，运行在爬行。这是 1 条径迹 / sensor 的结构性结果，不进入判据。
+
+**D1：通过**。control 用 3 次外迭代达到 `converged`（2 个接受步，ρ = 0.9997 / 1.0000，α = 1，0 次拒步），用时 160 s，峰值 4.2 GB。
+最终 λ²_geo = 2.2e-3、max λ²_trk = 2.1e-5，最小缩放特征值 0.358，没有弱方向。首步 target 残差归因为 `|AΔa|²` 2.6e8 对 `|BΔθ|²` 2.3e5。
+**D2：通过**（`lambda_init_insensitive`）：λ_init = 1e-5 与 1e-1 两臂都 `converged`（3 / 5 次外迭代），与 control 的最大差为 0.0032σ_S（容差 0.2σ）。
+**候选**：`data/alignment/Vol17_Lay8__Vol24_Lay4/aligned_transforms_p9-schur-observability-20261012_schur_lm.json`，
+SHA256 `3395fd1e19197f10ed4cf75532bcd3318a87dede32c3b6e9bc8309e8a7014738`。
+
+**D3：通过**。在三个点上（`a = 0`、`a*`、`a_S*`），`C_ii − S_ii` 的最小相对特征值都为 +1.0e-6，6804 个 σ 中有序性违反为 0 个。
+
+**§D 谱**（`a*` 处；`a_S*` 处数字相同，到第 3 位有效数字）：
+
+| 层 | R_i 中位 [p05, p95] | σ_S / σ_C 中位：tx / ty / rz | σ_C → σ_S 中位 |
+|---|---|---|---|
+| 17:8 | 0.547 [0.521, 0.571] | 1.21 / **1.69** / 1.22 | tx 1.95 → 2.38 μm；ty 1.93 → 3.27 μm；rz 9.2e-5 → 1.12e-4 |
+| 24:4 | 0.868 [0.856, 0.877] | 1.07 / 1.00 / 1.08 | tx 6.6 → 7.1 μm；ty 160 → 160 μm；rz 1.86e-4 → 2.02e-4 |
+
+全局 Jacobi 谱：**弱模 0 个**，最小特征值 0.358（`a = 0` 处为 0.423）。`S_ii` 局部弱模 0 个。
+16,416 个非对角块的 ρ^S_ij：中位 0.025，p95 0.104，最大 0.144，最强的耦合全部出现在 17:8 ↔ 24:4 的 sensor 对之间。
+预测「R_i < 1 处处成立」与「σ_S/σ_C 在 17:8 上明显大于 1」都成立；预测「可能出现跨 sensor 弱模」不成立：没有出现。
+
+**§E 主判据：按预注册判为未通过**，原因**只有** `not_evaluable`：`sub3_ty_plus` 用完了 60 步外层预算
+（`rank_deficient`，`reason = outer_iters`），所以 sub3 的 6 格按 §E 都记为 `not_evaluable`。report 中这些格的标签是
+`unobservable_or_prior_dominated`，这是沿用 M1 代码的二分标签，实际含义是 not_evaluable。**没有任何一格的斜率 CI 越出 band**：
+在可评估的 24 个（样本 × 格）中，CI 全部落在 [0.9, 1.1] 内。
+
+| 格 | full mean [CI] | sub0–2 mean 范围 | sub0–2 最差 CI 端点 | M1 full |
+|---|---|---|---|---|
+| 17:8 mode0 | 1.0002 [0.9995, 1.0009] | 0.9998–1.0004 | 0.9991 / 1.0012 | 1.0003 |
+| 17:8 mode1 | 1.0000 [0.9998, 1.0002] | 0.9999–1.0000 | 0.9997 / 1.0002 | 1.0000 |
+| 17:8 mode2 | 0.9998 [0.9991, 1.0005] | 0.9994–1.0002 | 0.9987 / 1.0009 | 0.9997 |
+| 24:4 mode0 | 0.9991 [0.9985, 0.9996] | 0.9896–0.9923 | 0.9865 | 0.9990 |
+| 24:4 mode1 | 0.9998 [0.9996, 0.9999] | 0.9951–0.9954 | 0.9929 | 0.9998 |
+| 24:4 mode2 | 0.9998 [0.9995, 1.0000] | 0.9963–0.9978 | 0.9951 | 0.9997 |
+
+36 个 `schur-lm` 臂（含 P10）都**没有一次拒步**。外迭代多（子样本上 ty 臂 43–61 次）全部来自盒约束：可行性缩放把 α 截到 1e-3 量级。
+sub0、sub3 的 12 个臂的终态都是 `rank_deficient`（子样本上有真实弱方向），但除 `sub3_ty_plus` 外 `reason` 都是 `stationary`。
+
+**§F**：**F1 通过**，84 个臂上 fixed-track oracle 与 M1 基于 refit 的结果在 0.1σ_C 内的比例全部为 1.0。H1-R（Iteration 41 §B）：
+
+| 参考臂 → target | fixed | Schur | 比值 | 下降（≤ 0.90） |
+|---|---:|---:|---:|---|
+| 17:6 ty → 17:8 ty | 15.24 μm | 15.37 μm | 1.009 | 否 |
+| 17:2 ty → 17:8 ty | 7.96 μm | 7.82 μm | 0.983 | 否 |
+| 17:6 tx → 17:8 tx | 4.36 μm | 4.38 μm | 1.005 | 否 |
+| 17:4 ty → 17:8 ty | 2.71 μm | 2.42 μm | 0.891 | **是** |
+| 17:4 tx → 17:8 tx | 2.30 μm | 2.27 μm | 0.989 | 否 |
+
+只有 1/5 下降。「不依赖精确 nominal 参考」次判据**通过**：(i) 没有增大超过 10% 的组合；(ii) 没有新增参考敏感组合。
+fixed-track 传递精确为 0 的 18 个组合（23:6、25:8 → 17:8，没有共享径迹），在 Schur 下最大只有 2.3e-4 μm。
+
+**工程修正（运行中发现，先补红测试再修）**：`reference_comparison` 在 fixed-track RMS 为 0 时除零。
+新增 `transfer_ratio`：fixed 为 0 时，Schur 大于 0 就取 inf，两者都为 0 就取 NaN。判据不变，因为 (i) 只作用于 fixed-track 敏感组合，它们都不为 0。
+
+**解读边界**：
+1. 交接文档的预测「Schur 会让参考敏感组合的传递下降」基本不成立。参考误差到 target 的传递是几何偏差，改变统计权重并不能消除它。
+   用 σ 归一化看起来有改善（17:6 ty 从 7.9σ_C 降到 4.7σ_S），但那只是 σ 变大的结果，不能写成改善。
+2. 17:8 的 σ_S 比 σ_C 大 1.2–1.7 倍，方向与 Iteration 41 §A 的 fixed-track 低估（误差 / σ_C = 1.6–2.6）一致，但量级上还解释不完全；能否解释，要等 H1 truth 判定。
+3. P9 主判据不通过是因为预算用完，不是因为可观测性；不得据此加大预算重跑本条。外层预算 60 在子样本加盒约束的组合下不够，
+   这是 Iteration 37 §B 常量的一个已知局限，修改需要另写 Iteration。
+
+---
+
+## Iteration 43 — Schur P11：diagonal-only 消融的函数与回归（预注册，Level A）
+
+**日期**：2026-10-12。**状态**：预注册，写于 `diagonal_only` 等函数和测试之前。**范围**按用户决定：只做函数与测试，**不接 CLI**，
+不在真实数据上运行。**上游**：`plan.md` §P11（定义、按块秩判据、终态聚合、回归）；Iteration 37（契约）、38（`schur_lm_loop` 的 `solve` / `stationarity` 钩子）。
+
+### A. 定义（plan §P11，原样落实）
+
+1. 与 full Schur 一样逐径迹消元并全局累加，得到 `S` 和**完整的** `b = c − GΓ⁻¹β`；
+2. 全局累加之后，只删去非对角块 `S_ij`（i ≠ j），`b`、`track_step`、`track_gain` 都不变 ⇒ `diagonal_only(system)`；
+3. 逐块求解 `S_ii δu_i = −b_i` ⇒ `solve_geometry_diagonal`；回代用的公式与 full 相同（`back_substitute`）；
+4. 按块判秩：`S_ii` 只取自由 DOF，按 Jacobi 缩放判 `μ ≤ τ = 1e-4`（与 full 用同一个 τ），或该块有 `diag ≤ 0` ⇒ 该块 `rank_deficient`。**不加任何正则**；
+5. 秩亏块在求解中被钉住（`δu_i = 0`），但它的结果**报告为未定义（NaN），不当作零修正**；只要存在秩亏块，该臂的终态就是 `rank_deficient`；
+6. 收敛判据：该臂只看自己的系统，`λ²_geo = Σ_i b_iᵀ S_ii⁻¹ b_i`（自由 DOF、强方向），`λ²_trk` 与 full 相同；阈值、终态优先级、
+   λ 规则、盒约束、ρ 的定义（未阻尼**联合**模型在执行步上的下降）全部沿用 Iteration 37。
+   通过 `schur_lm_loop(solve=solve_geometry_diagonal, stationarity=global_stationarity_diagonal)` 运行，不复制循环代码。
+
+### B. 运行前的理论结论（必须带到 P11 的解读里）
+
+非线性 LM 循环中，两臂的驻点条件都是 `b = 0`、`β = 0`（自由 DOF 上）。删去非对角块只改变**步长的预条件**，不改变目标函数和驻点。
+因此，两臂都 `converged` 时，它们收敛到**同一个联合最优点**，差异只在停止判据的分辨率之内（各自 ε_geo 度量下 ≤ 0.1）。
+plan §P11 希望用它区分「逐 sensor 重新加权」与「真正的跨 sensor 耦合」，这一目的在迭代收敛后的**点估计**上无法实现，只能体现在：
+(i) 收敛行为（迭代数、拒步、是否收敛）；(ii) 不确定度陈述：`S_ii⁻¹` 与 `(S⁻¹)_ii` 的差别，后者已在 P9 的 `σ_S,local` 与 `σ_S` 中给出；
+(iii) 单步（一次线性化）估计。真实数据上是否运行该臂，留到 P11 结束后另行决定。
+
+### C. 回归（数值容差，非统计）
+
+- **P11-1**：`diagonal_only` 恰好删去所有 i ≠ j 的块；`rhs`、`track_step`、`track_gain`、对角块逐位不变。
+- **P11-2（plan §P11 的必需回归）**：拓扑中没有两个 target 共用一条径迹、且所有块满秩 ⇒ `diagonal_only(system)` 与 `system` 的块集合和数值逐元相同；
+  两臂的 `schur_lm_loop` 结果（values、tracks）逐元相同（rtol 1e-12），终态相同。
+- **P11-3（§B 的不动点）**：在有共享径迹的 Level A 线性问题上，(a) 一次线性化的 diagonal-only 步与 full 步不同（相对差 > 1e-3，说明消融确有作用）；
+  (b) 从 full Schur 的精确最优点出发，diagonal-only 循环在第 0 次迭代即报 `converged`，且 `λ²_geo ≤ 1e-20`（同一不动点）。
+- **P11-4（秩）**：只被一条径迹穿过的块，其 3×3 信息由 2 个分量给出，必然秩亏 ⇒ 该块被标为 `rank_deficient`，结果为 NaN 而不是 0，
+  其余块有限；该臂终态为 `rank_deficient`；full 臂在同一问题上也报 `rank_deficient`（结论一致，没有被静默过滤）。
+
+### D. 结果（2026-10-12，只回填）
+
+`diagonal_only`、`diagonal_block_rank_deficient`、`solve_geometry_diagonal`、`global_stationarity_diagonal`、`run_diagonal_only_loop`
+已加入 `scripts/joint_alignment_schur.py`。`tests/test_joint_schur_diagonal.py` 的 5 项先确认为红（AttributeError），实现后全部通过：
+**P11-1–P11-4 全部通过**，包括「full 臂在同一秩亏问题上也报 `rank_deficient`」。没有接 CLI，也没有在真实数据上运行。
+
+---
+
+## Iteration 44 — Schur P10：非线性与信赖域工作区间的幅度扫描（预注册）
+
+**日期**：2026-10-12。**状态**：预注册，写于任何 P10 运行之前。写本条时已知的只有 Iteration 42 Level D control 的结果：
+从 a = 0 出发 3 次外迭代 `converged`，两个接受步的 ρ 为 0.9997 与 1.0000，没有拒步，α = 1。
+P9 的谱、注入与参考层结果均未读。
+**上游**：`plan.md` §P10；Iteration 37（ρ 定义）、42（driver 与输入）。**性质**：描述性诊断，不读 truth，不改常量。
+
+### A. 设计
+
+- 全量行集，径迹初值取 θ_ref，几何从 a = 0 出发（同 control）。在真实错位之上，再对两个 target 层的**所有** sensor 同时做整层注入：
+  三个 DOF 一起、同号，`s × (0.5 mm, 0.5 mm, 0.02 rad)`，`s ∈ {0.5, 1, 2}`，正负号各一次，共 6 次运行。
+  s = 2 时注入 1 mm 加上约 0.5 mm 的真实错位，会接近盒约束（1.5 mm / 0.05 rad），所以这一档专门用来观察约束活动。
+- s = 0 的对照就是 Level D control，不重跑。
+
+### B. 记录（逐运行）
+
+终态与原因；外迭代数；全部 trial 的 ρ；首步 ρ；拒步数及原因（`component_loss` / `insufficient_decrease` / `non_finite`）；
+α 最小值与 `n_resolves`；自由 DOF 数的最小值（反映约束活动）；首步「预测 / 实际」下降；首步 target 残差归因 `|AΔa|²` 与 `|BΔθ|²`；
+注入恢复：`mean_i (â_i(s) − â_i(control)) / (−s·δ)`，按层 × DOF 分别计算，只作一致性描述。
+
+### C. 判读规则（运行前写下）
+
+- **线性工作区间**：首步 ρ ∈ [0.75, 1.25] 的最大 |s| 称为「GN 模型可信区」，只描述，不据此改任何常量。
+- **停止条件**：出现 `numerical_failure` 或 `intersection_failed`，或者某次运行 `converged` 了，但注入恢复均值偏离 1 超过 0.1（可能是错误盆地）⇒
+  停下排查，结果如实记录，不调常量重跑。
+- `budget_exhausted` 或 `constraint_stalled` 按契约如实报告，它们是工作区间的边界信息，不算方法失败。
+
+### D. 结果（2026-10-12，只回填）
+
+阶段 `amplitude` 为 `completed`，没有触发停止条件。
+
+| 运行 | 终态 | 外迭代 | 首步 ρ | 拒步 | α 最小 | 自由 DOF 最小 | 恢复（tx / ty / rz，两层相同到 1e-3） |
+|---|---|---:|---:|---:|---:|---:|---|
+| s0.5+ | converged | 4 | 0.9996 | 0 | 0.97 | 6803 | 1.011 / 0.990 / 1.000 |
+| s0.5− | converged | 3 | 0.9996 | 0 | 1 | 6804 | 0.991 / 1.010 / 1.000 |
+| s1+ | converged | 12 | 0.9995 | 0 | 0.023 | 6794 | 1.020 / 0.980 / 1.000 |
+| s1− | converged | 15 | 0.9996 | 0 | 0.0075 | 6791 | 0.980 / 1.020 / 1.000 |
+| s2+ | **constraint_stalled** | 11 | 0.9988 | 0 | 2.5e-4 | 6794 | — |
+| s2− | **constraint_stalled** | 12 | 0.9996 | 0 | 1.4e-4 | 6793 | — |
+
+- **GN 模型可信区 ≥ s = 2**（首步 ρ 都在 [0.9988, 0.9996]）：在 0.5–1.5 mm 的总错位范围内，联合 GN 模型几乎是精确的，非线性不是限制因素。
+- **限制因素是盒约束**：s = 2 时约 10 个 DOF 顶到 1.5 mm / 0.05 rad 的界，阻挡 DOF 轮流变化，连续 3 步 α < 1e-3 ⇒ `constraint_stalled`（契约行为）。
+- 恢复值偏离 1 最多 2%，而且随注入方向反对称。这符合 M1 §C 已知的 rz 注入经 `R(δ)` 复合进平移的效应（三个 DOF 同时注入），没有超过 0.1 的停止阈值。
+- 首步归因：`|BΔθ|²` / `|AΔa|²` ≤ 1e-3，没有出现径迹吸收几何信号的迹象。
