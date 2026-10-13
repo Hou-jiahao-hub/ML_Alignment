@@ -4088,3 +4088,110 @@ P9 的谱、注入与参考层结果均未读。
 - **限制因素是盒约束**：s = 2 时约 10 个 DOF 顶到 1.5 mm / 0.05 rad 的界，阻挡 DOF 轮流变化，连续 3 步 α < 1e-3 ⇒ `constraint_stalled`（契约行为）。
 - 恢复值偏离 1 最多 2%，而且随注入方向反对称。这符合 M1 §C 已知的 rz 注入经 `R(δ)` 复合进平移的效应（三个 DOF 同时注入），没有超过 0.1 的停止阈值。
 - 首步归因：`|BΔθ|²` / `|AΔa|²` ≤ 1e-3，没有出现径迹吸收几何信号的迹象。
+
+---
+
+## Iteration 45 — Schur Level E：冻结候选的 ACTS 重建与 production acceptance（预注册）
+
+**日期**：2026-10-12。**状态**：预注册，写于 Level E 的任何重建或 acceptance 运行之前。用户决定直接进入 Level E，
+不先处理 Iteration 42 §H 的外层预算局限。**上游**：Iteration 41 §C（候选冻结与 truth 时机）、42 §H（候选与 SHA256）、29/30（acceptance 流程与判据）。
+**性质**：不读 truth；不做 polish；不做候选选择。
+
+### A. 输入与流程
+
+- 候选（唯一）：`aligned_transforms_p9-schur-observability-20261012_schur_lm.json`，运行前核对 SHA256 = `3395fd1e…7014738`，不符即停。
+- 阈值 profile：复用 Iteration 30 冻结的 `closure-schema31-100k-20260910/acceptance_baseline.json`
+  （SHA256 `15fcd62f…2467`，以 `--threshold-profile-sha256` 传入，`profile_identity_verified` 必须为 true）。这样 Schur 臂与 fixed-track 臂用同一阈值。
+- 重建：ACTS（`setup_acts.sh`，与 conda 分开的子 shell），`alignment_odd.py reconstruction --mode aligned --num-events 100000`，
+  同一 `data/simulation` 输入，输出后缀 `<run_tag>_schur_lm`。
+- acceptance：conda，`reconstruction_acceptance.py`，target `17:8,24:4`。
+- 身份核对：用同一 profile 重算错位输入的 acceptance，`acceptance_score` 必须与 Iteration 30 的
+  `[4, 1002.2362008145352, 1543.7135270312644]` 逐位相同，否则停止。
+
+### B. 判据（全部通过才算 Level E 通过）
+
+- **E1**：候选 acceptance JSON 的 schema 为 3.1，`profile_type = diagnostic_only`，`verdict_eligible = false`，`profile_identity_verified = true`；
+- **E2**：`passed = true`，四个层 × 分量都通过（`failed_components` 为空）；
+- **E3**：`acceptance_score` 严格优于错位基线（`polish_improves`）；
+- **E4**：manifest 为 schema 2，`completed`，源码快照 `written`。
+
+### C. 只报告、不进入判据
+
+- 与 fixed-track 候选（Iteration 30，`[0, 0.9694442432274074, 0]`）的 acceptance score 和逐分量 χ² 对比。**不据此比较两个候选的优劣，也不据此做任何选择**；
+- 重建的径迹数与 fixed-track 臂的对比。
+
+### D. 失败语义
+
+E1–E4 任一失败 ⇒ Level E 不通过，Level F（H1 truth-veto）不运行。不调参，不 polish，不换候选重跑；工程故障（环境、中断）记 `failed`，修好后可以按原样重跑。
+
+### E. 结果（2026-10-12，只回填）
+
+运行 `level-e-schur-20261012`，驱动为新脚本 `scripts/run_candidate_acceptance.sh`（候选与 profile 的 SHA256 都先核对）。manifest 为 schema 2，`completed`，源码快照 `written`。
+ACTS 环境当天实测可用（CVMFS 已挂载，`import acts` 成功）。
+
+- 身份核对通过：错位输入的 acceptance score 与 Iteration 30 逐位相同，`[4, 1002.2362008145352, 1543.7135270312644]`。
+- **E1–E4 全部通过 ⇒ Level E 通过**。候选 score 为 `[0, 0.969386325564367, 0.0]`，四个分量都 `passed`，schema 3.1，`diagnostic_only`，profile 身份已验证。
+
+只报告（§C，不比较优劣，也不做选择）：
+
+| 层 / 分量 | Schur χ²/分量 | fixed-track（Iteration 30） | 分量数（两臂相同） |
+|---|---:|---:|---:|
+| 17:8 LOC0 | 0.6595 | 0.6675 | 71,600 |
+| 17:8 LOC1 | 1.3269（归一 0.9333） | 1.3379（0.9410） | 71,600 |
+| 24:4 LOC0 | 0.8206 | 0.8237 | 72,097 |
+| 24:4 LOC1 | 0.9694 | 0.9694 | 72,097 |
+
+**解读边界**：acceptance 属于 `diagnostic_only`，不是 blind validation。χ² 略低不等于几何更准；roadmap 的证伪条件正是「χ² 更好而 truth 更差」，
+这一点只能由 Level F（Iteration 41 §B）判定。Level F 需要先写好并测试 Schur 对 fixed-track 的配对 truth 脚本。
+
+---
+
+## Iteration 46 — Level F：H1 一次性 truth-veto 的实现口径（预注册）
+
+**日期**：2026-10-12。**状态**：预注册，写于 `run_h1_truth_veto.py` 的唯一一次运行之前。判据本身是 Iteration 41 §B，本条一项都不改，
+只把实现中需要做的选择固定下来。用户在 Level E 通过后确认开始 Level F。
+
+- **脚本**：`scripts/analysis/run_h1_truth_veto.py`；`tests/test_h1_truth_veto.py` 共 11 项，先确认为红，实现后通过。
+  这 11 项覆盖：配对比值、CI 两端（与独立重算的分位数一致）、truth 按 `HIT_KEY` 匹配并在出错时 fail closed，以及判决逻辑。
+- **CI**：上界用 `truth_veto_gate.paired_truth_distance_ratio_ci`（0.975 分位，method `higher`，2000 次，seed 6006；与 Iteration 29 相同）。
+  下界用同一组重抽样、两臂对调求得：`1 / 上界(A/C)`，等于 C/A 比值的 0.025 分位（method `lower`）。
+- **几何**：A = `aligned_transforms_schur-p0-fixedtrack-20260922_joint_free.json`，C = Schur 候选（SHA `3395fd1e…`）。
+  误差在错位局部帧中计算（`run_truth_veto_closure._local_delta`）；配对单位为 sensor；两臂的 sensor 集合必须与错位 overlay 完全相同。
+- **径迹**：A 取 M1 缓存的 ref-only refit（`tracks.pt`），C 取 P9 control 的径迹。truth 位置来自错位 trackstates ROOT，
+  按 `(event_nr, track_nr, volume, layer, module)` 唯一匹配，且匹配到的 `l_x_hit` 必须与缓存的测量逐位相同，否则 fail closed。
+  距离用 `closest_helix_points`；只比较两臂都有效的 hit；事件块 bootstrap。
+- **联合目标 F**（证伪 (1)）：A 在 (M1 control 几何，θ_ref)，C 在 (P9 control 几何，θ_S)，各自计算白化残差，在两臂都有效的分量上求 `½Σr²`。
+- **证伪 (2)**：「不依赖 nominal 参考」取 P9 report 中的 `h1_r.nominal_reference_independent`（= true）。
+- **一次性**：输出目录已存在就拒绝运行。工程故障（匹配、I/O、中断）记 `failed`；径迹部分先于几何比值执行，以便工程故障发生在任何几何比值算出之前。
+  此类故障修复后，用新的 run-id 按原样重跑，并在本条记录；科学判据的结果无论如何都不重跑。
+
+### 结果（2026-10-12，只回填；Iteration 41 §B 的判据一项未改）
+
+运行 `h1-truth-veto-20261012`：manifest 为 schema 2，`completed`，源码快照 `written`，用时 103 s。
+第一次调用在写 manifest 时因参数类型错误中止（`config={}`），当时还没有读取任何数据，输出目录也没有创建。修正后用同一个 run-id 完成了唯一一次运行。
+
+**几何（sensor 配对，ratio = RMS(e_C) / RMS(e_A)）**：
+
+| 格 | ratio [95% CI] | RMS C / A |
+|---|---|---|
+| 17:8 tx | 0.940 [0.924, 0.957] | 3.00 / 3.19 μm |
+| **17:8 ty** | **0.795 [0.771, 0.821]** | 3.95 / 4.96 μm |
+| 17:8 rz | 0.911 [0.888, 0.937] | 1.43e-4 / 1.57e-4 rad |
+| 24:4 tx | 0.981 [0.970, 0.992] | 7.60 / 7.75 μm |
+| 24:4 ty | 0.999 [0.996, 1.002] | 165.8 / 165.9 μm |
+| 24:4 rz | 0.978 [0.961, 0.997] | 2.22e-4 / 2.27e-4 rad |
+
+**径迹 truth 距离（事件块配对，61,482 个事件块）**：target hit 0.692 [0.684, 0.700]（RMS 38.2 对 55.1 μm，143,187 个 hit）；
+ref hit 0.837 [0.830, 0.844]（149 对 178 μm，709,672 个 hit）。
+**联合目标 F**（两臂都有效的 1,441,135 个分量）：C 598,039 < A 757,654。
+
+**判定**：
+- **H1-P 通过**：8 项 CI 上界都 ≤ 1.01，最大的是 24:4 ty 的 1.002。
+- **H1-D**：**17:8 ty 改善**（上界 0.821 < 0.90）；17:8 tx（0.957）与 24:4 ty（1.002）未达到改善线。范围限定为 `post_hoc_single_sample`。
+- **证伪 (1) 不成立**：F_C < F_A，但没有任何一项 CI 下界 > 1。**证伪 (2) 不成立**：P9 的 nominal 参考独立性为 true。
+
+**解读边界**：
+1. 17:8 ty 的改善，与 P9 中 σ_S/σ_C = 1.69、以及 Iteration 41 §A 中 fixed-track 在 17:8 ty 上最过度自信（误差 / σ_C = 2.6）的观察方向一致；24:4 ty 没有变化，与「已贴近 σ」的先验一致。
+2. 径迹 truth 距离改善，说明联立拟合**没有**重现 L3 的「target hit 并入拟合导致约 9.9 倍偏差」。但 C 臂的径迹用了 target hit，A 臂没有，所以这部分改善包含「多用了一层测量」的贡献，不能全部归因于 Schur。
+3. 本样本中 A 臂的 truth 已在 Iteration 29/30 读过，C 臂是第一次读。改善声明要成为正式结论，还需要在独立模拟样本上复现（roadmap §H1），本条没有做。
+4. 24:4 tx 的 A 臂 RMS 为 7.75 μm，与 Iteration 30 的 truth-veto 口径一致（0.01498 × 0.5167 mm）。Iteration 41 §A 表中的 6.98 μm 来自 `compare_geometries`，口径不同，只作量级参考，不影响任何判定。
