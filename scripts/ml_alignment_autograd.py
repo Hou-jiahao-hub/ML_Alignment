@@ -784,7 +784,8 @@ def fit_helices_to_measurements(
     figure is what separates "the optimiser converged" from "the seed was already
     close".  It is a diagnostic, and switching it off does not switch off the
     pre-registered acceptance criterion the Gauss-Newton path is held to -- that
-    one reads the decrement the solver computes for itself.
+    one reads the decrement the solver computes for itself.  On the float64 CPU
+    Gauss-Newton path the refit figure is that same gate report, reused.
     """
     if solver not in JOINT_REFIT_SOLVERS:
         raise ValueError(
@@ -850,9 +851,22 @@ def fit_helices_to_measurements(
             stats["best_iteration"] >= 0 and final_loss < initial_loss
         )
     if stationarity:
+        # The Gauss-Newton gate already evaluated the same float64 CPU decrement
+        # on these exact parameters; recomputing it costs a full Jacobian pass.
+        # Any cast to float32 or another device changes the parameters, so only
+        # then is the refit report measured again.
+        reuse_gate = (
+            solver == JOINT_REFIT_SOLVER_GAUSS_NEWTON
+            and fitted.dtype == torch.float64
+            and fitted.device.type == "cpu"
+        )
         stats["stationarity"] = {
             "seed": measure_joint_refit_stationarity(batches, geometry, initial),
-            "refit": measure_joint_refit_stationarity(batches, geometry, fitted),
+            "refit": (
+                dict(stats["stationarity_gate"])
+                if reuse_gate
+                else measure_joint_refit_stationarity(batches, geometry, fitted)
+            ),
         }
     return fitted, stats
 

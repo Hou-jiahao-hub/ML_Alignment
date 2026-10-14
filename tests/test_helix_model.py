@@ -85,6 +85,41 @@ def test_measurement_residual_jacobian_matches_finite_difference():
     )
 
 
+def test_forward_mode_jacobians_match_reverse_mode_reference():
+    """Catch forward mode differentiating through the detached closest-point
+    path, or otherwise departing from the reverse-mode Jacobian it replaced."""
+    model = importlib.import_module("scripts.helix_model")
+    inputs, truth, seed = _measurement_fit_case(model)
+    frame = model.reference_gauge_frame(seed)
+    theta = model.pack_gauge_fixed_track_parameters(seed)
+    measurement_args = (
+        theta, *frame, inputs.measured, inputs.variance,
+        inputs.component_mask, inputs.centers, inputs.rotations,
+    )
+    reference = torch.func.vmap(
+        torch.func.jacrev(model._single_measurement_residual, argnums=0)
+    )(*measurement_args)
+    torch.testing.assert_close(
+        model.measurement_residual_jacobian(theta, frame, inputs),
+        reference, atol=1.0e-9, rtol=1.0e-9,
+    )
+
+    path = torch.linspace(-30.0, 80.0, 12, dtype=torch.float64)
+    points = model.helix_point(
+        truth[:, None, :].expand(-1, len(path), -1), path.expand(len(truth), -1)
+    )
+    points[..., 2] += 0.01 * torch.sin(path / 7.0)
+    mask = torch.ones(points.shape[:2], dtype=torch.bool)
+    point_args = (theta, *frame, points, mask)
+    point_reference = torch.func.vmap(
+        torch.func.jacrev(model._single_point_fit_residual, argnums=0)
+    )(*point_args)
+    torch.testing.assert_close(
+        model._BATCHED_POINT_FIT_JACOBIAN(*point_args),
+        point_reference, atol=1.0e-9, rtol=1.0e-9,
+    )
+
+
 def test_measurement_gauss_newton_is_chunk_exact_and_stationary():
     """Catch budget exhaustion being reported as a solved measurement fit."""
     model = importlib.import_module("scripts.helix_model")

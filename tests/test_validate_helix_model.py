@@ -2554,9 +2554,21 @@ def test_production_single_helix_matches_legacy_nodeless_solver():
     )
     decrement = production.measurement_newton_decrement(fitted, inputs)
 
-    torch.testing.assert_close(fitted, legacy, atol=1.0e-9, rtol=0.0)
+    # Production differentiates in forward mode, the legacy solver in reverse
+    # mode: identical to rounding, which LM carries to ~1e-8 in the fit and to a
+    # different stopping point below the stationarity threshold, so the
+    # decrement quantiles share the absolute tolerance of the decrement itself.
+    torch.testing.assert_close(fitted, legacy, atol=1.0e-8, rtol=0.0)
     torch.testing.assert_close(decrement, legacy_decrement, atol=1.0e-9, rtol=1.0e-9)
-    assert stats["stationarity"] == legacy_stats["stationarity"]
+    report = stats["stationarity"]
+    legacy_report = legacy_stats["stationarity"]
+    assert report.keys() == legacy_report.keys()
+    for key in ("stationary_threshold", "non_stationary_row_fraction", "n_non_finite"):
+        assert report[key] == legacy_report[key], key
+    for key in report.keys() - {
+        "stationary_threshold", "non_stationary_row_fraction", "n_non_finite"
+    }:
+        assert report[key] == pytest.approx(legacy_report[key], abs=1.0e-9), key
 
 
 def test_gauss_newton_measurement_fit_chunking_is_exact():

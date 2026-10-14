@@ -716,6 +716,31 @@ def test_joint_refit_rejects_a_truncated_gauss_newton_solution(monkeypatch):
     assert stats["stationarity_gate"]["non_stationary_row_fraction"] == 0.0
 
 
+def test_gauss_newton_refit_stationarity_reuses_the_identical_gate_report(
+    monkeypatch,
+):
+    """The reused refit report must equal an independent recomputation, and the
+    diagnostic must then measure only the seed."""
+    m = load_ml_alignment_autograd_module()
+    batches, geometry, _truth, seed = build_synthetic_joint_case(m)
+    measured_rows = []
+    original = m.measure_joint_refit_stationarity
+
+    def counted(batches_, geometry_, parameters, **kwargs):
+        measured_rows.append(parameters)
+        return original(batches_, geometry_, parameters, **kwargs)
+
+    monkeypatch.setattr(m, "measure_joint_refit_stationarity", counted)
+    fitted, stats = m.fit_helices_to_measurements(
+        batches, geometry, seed, stationarity=True
+    )
+
+    assert len(measured_rows) == 1
+    assert torch.equal(measured_rows[0], seed.to(torch.float64))
+    assert stats["stationarity"]["refit"] == original(batches, geometry, fitted)
+    assert stats["stationarity"]["refit"] == stats["stationarity_gate"]
+
+
 def test_gauss_newton_refit_improves_on_adam_at_the_same_component_count():
     """The swap changes the optimiser and nothing else.
 
