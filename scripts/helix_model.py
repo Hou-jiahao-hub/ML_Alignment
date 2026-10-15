@@ -810,8 +810,9 @@ def _single_point_fit_residual_and_mask(
         (origin.unsqueeze(0), axis0.unsqueeze(0), axis1.unsqueeze(0)),
     ).squeeze(0)
     expanded = reference.expand(points.shape[0], -1)
-    with torch.no_grad():
-        _fitted, path, valid = closest_helix_points(expanded.detach(), points)
+    # Differentiate the closest-point path too: holding it fixed keeps the
+    # gradient but inflates J^T J along the tangent, so seed steps crawl.
+    _fitted, path, valid = closest_helix_points(expanded, points)
     predicted = helix_point(expanded, path)
     effective = mask & valid
     residual = torch.where(
