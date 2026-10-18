@@ -215,6 +215,108 @@ def test_histogram_series_use_active_dof_shared_bins_and_rms():
     assert np.histogram(tx.aligned, bins=tx.bin_edges)[0].sum() == 2
 
 
+def test_three_way_bins_include_schur_extremes_and_pair_reordered_rows():
+    m = load_module()
+    rows = _plot_rows()
+    schur_rows = [dict(row, aligned_difference=3.0 * row["misaligned_difference"])
+                  for row in reversed(rows)]
+    tx = m.build_histogram_series(
+        rows, active_dof=(0,), schur_rows=schur_rows
+    )[0]
+    assert tx.schur == pytest.approx([-6.0, 6.0])
+    assert tx.schur_rms == pytest.approx(6.0)
+    assert len(tx.bin_edges) == 51
+    assert tx.bin_edges[[0, -1]] == pytest.approx([-6.0, 6.0])
+    for values in (tx.misaligned, tx.aligned, tx.schur):
+        assert np.histogram(values, bins=tx.bin_edges)[0].sum() == 2
+
+
+@pytest.mark.parametrize("defect", ["missing", "duplicate", "baseline", "nonfinite"])
+def test_three_way_histograms_reject_inconsistent_comparisons(defect):
+    m = load_module()
+    schur_rows = [dict(row) for row in _plot_rows()]
+    if defect == "missing":
+        schur_rows.pop()
+    elif defect == "duplicate":
+        schur_rows.append(dict(schur_rows[0]))
+    elif defect == "baseline":
+        schur_rows[0]["misaligned_difference"] = 100.0
+    else:
+        schur_rows[0]["aligned_difference"] = float("nan")
+    with pytest.raises(ValueError):
+        m.build_histogram_series(_plot_rows(), active_dof=(0, 1, 5), schur_rows=schur_rows)
+
+
+def test_three_way_plot_draws_both_solvers_in_shared_detail_bins(monkeypatch, tmp_path):
+    m = load_module()
+    import matplotlib.figure
+    from matplotlib.colors import to_rgba
+
+    figures = []
+    monkeypatch.setattr(matplotlib.figure.Figure, "savefig",
+                        lambda figure, *_args, **_kwargs: figures.append(figure))
+    schur_rows = [dict(row, aligned_difference=2.0 * row["aligned_difference"])
+                  for row in _plot_rows()]
+    m.write_difference_histograms(
+        _plot_rows(), tmp_path, active_dof=(0,), schur_rows=schur_rows
+    )
+    main = figures[0].axes[0]
+    detail = figures[0].axes[1]
+    assert len(main.patches) == 3
+    assert len(detail.patches) == 2
+    assert detail.get_xlim() == pytest.approx((-1.0, 1.0))
+    for axis, colors in ((main, ("tab:red", "tab:blue", "tab:brown")),
+                         (detail, ("tab:blue", "tab:brown"))):
+        for patch, color in zip(axis.patches, colors, strict=True):
+            assert patch.get_edgecolor() == pytest.approx(to_rgba(color))
+            assert not patch.get_fill()
+        dashed = axis.patches[-1].get_linestyle()
+        solid = axis.patches[-2].get_linestyle()
+        assert dashed == "--" if isinstance(dashed, str) else dashed[1] is not None
+        assert solid in ("-", "solid") if isinstance(solid, str) else solid[1] is None
+        x_coordinates = [patch.get_xy()[:, 0] for patch in axis.patches]
+        for coordinates in x_coordinates[1:]:
+            assert coordinates == pytest.approx(x_coordinates[0])
+    assert not main.child_axes
+    assert main.get_legend() is None
+    labels = [text.get_text() for text in figures[0].legends[0].get_texts()]
+    assert labels == ["Nominal vs Misaligned", "Nominal vs ACTS Aligned",
+                      "Nominal vs Schur-LM"]
+    table = figures[0].axes[-1].tables[0]
+    assert [table.get_celld()[(row, 0)].get_text().get_text()
+            for row in (1, 2, 3)] == ["2", "0.5", "1"]
+
+
+def test_three_way_layout_keeps_legend_and_rms_outside_all_six_panels(monkeypatch, tmp_path):
+    m = load_module()
+    import matplotlib.figure
+
+    figures = []
+    monkeypatch.setattr(matplotlib.figure.Figure, "savefig",
+                        lambda figure, *_args, **_kwargs: figures.append(figure))
+    schur_rows = [dict(row) for row in _plot_rows()]
+    m.write_difference_histograms(
+        _plot_rows(), tmp_path, active_dof=(0, 1, 5), schur_rows=schur_rows
+    )
+    figure = figures[0]
+    assert len(figure.axes) == 7  # Six data axes plus the separate RMS table.
+    panels = figure.axes[:6]
+    assert [len(axis.patches) for axis in panels] == [3, 3, 3, 2, 2, 2]
+    assert all(not axis.child_axes and axis.get_legend() is None for axis in panels)
+    assert len(figure.legends) == 1
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    legend_box = figure.legends[0].get_window_extent(renderer)
+    table_box = figure.axes[-1].tables[0].get_window_extent(renderer)
+    for axis in panels:
+        bounds = axis.get_tightbbox(renderer)
+        assert not bounds.overlaps(legend_box)
+        assert not bounds.overlaps(table_box)
+    for left, first in enumerate(panels):
+        for second in panels[left + 1:]:
+            assert not first.get_tightbbox(renderer).overlaps(second.get_tightbbox(renderer))
+
+
 def test_histogram_writer_creates_one_png_per_layer(tmp_path):
     m = load_module()
 
@@ -431,6 +533,115 @@ def test_cli_writes_csv_json_and_completed_manifest(tmp_path):
         b"\x89PNG\r\n\x1a\n"
     )
     assert len(manifest["inputs"]["nominal"]["sha256"]) == 64
+
+
+@pytest.mark.parametrize("matching_ids", [True, False])
+@pytest.mark.parametrize("rms_bar_chart", [False, True])
+def test_three_way_cli_reports_and_manifest(tmp_path, matching_ids, rms_bar_chart):
+    m = load_module()
+    paths = {}
+    for name, displacement in (("nominal", 0.0), ("misaligned", 2.0),
+                               ("aligned", 0.5), ("schur", 0.25)):
+        sensor = 2 if name == "schur" and not matching_ids else 1
+        paths[name] = _write_geometry(
+            tmp_path / f"{name}.json",
+            [_surface(f"vol=17|lay=8|sen={sensor}", (displacement, 0.0, 0.0))],
+        )
+    destination = tmp_path / "overlay"
+    arguments = ["--output-dir", str(destination)]
+    if rms_bar_chart:
+        arguments.append("--rms-bar-chart")
+    for flag, name in (("--nominal", "nominal"), ("--misaligned", "misaligned"),
+                       ("--aligned", "aligned"), ("--schur-aligned", "schur")):
+        arguments.extend((flag, str(paths[name])))
+    result = m.main(arguments)
+    manifest = json.loads((destination / "manifest.json").read_text())
+    assert set(manifest["inputs"]) == {"nominal", "misaligned", "aligned", "schur_aligned"}
+    assert len(manifest["inputs"]["schur_aligned"]["sha256"]) == 64
+    if not matching_ids:
+        assert result == 1
+        assert manifest["status"] == "failed"
+        assert "ID sets differ" in manifest["metrics"]["error"]
+        return
+    assert result == 0
+    assert manifest["status"] == "completed"
+    assert ("rms_bar_chart" in manifest["outputs"]) == rms_bar_chart
+    if rms_bar_chart:
+        assert Path(manifest["outputs"]["rms_bar_chart"]).read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+        with Path(manifest["outputs"]["rms_bar_values_csv"]).open() as stream:
+            assert len(list(csv.DictReader(stream))) == 6
+    assert len(manifest["metrics"]["source_files"]["compare_geometries"]["sha256"]) == 64
+    for output, rms in (("summary_json", 0.5), ("schur_summary_json", 0.25)):
+        summary = json.loads(Path(manifest["outputs"][output]).read_text())
+        assert summary["overall"]["tx"]["aligned_difference"]["rms"] == rms
+    for output in ("comparison_csv", "schur_comparison_csv"):
+        with Path(manifest["outputs"][output]).open() as stream:
+            assert len(list(csv.DictReader(stream))) == 6
+
+
+def test_rms_bar_chart_scales_values_and_keeps_labels_clear(monkeypatch, tmp_path):
+    m = load_module()
+    import matplotlib.figure
+    from matplotlib.colors import to_rgba
+
+    rows = _plot_rows()
+    rows += [dict(row, volume_id=24, layer_id=4,
+                  aligned_difference=2.0 * row["aligned_difference"])
+             for row in _plot_rows()]
+    schur_rows = [dict(row, aligned_difference=1.01 * row["aligned_difference"])
+                  for row in rows]
+    figures = []
+    real_savefig = matplotlib.figure.Figure.savefig
+
+    def save_and_capture(figure, *args, **kwargs):
+        figures.append(figure)
+        real_savefig(figure, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.figure.Figure, "savefig", save_and_capture)
+    outputs = m.write_rms_bar_chart(rows, schur_rows, tmp_path, active_dof=(0, 1, 5))
+    assert Path(outputs["rms_bar_chart"]).read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    with Path(outputs["rms_bar_values_csv"]).open() as stream:
+        values = list(csv.DictReader(stream))
+    assert len(values) == 12
+    assert {row["surface_count"] for row in values} == {"2"}
+    assert [float(row["rms"]) for row in values if row["method"] == "ACTS Alignment"] == pytest.approx(
+        [500.0, 1000.0, 1000.0, 2000.0, 12.345, 24.69]
+    )
+    assert {row["unit"] for row in values if row["dof"] in ("tx", "ty")} == {"um"}
+    assert {row["unit"] for row in values if row["dof"] == "rz"} == {"mrad"}
+    figure = figures[0]
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    assert len(figure.axes) == 3
+    assert len(figure.legends) == 1
+    assert [text.get_text() for text in figure.legends[0].get_texts()] == ["Schur-LM", "ACTS Alignment"]
+    for axis, schur_values, acts_values in zip(figure.axes,
+            ([505, 1010], [1010, 2020], [12.46845, 24.9369]),
+            ([500, 1000], [1000, 2000], [12.345, 24.69]), strict=True):
+        assert axis.get_ylim()[0] == 0
+        assert axis.get_yscale() == "linear"
+        assert [tick.get_text() for tick in axis.get_xticklabels()] == ["17:8", "24:4"]
+        assert axis.get_legend() is None
+        assert [bar.get_height() for bar in axis.patches] == pytest.approx(list(schur_values) + list(acts_values))
+        for bars, color in ((axis.patches[:2], "tab:brown"), (axis.patches[2:], "tab:blue")):
+            assert all(bar.get_facecolor() == pytest.approx(to_rgba(color)) for bar in bars)
+        boxes = [text.get_window_extent(renderer) for text in axis.texts]
+        assert all(axis.bbox.contains(*point) for box in boxes for point in box.get_points())
+        assert all(not first.overlaps(second) for i, first in enumerate(boxes) for second in boxes[i + 1:])
+        assert not axis.get_tightbbox(renderer).overlaps(figure.legends[0].get_window_extent(renderer))
+    assert [text.get_text() for text in figure.axes[-1].texts] == ["12.4685", "24.9369", "12.345", "24.69"]
+
+
+def test_rms_bar_chart_requires_schur_and_records_failure(tmp_path):
+    m = load_module()
+    geometry = _write_geometry(tmp_path / "geometry.json", [_surface("vol=17|lay=8|sen=1")])
+    output = tmp_path / "failed"
+    result = m.main(["--nominal", str(geometry), "--misaligned", str(geometry),
+                     "--aligned", str(geometry), "--rms-bar-chart", "--output-dir", str(output)])
+    assert result == 1
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["status"] == "failed"
+    assert "--schur-aligned" in manifest["metrics"]["error"]
 
 
 def test_cli_records_failed_manifest_for_malformed_geometry(tmp_path):

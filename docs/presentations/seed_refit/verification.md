@@ -1,6 +1,6 @@
 # 原图核验与实现对应
 
-本记录用于备查，不新增正文页。核验限定生产 joint 初始化的 SMT seed 与默认 Gauss–Newton measurement refit。源码定位由交付时快照提供；理论推导和当前近似实现明确区分。
+本记录用于备查，不新增正文页。核验限定生产 joint 初始化的 SMT seed 与默认 Gauss–Newton measurement refit；P7 的 block-LM 内容为后续补页，其核验对象是 `run_block_lm_alignment` 的收敛与接受契约（预注册版本 2）。源码定位由交付时快照提供；理论推导和当前近似实现明确区分。
 
 ## 原图逐项核验
 
@@ -35,8 +35,9 @@
 - `scripts/helix_model.py`：位置与切向、最近点、平面求交、gauge、seed Jacobian、LM、seed 终态门限。
 - `scripts/ml_alignment_autograd.py`：生产组批、初始化、measurement 适配、主线失效率与驻点检查、几何更新旋转约定。
 - `scripts/validate_helix_model.py`：零节点 measurement 残差、可微求交、LM change 停止、终态 decrement。
+- `scripts/ml_alignment_autograd.py`（P7 block-LM）：`load_joint_geometry` 装配工作几何、`run_block_lm_alignment` 主循环、`_sensor_residual_data` 分块选择、`_block_lm_linearized_block` 线性化、`_block_lm_decrement` 与 `_block_lm_free_dof_mask` 驻点与自由集、`_block_lm_fixed_chi2` 与 `_block_lm_retry_damping` 接受与阻尼阶梯、`_block_lm_block_status` 与 `_block_lm_run_summary` 终态汇总，常量组 `BLOCK_LM_*`。
 
-精确行号、文件 SHA256 与工作区状态见 [source_snapshot.json](source_snapshot.json)。正式 PPT 页脚可只写“实现依据：ML_Alignment，版本见备注”，避免路径占据画面。
+精确行号、文件 SHA256 与工作区状态见 [source_snapshot.json](source_snapshot.json)；P7 新增的函数索引尚未进入该快照，下次刷新快照时补齐。正式 PPT 页脚可只写“实现依据：ML_Alignment，版本见备注”，避免路径占据画面。
 
 ## 解释边界
 
@@ -49,4 +50,4 @@
 
 ## 文案与图稿检查
 
-交付前核查正文六页、附录十四页、全部本地文档链接、Mermaid 解析、SVG/PNG 输出及独立视觉反馈。检查记录见 [qa.md](qa.md)。不修改核心算法，因此不运行耗时生产实验或为文案新增算法测试。
+交付前核查正文七页（P7 图稿待生成）、附录十四页、全部本地文档链接、Mermaid 解析、SVG/PNG 输出及独立视觉反馈。检查记录见 [qa.md](qa.md)。不修改核心算法，因此不运行耗时生产实验或为文案新增算法测试。

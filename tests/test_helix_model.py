@@ -266,17 +266,24 @@ def test_shared_closest_point_and_plane_intersection_report_invalid_paths():
 
 def test_broken_helix_math_is_a_lazy_compatibility_import():
     """Production helix imports must not eagerly load material experiments."""
-    sys.modules.pop("scripts.broken_helix_model", None)
-    model = importlib.reload(importlib.import_module("scripts.helix_model"))
-    assert "scripts.broken_helix_model" not in sys.modules
-
-    broken = importlib.import_module("scripts.broken_helix_model")
-    x_over_x0 = torch.tensor([[0.01]], dtype=torch.float64)
-    q_over_p = torch.tensor([0.2], dtype=torch.float64)
-    expected = broken.highland_kink_sigma(x_over_x0, q_over_p)
-    actual = model.highland_kink_sigma(x_over_x0, q_over_p)
-
-    torch.testing.assert_close(actual, expected)
+    # A reload in this process invalidates functions already re-exported by
+    # consumers imported earlier in the suite. Test import behavior in a fresh
+    # interpreter, which is also the actual production import boundary.
+    import subprocess
+    from pathlib import Path
+    code = """
+import sys
+import torch
+import scripts.helix_model as model
+assert 'scripts.broken_helix_model' not in sys.modules
+import scripts.broken_helix_model as broken
+x = torch.tensor([[0.01]])
+q = torch.tensor([0.2])
+torch.testing.assert_close(model.highland_kink_sigma(x, q), broken.highland_kink_sigma(x, q))
+"""
+    completed = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                               cwd=Path(__file__).resolve().parents[1])
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_curvature_optimizer_scaling_round_trips_physical_parameters():

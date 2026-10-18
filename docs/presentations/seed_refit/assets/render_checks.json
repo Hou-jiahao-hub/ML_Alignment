@@ -63,6 +63,33 @@
     "text_outside_canvas": []
   },
   {
+    "file": "p3_seed_s1.svg",
+    "viewBox": {
+      "w": 1600,
+      "h": 900
+    },
+    "width_px": 3840,
+    "text_outside_canvas": []
+  },
+  {
+    "file": "p3_seed_s2.svg",
+    "viewBox": {
+      "w": 1600,
+      "h": 900
+    },
+    "width_px": 3840,
+    "text_outside_canvas": []
+  },
+  {
+    "file": "p3_seed_s3.svg",
+    "viewBox": {
+      "w": 1600,
+      "h": 900
+    },
+    "width_px": 3840,
+    "text_outside_canvas": []
+  },
+  {
     "file": "p4_refit.svg",
     "viewBox": {
       "w": 1600,
@@ -76,6 +103,33 @@
     "viewBox": {
       "w": 834.96875,
       "h": 2594.171875
+    },
+    "width_px": 3840,
+    "text_outside_canvas": []
+  },
+  {
+    "file": "p4_refit_s1.svg",
+    "viewBox": {
+      "w": 1600,
+      "h": 900
+    },
+    "width_px": 3840,
+    "text_outside_canvas": []
+  },
+  {
+    "file": "p4_refit_s2.svg",
+    "viewBox": {
+      "w": 1600,
+      "h": 900
+    },
+    "width_px": 3840,
+    "text_outside_canvas": []
+  },
+  {
+    "file": "p4_refit_s3.svg",
+    "viewBox": {
+      "w": 1600,
+      "h": 900
     },
     "width_px": 3840,
     "text_outside_canvas": []

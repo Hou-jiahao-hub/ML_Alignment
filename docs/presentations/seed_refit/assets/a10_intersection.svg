@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="850" viewBox="0 0 1600 850">
-<defs><marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8 Z" fill="#53616D"/></marker></defs>
+<defs><marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8 Z" fill="#53616D"/></marker><marker id="arrowmute" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8 Z" fill="#C6D0D5"/></marker><marker id="arrowink" markerWidth="11" markerHeight="9" refX="10" refY="4.5" orient="auto"><path d="M0 0 L11 4.5 L0 9 Z" fill="#23343D"/></marker></defs>
 <rect width="100%" height="100%" fill="white"/>
 <text x="65" y="58.0" font-family="Droid Sans Fallback, sans-serif" font-size="34" font-weight="700" text-anchor="start" fill="#23343D">从全局交点到局部测量预测</text>
 <text x="65" y="98.0" font-family="Droid Sans Fallback, sans-serif" font-size="22" font-weight="400" text-anchor="start" fill="#53616D">几何固定；R 将局部坐标映射到全局，Rᵀ 用于逆变换</text>

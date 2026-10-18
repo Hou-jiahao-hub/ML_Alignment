@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+<defs><marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8 Z" fill="#53616D"/></marker><marker id="arrowmute" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8 Z" fill="#C6D0D5"/></marker><marker id="arrowink" markerWidth="11" markerHeight="9" refX="10" refY="4.5" orient="auto"><path d="M0 0 L11 4.5 L0 9 Z" fill="#23343D"/></marker></defs>
+<rect width="100%" height="100%" fill="white"/>
+<text x="65" y="52.0" font-family="Droid Sans Fallback, sans-serif" font-size="34" font-weight="700" text-anchor="start" fill="#23343D">Measurement refit｜内循环：一步如何被接受或拒绝</text>
+<text x="65" y="96.0" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="700" text-anchor="start" fill="#2E6B5E">结论：在固定工作几何上，以非目标层局部测量重新约束径迹参数。</text>
+<text x="1540" y="52.0" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="700" text-anchor="end" fill="#8A97A0">2 / 3</text>
+<rect x="100" y="145" width="520" height="90" rx="12" fill="#FBFCFC" stroke="#DCE3E6" stroke-width="2"/>
+<text x="360.0" y="176.23" font-family="Droid Sans Fallback, sans-serif" font-size="34" font-weight="400" text-anchor="middle" fill="#B4C0C6">① 初始求交检查 → 规范固定</text>
+<text x="360.0" y="225.52999999999997" font-family="Droid Sans Fallback, sans-serif" font-size="34" font-weight="400" text-anchor="middle" fill="#B4C0C6">初始检查失败则直接退出</text>
+<rect x="100" y="275" width="520" height="100" rx="12" fill="#FBFCFC" stroke="#DCE3E6" stroke-width="2"/>
+<text x="360.0" y="311.23" font-family="Droid Sans Fallback, sans-serif" font-size="34" font-weight="400" text-anchor="middle" fill="#B4C0C6">② 完成一次 LM 更新</text>
+<text x="360.0" y="360.53000000000003" font-family="Droid Sans Fallback, sans-serif" font-size="34" font-weight="400" text-anchor="middle" fill="#B4C0C6">计算候选与 change</text>
+<path d="M360,235 L360,275" fill="none" stroke="#C6D0D5" stroke-width="2.4"  marker-end="url(#arrowmute)"/>
+<path d="M80.0 475 L360 400.0 L640.0 475 L360 550.0 Z" fill="#FBFCFC" stroke="#DCE3E6" stroke-width="2"/>
+<text x="360" y="462.85" font-family="Droid Sans Fallback, sans-serif" font-size="30" font-weight="400" text-anchor="middle" fill="#B4C0C6">③ 分块内最大 change</text>
+<text x="360" y="506.35" font-family="Droid Sans Fallback, sans-serif" font-size="30" font-weight="400" text-anchor="middle" fill="#B4C0C6">&lt; 10⁻¹⁰ 或预算耗尽？</text>
+<rect x="100" y="575" width="520" height="100" rx="12" fill="#FBFCFC" stroke="#DCE3E6" stroke-width="2"/>
+<text x="360.0" y="611.23" font-family="Droid Sans Fallback, sans-serif" font-size="34" font-weight="400" text-anchor="middle" fill="#B4C0C6">④ 独立终态验收</text>
+<text x="360.0" y="660.53" font-family="Droid Sans Fallback, sans-serif" font-size="34" font-weight="400" text-anchor="middle" fill="#B4C0C6">驻点 · 非有限值 · 失效率</text>
+<path d="M360,550 L360,575" fill="none" stroke="#C6D0D5" stroke-width="2.4"  marker-end="url(#arrowmute)"/>
+<text x="322" y="568.0" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#C6D0D5">是</text>
+<path d="M100.0 745 L360 690.0 L620.0 745 L360 800.0 Z" fill="#FBFCFC" stroke="#DCE3E6" stroke-width="2"/>
+<text x="360" y="754.6" font-family="Droid Sans Fallback, sans-serif" font-size="30" font-weight="400" text-anchor="middle" fill="#B4C0C6">⑤ 主线验收通过？</text>
+<path d="M360,675 L360,690" fill="none" stroke="#C6D0D5" stroke-width="2.4"  marker-end="url(#arrowmute)"/>
+<rect x="95" y="820" width="430" height="62" rx="12" fill="#FBFCFC" stroke="#DCE3E6" stroke-width="2"/>
+<text x="310.0" y="859.96" font-family="Droid Sans Fallback, sans-serif" font-size="28" font-weight="400" text-anchor="middle" fill="#B4C0C6">恢复六参数 → 固定径迹</text>
+<path d="M360,800 L360,820" fill="none" stroke="#C6D0D5" stroke-width="2.4"  marker-end="url(#arrowmute)"/>
+<text x="322" y="815.0" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#C6D0D5">是</text>
+<rect x="560" y="820" width="300" height="62" rx="12" fill="#FBFCFC" stroke="#DCE3E6" stroke-width="2"/>
+<text x="710.0" y="859.32" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#B4C0C6">失败退出并记录</text>
+<path d="M620,745 L710,745 L710,820" fill="none" stroke="#C6D0D5" stroke-width="2.4"  marker-end="url(#arrowmute)"/>
+<text x="668" y="726.0" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#C6D0D5">否</text>
+<path d="M80,475 L40,475 L40,325 L100,325" fill="none" stroke="#C6D0D5" stroke-width="2.4"  marker-end="url(#arrowmute)"/>
+<text x="63" y="422.0" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#C6D0D5">否</text>
+<path d="M620,325 L700,325 L700,190 L760,190" fill="none" stroke="#53616D" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<text x="684" y="262.0" font-family="Droid Sans Fallback, sans-serif" font-size="22" font-weight="700" text-anchor="end" fill="#23343D">展开 ②</text>
+<rect x="760" y="145" width="780" height="90" rx="12" fill="#EDF0FA" stroke="#62777F" stroke-width="2"/>
+<text x="1150.0" y="178.66" font-family="Droid Sans Fallback, sans-serif" font-size="28" font-weight="400" text-anchor="middle" fill="#23343D">求交与残差 → J, H, g</text>
+<text x="1150.0" y="219.26" font-family="Droid Sans Fallback, sans-serif" font-size="28" font-weight="400" text-anchor="middle" fill="#23343D">求 LM 步，构造候选参数</text>
+<path d="M1150,235 L1150,275" fill="none" stroke="#53616D" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<rect x="760" y="275" width="780" height="100" rx="12" fill="#EDF0FA" stroke="#62777F" stroke-width="2"/>
+<text x="1150.0" y="313.65999999999997" font-family="Droid Sans Fallback, sans-serif" font-size="28" font-weight="400" text-anchor="middle" fill="#23343D">重新求交</text>
+<text x="1150.0" y="354.26" font-family="Droid Sans Fallback, sans-serif" font-size="28" font-weight="400" text-anchor="middle" fill="#23343D">计算候选目标函数</text>
+<path d="M1150,375 L1150,395" fill="none" stroke="#53616D" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<path d="M790.0 475 L1150 395.0 L1510.0 475 L1150 555.0 Z" fill="#FAF0D9" stroke="#9B8051" stroke-width="2"/>
+<text x="1150" y="463.65999999999997" font-family="Droid Sans Fallback, sans-serif" font-size="28" font-weight="400" text-anchor="middle" fill="#23343D">逐径迹：候选目标</text>
+<text x="1150" y="504.26" font-family="Droid Sans Fallback, sans-serif" font-size="28" font-weight="400" text-anchor="middle" fill="#23343D">严格下降？</text>
+<rect x="770" y="590" width="330" height="95" rx="12" fill="#EDF0FA" stroke="#62777F" stroke-width="2"/>
+<text x="935.0" y="626.97" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#23343D">提交候选</text>
+<text x="935.0" y="664.6700000000001" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#23343D">阻尼 ×0.1，有下限</text>
+<rect x="1210" y="590" width="330" height="95" rx="12" fill="#FAE9E5" stroke="#62777F" stroke-width="2"/>
+<text x="1375.0" y="626.97" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#23343D">保留参数</text>
+<text x="1375.0" y="664.6700000000001" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#23343D">阻尼 ×10</text>
+<path d="M790,475 L790,535 L935,535 L935,590" fill="none" stroke="#53616D" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<text x="828" y="512.0" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="700" text-anchor="middle" fill="#53616D">是</text>
+<path d="M1510,475 L1510,535 L1375,535 L1375,590" fill="none" stroke="#53616D" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<text x="1472" y="512.0" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="700" text-anchor="middle" fill="#53616D">否</text>
+<path d="M935,685 L935,705 L1150,705" fill="none" stroke="#53616D" stroke-width="2.4"  />
+<path d="M1375,685 L1375,705 L1150,705" fill="none" stroke="#53616D" stroke-width="2.4"  />
+<path d="M1150,705 L1150,713" fill="none" stroke="#53616D" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<rect x="940" y="713" width="420" height="95" rx="12" fill="#EDF0FA" stroke="#62777F" stroke-width="2"/>
+<text x="1150.0" y="769.46" font-family="Droid Sans Fallback, sans-serif" font-size="28" font-weight="400" text-anchor="middle" fill="#23343D">计算分块内最大 change</text>
+<path d="M940,760 L730,760 L730,475 L640,475" fill="none" stroke="#53616D" stroke-width="2.4"  marker-end="url(#arrow)"/>
+<text x="825" y="736.0" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="700" text-anchor="middle" fill="#53616D">返回 ③</text></svg>

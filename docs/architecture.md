@@ -31,6 +31,7 @@ simulation -> ROOT/geometry JSON -> loaders -> solver -> aligned geometry
 | `material_artifact.py` | Per-track material-node artifact from ACTS ROOT output | None |
 | `validate_helix_model.py` | Holdout validation, acceptance gates, paired single/broken-helix comparison | None |
 | `compare_helix_recovery.py` | Paired nominal/misaligned helix seed-to-refit recovery diagnostic | None |
+| `validate_helix_truth.py` | Non-target nominal helix refit scored against MC truth on every crossed surface | None |
 | `reconstruction_acceptance.py` | Reconstructed measurement/smoothed-state chi2 acceptance | None |
 | `plot_*.py` | Residual, chi2/NDF, and hit diagnostics | ROOT/uproot |
 | `experiment_manifest.py` | Reproducibility metadata and input hashes | None |
@@ -95,6 +96,7 @@ data/
     surface_helix/
     helix_validation/
     helix_recovery/
+    helix_truth/
     material/
     ablation/
   archive/                  historical logs, figures, and retired artifacts
@@ -238,6 +240,67 @@ The manifest hashes both ROOT and both geometry inputs and is finalized on both
 normal, exceptional, and interrupted exits while retaining every metric already
 computed. Runnable smoke and partitioned examples are in
 [`docs/helix-recovery.md`](helix-recovery.md).
+
+## Non-target helix truth diagnostic
+
+`validate_helix_truth.py --geometry {nominal,misaligned}` selects the reconstruction
+branch (default nominal). The misaligned branch requires `--nominal-run-dir`:
+it verifies the completed nominal run's input hashes and frozen CSV cohort,
+strictly pairs measured-state identities/measurements/variances, verifies equal
+non-target geometry, and replaces only the SMT seed positions/directions.
+The fitted helix is evaluated on the frozen nominal surfaces, using nominal
+MC truth and measurement variances. Target data and truth stay out of the fit.
+`paired_comparison.csv` and `paired_summary.json` compare the total truth score
+against nominal ACTS SMT on exactly the same components, with an event-cluster
+bootstrap (2,000 replicates, seed 6006). Any final non-stationary refit or
+incomplete all-surface score makes the primary verdict inconclusive; seed
+stationarity and valid-subset diagnostics are retained separately. Existing
+nominal CLI behavior and historical manifest readers remain compatible.
+
+`validate_helix_truth.py` measures how well one six-parameter helix, fitted
+without any target-surface data, describes the MC track itself. Truth is
+`RootTrackStatesWriter`'s `t_eLOC0/1`: `averageSimHits` transforms each
+associated sim hit onto the nominal reference surface and averages the local
+positions. It is neither a measurement nor a smoothed state, and the two
+branches alone cannot distinguish a missing association from a real zero.
+
+Each track is fitted once on nominal geometry: an SMT point seed and a
+measurement Gauss--Newton refit, both restricted to non-target rows with a
+finite measurement and a positive variance. Target measurements, target SMT
+rows, and every truth value stay out of initialization, optimization, the
+convergence test, and parameter selection; a regression test perturbs them and
+requires bitwise-identical parameters. The cohort condition is the existing one:
+at least 8 usable non-target hits and at least 300 mm of non-target path span.
+
+The frozen parameters are then continued through the track's own recorded
+surfaces in path order, including target. Re-anchoring at each accepted
+crossing is an exact representation change, not a refit; a branch that goes
+backwards, or repeats a crossing at a later recorded path, is invalidated
+rather than replaced by a guessed winding. Truth never selects a crossing.
+
+Residuals are `prediction - truth` in surface-local mm. Every component with a
+truth value is reported, while only components with a valid measurement
+variance are weighted:
+
+    Q_S = sum over surfaces in S, components a of r^2 / sigma_meas^2,
+    S in {non_target, target, all}
+
+This is a measurement-resolution-weighted truth residual diagnostic, not a
+calibrated chi-square: no `N - 6`, and no expectation of `Q/N ~ 1`. A group's
+score is written only when every expected component is finite and every
+intersection in the group succeeded; otherwise the valid subset is reported
+separately under an explicit incomplete flag, so a shrinking component set can
+never pass as a complete track. `Q_all = Q_non_target + Q_target` holds by
+construction for complete tracks. The non-target measurement chi2 is reported
+alongside, separating "fits the measurements" from "follows the true track".
+
+Excluding target rows from the helix fit does not make this a strict target
+holdout: the SMT seed comes from an ACTS reconstruction that saw those hits.
+Runs record `strict_target_holdout: false` for that reason.
+
+Each run writes `per_surface.csv`, `per_track.csv`, `excluded_tracks.csv`, a
+strict-JSON `summary.json`, three PNGs, and a `manifest.json` that is started
+before input hashing and finalized on normal, failed, and interrupted exits.
 
 ## Input/output contracts
 

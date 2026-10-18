@@ -1,9 +1,13 @@
 {
-  "main_pages": 6,
+  "main_numbered_sections": 6,
+  "main_display_pages_with_existing_progressive_variants": 10,
   "appendix_pages": 14,
-  "svg_png_pairs": 11,
+  "svg_png_pairs": 17,
+  "contact_sheet_images": 15,
   "broken_document_links": [],
   "source_hashes_unchanged": true,
+  "verified_against_current_head": "a4dd1e1447555ca08b445bb52f80741c67d6236b",
   "all_png_width": 3840,
-  "svg_text_outside_canvas": 0
+  "svg_text_outside_canvas": 0,
+  "latex_fragments_parsed": 160
 }

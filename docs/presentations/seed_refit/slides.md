@@ -1,8 +1,10 @@
 # SMT seed 与 measurement refit：逐页展示文案
 
-用途：探测器与算法组会中可独立插入的六页算法章节。正文 P1–P6；公式附录 A1–A14 见 [appendix.md](appendix.md)。
+用途：探测器与算法组会中可独立插入的算法章节。正文编号 P1–P7，其中 P3、P4 各以三页渐进图展开，P7 用单行流程带，实际上屏十一页；公式附录 A1–A14 见 [appendix.md](appendix.md)。
 
 本文件的“页面文案”可直接复制到 PPT；“讲解备注”建议置于演讲者备注，不需要全部上屏。建议 16:9、白底、深灰正文，以青绿色表示 seed、靛蓝色表示 refit、赭色表示判断及验收。正文中文建议不小于 18 pt。图中文字不重复堆放整套推导，公式以可编辑公式对象插入。
+
+P3、P4 的渐进图按 1600×900 版面绘制，框内正文 34 px。要让图内文字达到正文同级的 18 pt，这两页的图需占页宽不少于 90%，不要缩到半幅与文字并排；该页的文字改放演讲者备注。
 
 核验对象为当前工作区生产 joint 路径，默认 Gauss–Newton measurement refit；不泛指仓库内所有历史 solver 或独立 holdout 实验。版本与源码定位见 [verification.md](verification.md) 和 [source_snapshot.json](source_snapshot.json)。
 
@@ -116,7 +118,15 @@ F_t^{\mathrm{seed}}=\frac12\sum_{i\in\mathcal E_t}
 
 ### 流程图与布局
 
-顶部 15%：输入／目标／输出短条。中部 70%：两列回路图；底部 15%：目标公式及候选条件。使用 [p3_seed.mmd](diagrams/p3_seed.mmd)。驻点阈值集中在 P5，避免重复长公式。
+三页连播，每页整幅使用一张图，页内不再并排放文字：
+
+| 上屏顺序 | 图稿 | 只讲这一件事 |
+|---|---|---|
+| P3a | [p3_seed_s1.svg](assets/p3_seed_s1.svg) | 主干五步：初值 → 残差 → 驻点判断 → 终态诊断 → 输出。LM 内循环先折叠成虚线块 |
+| P3b | [p3_seed_s2.svg](assets/p3_seed_s2.svg) | 折叠块原地展开：一个候选步如何被接受或拒绝，阻尼随之 ×0.1 或 ×10 |
+| P3c | [p3_seed_s3.svg](assets/p3_seed_s3.svg) | 内循环折回，高亮停止条件、终态诊断与主线检查的两个出口 |
+
+三页的主干框、菱形与出口框坐标完全相同，只切换高亮与淡出，连播时应表现为同一张图逐层展开；若翻页时框发生位移，说明图稿被手工改动过，需重新生成。上面的「流程图节点」七条文字用作讲解顺序，不必上屏。完整单页版 [p3_seed.svg](assets/p3_seed.svg) 与自动排版的 [p3_seed_detailed.svg](assets/p3_seed_detailed.svg) 留作附录与审阅，不在正文使用。驻点阈值集中在 P5，避免重复长公式。
 
 ### 讲解备注
 
@@ -153,7 +163,19 @@ F_t^{\mathrm{meas}}=\frac12\sum_{(i,d)\in\mathcal C_t}r_{ti,d}^{2}.
 
 ### 流程图与布局
 
-顶部输入／目标／输出短条。左侧 60% 放 [p4_refit.mmd](diagrams/p4_refit.mmd)；右侧放预测链及残差定义，目标式可放图下。\(P\) 提取局部坐标的前两个分量；\(\mathcal C_t\) 包含拟合 mask、分量可用性和有效求交条件。
+三页连播，与 P3 同版式同槽位，听众不需要重新适应布局：
+
+| 上屏顺序 | 图稿 | 只讲这一件事 |
+|---|---|---|
+| P4a | [p4_refit_s1.svg](assets/p4_refit_s1.svg) | 主干五步：初始检查 → 一次 LM 更新 → change 停止判断 → 独立终态验收 → 固定径迹 |
+| P4b | [p4_refit_s2.svg](assets/p4_refit_s2.svg) | 内循环展开：候选目标严格下降则提交，否则保留并提高阻尼，再算分块最大 change |
+| P4c | [p4_refit_s3.svg](assets/p4_refit_s3.svg) | 停止与验收：迭代停止不等于通过验收，两个出口分开 |
+
+与 P3 的图相比，P4b 的候选判据只有「严格下降」一条，没有 seed 的「不丢初始有效点」——
+这是两阶段的真实差异，见本页讲解备注，不要把 seed 的候选检查画进 refit。
+
+预测链「求交 → 局部变换 → 提取 LOC0／有效 LOC1 → 按方差标准化」与残差定义放入 A10–A12 附录，
+配用 [a10_intersection.svg](assets/a10_intersection.svg)，无需额外增加正文页。\(P\) 提取局部坐标的前两个分量；\(\mathcal C_t\) 包含拟合 mask、分量可用性和有效求交条件。单页版 [p4_refit.svg](assets/p4_refit.svg) 与 [p4_refit_detailed.svg](assets/p4_refit_detailed.svg) 留作附录与审阅。
 
 ### 讲解备注
 
@@ -221,7 +243,7 @@ M_t=\max\!\left(\tfrac15\operatorname{tr}H_t,10^{-30}\right)I_5.
 
 **输出连接**
 
-非目标层 measurement refit → 终态验收 → 固定径迹参数 → 目标层 measurement 几何优化。
+非目标层 measurement refit → 终态验收 → 固定径迹参数 → 目标层 measurement 几何优化（见 P7）。
 
 **适用边界**
 
@@ -236,3 +258,123 @@ M_t=\max\!\left(\tfrac15\operatorname{tr}H_t,10^{-30}\right)I_5.
 当前主线的后续“joint”阶段固定径迹，联合求解目标几何；不要画成目标测量继续更新径迹的反馈回路。纯 helix 描述的适用性还取决于场与材料效应，驻点验收不能替代残差诊断和重建验证。当前 refit mask 随求交有效性改变，因此 half-χ² 下降的解释需结合有效分量检查，不能当作固定数据集上的无条件改进保证。所有数值效果需引用已有可复核实验，本章节不新增或暗示性能测量。
 
 **代码依据：** seed/refit residual 与主线 fixed-track 调用链。**附录：** A7、A11–A14。
+
+## P7｜Block-LM：固定径迹的目标层几何优化
+
+**结论句：固定已验收的径迹参数，按 target sensor 分块求解几何；每块独立判定终态，不用单一 `converged` 布尔掩盖卡死。**
+
+### 页面文案
+
+**输入：**通过独立驻点验收的 refit helix（全程冻结）、目标层局部测量及方差、当前工作几何——非目标层取标称几何作底板，目标层覆盖为待校准的几何（`--input-geom`，合成实验中即已知错位几何）。
+
+**目标：**对每个 target sensor，最小化该 sensor 上目标层测量分量的 half-χ²，优化变量为该 sensor 相对其初始位姿的对齐增量（局部平移与欧拉角中的 active DOF）。
+
+**输出：**每个 sensor 的对齐增量及其四类终态之一：`converged`／`budget_exhausted`／`rank_deficient`／`intersection_failed`。
+
+几何更新为相对初值的局部系增量，严格可逆：
+
+\[
+\mathbf c_s=\mathbf c_s^{0}+R_s^{0}\,\delta\mathbf t_s,\qquad
+R_s=R_s^{0}\,R(\delta\boldsymbol\varphi_s),\qquad
+\boldsymbol\delta_s=(\delta\mathbf t_s,\delta\boldsymbol\varphi_s)\in\mathbb R^{6}.
+\]
+
+\(\boldsymbol\delta_s\) 初值为零，即从待校准几何出发；非目标层几何不进入优化变量，仅作为前两阶段径迹的锚定底板。
+
+**残差与目标：**与 refit 同形，但自变量由径迹换成几何。
+
+\[
+\widehat{\mathbf m}_{si}=P R_s^{\mathsf T}
+\left[\mathbf h(\boldsymbol\eta_i,s_{si}^{\cap})-\mathbf c_s\right],
+\qquad
+r_{si,d}=\frac{m_{si,d}-\widehat m_{si,d}}
+{\sqrt{\max(V_{si,d},10^{-8}\,\mathrm{mm}^2)}},
+\]
+\[
+\min_{\boldsymbol\delta_s}F_s=\frac12\sum_{(i,d)\in\mathcal M_s}r_{si,d}^{2}.
+\]
+
+\(\mathcal M_s\) 取 `hit_mask & is_target & (sensor_idx == s)` 的有效测量分量。
+
+**分块解耦（精确结论，不是近似）：**hit 选择只依赖 `sensor_idx`，径迹全程只读，因此 block \(s\) 的残差、Fisher 与梯度只是 \(\boldsymbol\delta_s\) 的函数；其它 block 移动不可能使它离开驻点，驻点块可永久退休。
+
+**逐块 LM 更新**
+
+\[
+H_s=J_s^{\mathsf T}J_s,\quad g_s=J_s^{\mathsf T}r_s,\quad
+(H_s+\mu_s M_s)\,\Delta\tilde{\boldsymbol\delta}_s=-g_s.
+\]
+
+\(J\) 已按 `physical_scales` 归一化为无量纲；阻尼 \(\mu_s\) 逐 sensor 持有，并跨外层迭代延续。
+
+**候选接受必须同时满足三条**
+
+\[
+\chi^2_{\mathcal F}(\boldsymbol\delta^{+})<\chi^2_{\mathcal F}(\boldsymbol\delta),\qquad
+\mathcal F\subseteq\mathcal M_s(\boldsymbol\delta^{+}),\qquad
+\mathrm{invalid}_s(\boldsymbol\delta^{+})\le\max\!\left(\mathrm{invalid}_s(\boldsymbol\delta),\,\tau_{\mathrm{inv}}\right).
+\]
+
+两侧同在当前点的固定分量集 \(\mathcal F\) 上求和；候选丢掉任一原有效分量即拒绝。接受后 \(\mu_s\leftarrow\max(0.5\mu_s,10^{-12})\)；拒绝则在同一 sensor、同一外层迭代内最多 8 级 \(\times10\) 重试，阶梯锚定生产初值，Jacobian 复用不重算。
+
+**驻点判据（不加任何正则，走谱分解）**
+
+\[
+\lambda^2_s=g_{\mathrm{free}}^{\mathsf T}H_{\mathrm{free}}^{-1}g_{\mathrm{free}}
+=\sum_{k:\,\mu_k>\mathrm{floor}}\frac{(q_k^{\mathsf T}g)^2}{\mu_k},
+\qquad
+\frac{\lambda^2_s}{n_{\mathrm{comp}}}\le10^{-6}.
+\]
+
+自由集为空，即所有 active DOF 抵边界且梯度朝外，同样是驻点——箱约束的 KKT 点。
+
+**四类终态的判定优先级**
+
+| 优先级 | 终态 | 触发条件 |
+|---|---|---|
+| 1 | `intersection_failed` | 阻尼阶梯耗尽，且过程中出现过分量丢失或失效率拒绝 |
+| 2 | `rank_deficient` | 有方向弱于 Fisher floor，或 \(\mu_{\min}\le0\)，或走过 `lstsq` 回退 |
+| 3 | `converged` | \(\lambda^2/n\le10^{-6}\)，或自由集为空 |
+| 4 | `budget_exhausted` | 外层迭代或阻尼重试预算耗尽 |
+
+既秩亏又达阈值报 `rank_deficient`：秩亏时 \(\lambda^2\) 只在良态子空间求和，是真值的下界。
+
+**流程图节点**
+
+1. 载入已验收 refit 径迹并冻结；按 sensor 选取目标层 hit。
+2. 逐 sensor 求交、转局部坐标、标准化残差，确定本次访问的固定分量集 \(\mathcal F\)。
+3. 一次 Gauss–Newton 线性化，得 \(J,H,g\)；该 Jacobian 供整条阻尼阶梯复用。
+4. 箱约束自由集判定，谱分解算 \(\lambda^2\)，做驻点与秩亏判断；驻点块退休，不再更新。
+5. 解 LM 候选步，信赖域截断，硬边界 clamp，生成候选几何。
+6. 在 \(\mathcal F\) 上评分：下降、不丢分量、失效率不恶化则接受并 \(\mu\times0.5\)；否则抬到下一级阻尼重试。
+7. 阶梯耗尽仍不降则该块退休并记录原因；全部块终态或预算耗尽后汇总四类终态。
+
+### 流程图与布局
+
+与 P3、P4 上屏所用的流程带同风格：整幅横跨页宽的单行流程带 [p7_blocklm_band.svg](assets/p7_blocklm_band.svg)，白底、无边框节点、黑色弯箭头，一条回流弧，右端接驻点检查与输出。
+
+- **左侧两路输入**汇入主链：固定径迹 helix（已通过驻点验收）、目标层局部测量及测量方差。
+- **主链**：逐 target sensor 与该面求交 → 转换为局部坐标系得到 LOC0／LOC1 预测 → 构造按方差标准化的残差 → 阻尼 LM 调整该面对齐增量 \(\boldsymbol\delta\) → 驻点与终态检查 → 输出逐 sensor 对齐增量。
+- **回流弧**：按 \(\boldsymbol\delta\) 移动测量面 → 重求交 → 在固定分量集上评分；弧下小字记阻尼阶梯「接受 \(\mu\times0.5\)；拒绝 \(\mu\times10\) 重试，同一 Jacobian 复用」。
+- **终态**：检查节点下方以小字列出四类终态，不拆成四条出口箭头，以免撑破带状版面。
+
+逐 sensor 分块这一层写在节点文字里而不是另画一层：带状图只有一条主链，多画一层嵌套会破坏与 P3、P4 的同构。若讲解时需要强调 block 之间精确解耦，用底部第一条要点口述即可。
+
+以下两项为后续可选，本轮未生成图稿。右上角小图与 P4 同尺寸：一条固定不动的 helix 穿过两块 target 传感面，面各带虚线的初始位姿轮廓与实线的施加 \(\boldsymbol\delta\) 后轮廓，箭头标 \(\delta\mathbf t\) 与 \(\delta\boldsymbol\varphi\)；面上实心点为预测交点、空心点为测量点，紫色虚线连接为局部测量残差。图例：固定径迹／初始面／对齐后面／预测交点／测量点／局部测量残差。脚注一句：与 refit 相反，此处径迹固定、测量面移动。若另画标称面轮廓作对照，须注明 truth 只用于事后核对、不进入求解。
+
+底部可选一条 `history` 折线条带，并注明接受步可扩大有效分量集，曲线跨迭代比较的是项数不同的两个目标，抬升本身不是异常。
+
+**底部两条要点**
+
+- 拟合过程中径迹固定，仅更新各 target sensor 的对齐增量；block 之间精确解耦。
+- 迭代停止不等于收敛：`converged` 需通过独立的自由集驻点判据，秩亏块永不被报为收敛。
+
+### 讲解备注
+
+\(\mathcal M_s\) 的 LOC1 还要求 `loc1_mask`；无效求交分量在残差中置零。`lm_max_step_t/r` 是信赖域，不进 KKT，被截断的步单独计数，因为截断后不再是 LM 步；`joint_clamp_t/r` 才是真实可行域，进 KKT。驻点判据刻意不加 `GAUSS_NEWTON_MIN_DAMPING`：\((H+\varepsilon I)^{-1}\preceq H^{-1}\)，加正则只会让 decrement 偏小，把“没收敛”报成“收敛”，正是本契约要消灭的失效模式。`rank_deficient` 不提前终止该 block——当前生产几何正由 Fisher floor 撑起的步产生，立刻退休会混淆“契约修好了”与“几何变了”；该块继续走步，只是永不被报成 `converged`。真实数据上 `rank_deficient` 比例可能很高，这是审计输出，不是 bug。
+
+阈值与 refit 的 `NEWTON_DECREMENT_STATIONARY` 同 gauge、同数值，但口径不同：refit 是每径迹行，这里是每 component；两者独立冻结，不得互相调整。
+
+宣称边界：本阶段的收敛与接受契约只使 `converged` 成为可证伪的陈述。若产出几何与基线等价，只能宣称契约得到验证，不得宣称物理精度提升。truth 在真实物理场景中不存在，只在带标注实验的事后核对中可得，求解器内部任何一处引用 truth 都是错的。
+
+**代码依据：** `run_block_lm_alignment` → `_sensor_residual_data` → `_block_lm_linearized_block` → `_block_lm_decrement`／`_block_lm_free_dof_mask`／`_block_lm_fixed_chi2`／`_block_lm_retry_damping` → `_block_lm_block_status`／`_block_lm_run_summary`；几何装配 `load_joint_geometry`、更新 `apply_alignment_torch` 与 `update_geometry_to_json`。预注册常量见 `BLOCK_LM_PREREGISTRATION_VERSION = 2` 一组，契约说明见 [2026-09-08-block-lm-convergence-contract.md](../../handoff/2026-09-08-block-lm-convergence-contract.md)。**附录：** A10–A14。

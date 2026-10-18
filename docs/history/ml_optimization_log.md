@@ -2893,6 +2893,151 @@ bootstrap）。六项 nominal ratio / 95% CI 上界为：
 
 ---
 
+## Iteration 31 — misaligned 输入的非目标 helix refit 与 nominal ACTS truth χ²（预注册）
+
+**日期**：2026-10-03。**状态**：完整实验和比较绘图均 `completed`；预注册总 truth χ²
+主判据为 `improved`，target 分项高于 nominal ACTS 基线。
+
+与历史实验的区别：2026-09-23 的 helix truth 实验只使用 nominal 重建输入；
+2026-09-09 的 recovery 实验检验两分支恢复，但未采用当前的 MC truth 全记录面总 χ²
+判据。本轮改变 SMT 初始化的输入分支，保留非目标 measurement refit、nominal 参考面和
+nominal MC truth，以 nominal ACTS smoothed 径迹的同口径 truth χ² 为主对照。
+
+### 冻结协议（preregistration version 1）
+
+- 输入：配置派生的 nominal/misaligned trackstates、完整 nominal geometry、目标层
+  misalignment overlay，以及 `full-20000-t6-20260923/nominal/` 的 manifest、summary、
+  per-track/per-surface CSV 和 exclusions；每个 retained run 在 manifest 中记录全部哈希。
+- 完整运行保持原 nominal 的最低 20,000 事件、19,946 条保留轨迹和 263,732 个记录面；
+  只用非目标 SMT seed 和非目标 measurement refit，600/60 iter、batch 128、6 threads、
+  CPU float64。目标测量、目标 SMT 和 truth 均不进入拟合。
+- 严格身份、measurement、variance 与组件 mask 配对，不缩小样本取交集；非目标
+  working geometry 必须等于 nominal。冻结 helix 后按 nominal 的记录面顺序求交，包含 target。
+- `Q_all = Σ(prediction − nominal truth)² / σ_measurement²` 为主统计，`Q_non_target` 和
+  `Q_target` 为分项；`N` 为有效测量分量数，不扣除参数数，不要求 Q/N≈1。
+- 主对照：nominal ROOT 的 ACTS `eLOC0/1_smt`，采用同一 nominal truth 和 variance。
+  主判据 `Δ = Q_helix − Q_nominal_ACTS` 的均值，事件簇 bootstrap 2,000 次、seed 6006；
+  完整样本均可评分且最终 refit 达驻点时，95% CI 上界 `<0` 才记录 `improved`。
+  任意最终 refit 非驻点、求交失败或评分不完整均为 `inconclusive`；有效子集仅作补充。
+  seed 非驻点单独记录，不改变迭代预算，也不把 seed 状态当作最终 refit 状态。
+- smoke 写入独立 `/tmp` 目录，完整结果写入
+  `data/experiments/helix_truth/Vol17_Lay8__Vol24_Lay4/full-20000-t6-20260923/misaligned/`。
+  所有正常、失败和中断实验均保存 schema-versioned manifest、已有指标和 source snapshot。
+
+### 结果
+
+- 定向测试：新增测试先失败后通过，包含 ROOT 端到端、target/truth 不干涉拟合、手算
+  χ²、事件簇 bootstrap、缩减队列不能宣称全样本改善，以及子 manifest 来源哈希稳定性；
+  最终 `29 passed`。`make ci` 为 `611 passed, 3 skipped, 14 deselected`，三项 shell
+  contract 均通过。需使用 conda `pytorch` 的 `libstdc++`（本机显式设置
+  `LD_LIBRARY_PATH=/home/houjiahao/miniconda3/envs/pytorch/lib`），避免 CLI 子进程加载
+  旧系统库缺少 `CXXABI_1.3.15`。
+- `make test-root-io` 为 `13 passed, 1 failed`。唯一失败为已有
+  `test_build_artifact_round_trips_a_synthetic_three_table_run`：当前 uproot 把 fixture
+  写成 RNTuple，材料读取器的 `library="np"` 无法把 mixed jagged record 转成 ndarray。
+  该模块未在本轮修改；排除此项后全部 13 项 ROOT I/O 测试通过。
+- smoke：`/tmp/helix-truth-misaligned-smoke-20261003/manifest.json` 为 `completed`，
+  25 条轨迹、321 个记录面，最终 refit 非驻点和求交失败均为零；7 个 seed 未达驻点。
+  这是冻结队列的子集，因此主 verdict 为 `inconclusive`。
+- 完整运行采用上述冻结参数，主 manifest 与 `acts_comparison/manifest.json` 均为
+  schema 2、`completed`，源码快照均为 `written`。覆盖 19,946 条轨迹和 263,732 个记录面，
+  54 条轨迹按原 nominal eligibility 排除；没有新增排除或缩减配对集。
+  seed 非驻点为 4,300（21.5582%），最终 measurement refit 非驻点、求交失败和主评分
+  不完整轨迹均为零。主流程耗时约 66 分 42 秒，另完成比较绘图。
+
+逐轨迹 truth χ² 的均值及事件 bootstrap 95% CI：
+
+| 分组 | 配对轨迹数 | misaligned 输入 helix | nominal ACTS SMT | 均值差 helix−ACTS | 差值 95% CI |
+|---|---:|---:|---:|---:|---|
+| all（主判据） | 19,946 | 10.1968475521 | 1649.9329593365 | −1639.7361117843 | [−1828.8207671073, −1479.7113365046] |
+| non_target | 19,946 | 6.4263108720 | 1648.4440539518 | −1642.0177430798 | [−1823.8773936202, −1470.9587549875] |
+| target | 12,436 | 6.0475333405 | 2.3880433261 | +3.6594900144 | [+3.2763353438, +4.0195180393] |
+
+`Q_all` 总和为 helix `203386.32127489327`、nominal ACTS
+`32909562.806925267`。全记录面主判据的 CI 上界严格小于零，因此记录 `improved`；
+这不意味着 target 精度改善：target 分项显著高于看过 target hits 的 nominal ACTS。
+所有评分仍为 measurement-resolution-weighted truth residual diagnostic，非校准 χ²
+检验或 blind/generalization 证明；`strict_target_holdout=false` 仍保留。
+
+完成后独立复核：两分支输入与原 nominal 产物哈希、源码快照与实际执行代码、绘图输出
+哈希、子 manifest 的不可变父来源、完整轨迹/面身份、canonical truth/measurement/variance，
+并从 CSV 的预测与 truth 重新计算逐轨迹 χ²、检查分项可加性，全部通过。保留原 nominal
+ROOT/JSON、CSV 和 manifest，没有改写原实验；本段只回填结果，不调整算法、参数或预算。
+
+## Iteration 32 — Track–Geometry 单 DOF 注入验证：V17L8 tx / ty / rz（P0–P5）
+
+执行《Track–Geometry 实验验证计划》（2026-10-08）第一批 A1–A3。新增
+`scripts/tracking_geometry_validation.py`（不 import acts；ACTS 经 `alignment_odd.py
+reconstruction --mode aligned --aligned-file` 在全新 LCG shell 中运行），复用
+`validate_helix_truth`、`validate_helix_model`、`helix_model` 与联合求解器，未修改既有代码。
+结果：`data/experiments/helix_truth/Vol17_Lay8__Vol24_Lay4/tracking_geometry_validation/`。
+
+### 预注册（`preregistration.json`，任何 a≠0 运行之前写入）
+
+- target 仅 `17:8`（`config_v17l8.toml`）；24:4 为 non-target，参与 SMT seed 与 refit。
+- 注入为确定值、整层 1092 个 sensor 同幅度，local 约定与求解器一致：
+  `c' = c + R[:,axis]·a`，`R' = R @ Rz(φ)`。幅度 tx/ty ±0.5 mm、rz ±0.02 rad（用户指定），
+  另设 a=0 对照（ACTS 经 decorator 加载 nominal 17:8 变换）。
+- cohort：nominal ROOT 前 20000 个出现的事例（最大事件号 20222 ⇒ ACTS `--num-events 20223`）。
+- 残差 `r = p − m`；配对 = event/track + 逐位相等的 measurement/variance/mask。
+- 容差：P1 ≤ 1e-9 mm；η_closure ≤ 0.10；G_g 相对误差 ≤ 1e-6（ε/2、ε、2ε）；G_t ≤ 1e-5；
+  P5 τ_abs = 3×RMS(a=0 对照修正量)、τ_rel = 0.05、≥95% converged sensor 满足
+  `|ĝ+a| ≤ τ_abs+τ_rel|a|`、层均值 `|mean e| ≤ τ_rel|a|+3·RMS/√N`、未注入 DOF ≥95% 在 τ_abs 内。
+- P5 求解器参数与 `run_surface_helix_experiment.sh` 的 joint_free 阶段一致（SMT seed 2000 次迭代、
+  refit 200、LM 60、step-r 5e-3）。冒烟时发现求解器自身默认的 200 次 seed 迭代在 nominal 数据上
+  即触发其驻点守卫（3000 条轨迹 6.2% 非驻点），故不能用默认值。
+
+### 结果（2026-10-08，28 个 manifest 全部 completed，`failures = {}`）
+
+- P0：19,998 条轨迹、264,221 个 surface；500 事例两次重跑与全量子集逐位一致。
+  refit 非驻点 4,300 条为既有行为（Iteration 31 同数）。
+- a=0 对照：ACTS 重建后 seed/refit Δθ、Δr_t、closure 全部逐位为 0，P0 预测逐位复现。
+- P1：tx/ty 在 17:8 上 Δr_g = −a，rz 为 (φv, −φu)；误差 ≤ 1.7e-13 mm，非 target ≤ 4.6e-13 mm。
+- P2：配对保留率 100%。seed 层吸收显著（target 注入轴向 Δr / Δr_g）：tx ≈ 32%、ty ≈ 77%；
+  rz 为 rms 0.133 mm（Δr_g rms 0.417 mm）。refit 层 Δr_t rms ~1e-9 mm——refit 目标函数
+  （non-target 测量与拟合几何）与 P0 相同，refit 收敛回同一极小值，因此 refit 层只检验 seed 无关性。
+- P4：η_closure tx 6.8e-14、ty 1.1e-14、rz 2.4e-10，全部通过；G_g solver vs FD
+  1e-11（tx/ty）、1.7e-9（rz，按 ε²/6 截断增长），solver vs 解析 ≤ 2e-15，无分支不一致；
+  G_t（gauge measurement Jacobian）≤ 7e-9。
+- P5：1090/1092 sensor converged（2 个 rank_deficient），求解器选用 11,922 条轨迹。
+  a=0 噪声底 rms：tx 8.8 μm、ty 10.5 μm、rz 0.46 mrad。
+
+| 单元 | 修正量均值 | 恢复误差均值 | 误差 rms | 容差内比例 | 串扰 | 判定 |
+|---|---:|---:|---:|---:|---|---|
+| tx −0.5 mm | +0.50022 mm | +0.22 μm | 8.9 μm | 99.54% | ty 98.8% / rz 99.0% | pass |
+| tx +0.5 mm | −0.49978 mm | +0.22 μm | 8.9 μm | 99.54% | ty 98.8% / rz 99.0% | pass |
+| ty −0.5 mm | +0.49984 mm | −0.16 μm | 10.6 μm | 99.91% | tx 98.8% / rz 99.0% | pass |
+| ty +0.5 mm | −0.50016 mm | −0.16 μm | 10.6 μm | 99.91% | tx 98.8% / rz 99.0% | pass |
+| rz −0.02 rad | +0.020005 rad | +0.005 mrad | 0.46 mrad | 99.54% | tx 98.8% / ty 98.8% | pass |
+| rz +0.02 rad | −0.019995 rad | +0.005 mrad | 0.46 mrad | 99.54% | tx 98.8% / ty 98.9% | pass |
+
+### 解读边界
+
+- 恢复误差分布与 a=0 对照几乎相同：在 fixed-track block-LM 下，helix 只用 non-target hit
+  拟合且 refit 与 seed 无关，估计量对注入幅度不敏感；这是该求解器结构的直接结果，
+  不是对 track absorption 的独立检验。
+- 每个 DOF 只有一档幅度，线性区间结论只基于该幅度；修正后残差为冻结 P0 helix 的几何评估，
+  未在修正几何上重跑 ACTS。
+- 尚未做：V24L4（B1–B3，需单独 P0 与 `["24:4"]` 配置）、单层多 DOF、两层综合、逐 module 随机注入。
+
+### 归档（2026-10-09）
+
+本迭代归档为 **Stage I — Frozen-track / target-holdout geometry-response validation**。结论：
+
+1. δg → Δr_g 的 geometry response 已验证；
+2. ACTS seed 对 perturbation 有响应；
+3. non-target-only helix refit 基本消除了 seed-induced track response
+   （refit 层 Δx0/Δy0/Δz0 ~2–3.5 μm 仅为 gauge 方向，物理参数 Δψ0 ~7e-8、Δtanλ ~4e-11，
+   `antisymmetry_target.track` ≈ 0.98，即 Δr_t 不随 ±a 反号，是数值噪声）；
+4. G_g 与 G_t 的 Jacobian 数值实现通过 FD 检查；
+5. 当前 closure 主要验证的是 geometry arm，尚未充分验证显著 G_t δθ 下的 joint response
+   （Δr_t ≈ 0 使闭合退化为 Δr_full ≈ Δr_g；`track_first_order` 的被预测量仅 ~1e-8 mm）。
+
+结论 5 留给后续阶段：需要 Δθ 显著的设定（如 seed 层 Δr_t 的 rz 离线闭合、target hit 参与 refit
+的变体、或平面外 DOF）。
+
+---
+
 ## Iteration 33 — Schur P1 统计误差预算诊断与 L1 处置（预注册）
 
 **日期**：2026-10-10。**状态**：预注册，写于任何 P1 数据运行之前。
@@ -4195,3 +4340,117 @@ ref hit 0.837 [0.830, 0.844]（149 对 178 μm，709,672 个 hit）。
 2. 径迹 truth 距离改善，说明联立拟合**没有**重现 L3 的「target hit 并入拟合导致约 9.9 倍偏差」。但 C 臂的径迹用了 target hit，A 臂没有，所以这部分改善包含「多用了一层测量」的贡献，不能全部归因于 Schur。
 3. 本样本中 A 臂的 truth 已在 Iteration 29/30 读过，C 臂是第一次读。改善声明要成为正式结论，还需要在独立模拟样本上复现（roadmap §H1），本条没有做。
 4. 24:4 tx 的 A 臂 RMS 为 7.75 μm，与 Iteration 30 的 truth-veto 口径一致（0.01498 × 0.5167 mm）。Iteration 41 §A 表中的 6.98 μm 来自 `compare_geometries`，口径不同，只作量级参考，不影响任何判定。
+
+## Iteration 47 — 三组 nominal helix 材料效应与计时诊断（预注册）
+
+**日期**：2026-10-14。**性质**：diagnostic_only，不回灌 alignment 求解器。
+用户批准硬编码三组 20000 事件：pT=10 GeV 材料开/关、pT=100 GeV 材料开，seed 42。
+运行 ID `material-helix-20261014-r1`，模拟/重建/refit/评分几何均为 nominal。
+与 Iteration 33 的区别：本实验消除 aligned target 残余几何误差混入，改变的是物理样本与
+材料开关；不复用 P1 旧输入哈希/61482 轨迹身份闸门，不重跑 alignment。
+完整协议、路径、时间定义和调用见 `docs/handoff/2026-10-14-helix-material-study.md`。
+
+主单元为配置的 target 层×LOC。只用非 target seed/refit，同一次 refit 传播 P，
+定义 M=mean((prediction-measurement)^2)、U=M-V-P、truth_M=mean((prediction-Truth)^2)。
+报告 g1-g2 的 M/U/truth_M、g3-g1 的 U/truth_M；无材料闭合看 g2 的 U 与 truth_M-P
+是否与零统计相容。事件簇 bootstrap 2000 次、seed 6006，按共同生成事件池采样，不缩减
+求交/拟合失败样本；非驻点/求交失败/非有限预算使相关主结论不可判定。
+记录完整覆盖、eta/内插外推分层、每阶段实际墙钟时间和失败重试次数。
+没有 100 GeV 材料关闭臂，因此不把高动量全部差异归为材料，也不单独归因于多重散射。
+
+**环境状态**：实现时 /cvmfs/sft.cern.ch/lcg 未挂载；真实实验启动与错误、测试结果随后回填。
+
+### 实现与验证留痕（2026-10-14；未取得真实物理结果）
+
+- 已实现硬编码三组 nominal 流程、精确分组路径、每阶段计时和失败 writer 清理；
+  `helix_model.py` 数学未修改。验证器同次 refit 传播 target P，新增比较器处理完整 cohort。
+- 独立审查发现并修复：截断队列进入比较、inner join 静默丢行、失败 writer 未关闭即计算哈希；
+  均有失败后通过的回归。导入懒加载测试改为子进程隔离，避免 reload 使其他消费者引用失效。
+- 最终 `make ci` exit 0：886 passed / 3 skipped / 15 deselected，三项 shell 合约通过。
+  后续新增 CLI 导入及硬编码表执行回归另行通过，最新 focused 结果记录在验证目录。
+- `make test-root-io`：14 passed / 1 failed。唯一失败是已有
+  `test_build_artifact_round_trips_a_synthetic_three_table_run`，混合 jagged RNTuple 不能由
+  material_artifact 的 `library="np"` 转换；本轮未修改该生产模块。
+- 新增三臂合成 ROOT→seed/refit→target P→bootstrap/图像/耗时报告端到端测试通过（19.30 s），
+  并验证 PNG 可读。产物仅是四事件工程 fixture，不是 Fatras 物理实验结果。
+- 实际 ACTS smoke 启动在 source setup_acts.sh 时 exit 1：LCG 路径未挂载。
+  正式 RUN/runtime_preflight 保留 failed manifest、startup.log 与实际环境加载时间；
+  模拟、重建、seed、refit 真实耗时均为空，不填估计值。
+- 测试日志与合成证据保存在 `data/experiments/material-implementation-20261014/`。
+  正式预注册与状态报告保存在配置派生的 helix_truth/<target-dir>/material-helix-20261014-r1/。
+  三个物理问题目前均不可判定，须环境恢复后完成三组真实运行。
+
+### 环境恢复后重启（2026-10-14；r2）
+
+用户手动挂载 CVMFS 后 ACTS 导入成功。r1 没有执行真实模拟，保持其 failed manifest 不变；
+硬编码 RUN 改为 material-helix-20261014-r2，物理配置和预注册统计协议不变。
+先运行 r2-smoke：三组各 64 事件模拟、nominal 重建及 helix 验证均完成，所有最终 refit 驻点、
+求交和 target 预算有效；粒子初态配对通过。接下来运行每组 20000 事件的正式三臂实验。
+
+### 使用优化代码重算 helix（2026-10-14；用户授权覆盖中断输出）
+
+前次全量验证在第 1 组保存 13440/19946 条径迹后按用户要求中断，第 2/3 组尚未开始。
+此次重复实验的变化是 `b9f33df` 优化了 `helix_model.py` 与 `ml_alignment_autograd.py`
+的 Jacobian、活动行计算和残差复用；物理输入、筛选、拟合上限及评分协议不变。
+用户明确要求直接覆盖 r2 被中断的 helix 结果，因此沿用该输出目录从头重算三组，
+不混用优化前的部分 CSV。模拟/重建输入保持只读；先运行当前代码回归及独立三组 smoke。
+当前代码、预检、旧 manifest 与覆盖授权分别记录在 `optimized_preflight/`、
+`optimized_restart.json` 和新 manifest 中，正式数值与时间以完成后的报告为准。
+
+### 按 10a9266 重跑三组全量 helix（2026-10-15）
+
+`b9f33df` 的三组验证、比较与核验已完整结束，原结果保持不变。
+用户指定 `10a9266`：seed Jacobian 现在对 closest-point 路径同时求导，纳入 ds/dtheta；
+这修正了此前近似 JᵀJ 沿切线方向偏大的问题，可能改变最终数值与驻点诊断，因此
+本轮对三组完整队列重新 seed/refit/求交和评分，不复用旧 helix 参数或 CSV。
+复用 r2 同一批模拟和 nominal 重建，物理配置、筛选、迭代上限、CPU float64、6 线程及
+统计协议保持不变。输出保存到配置派生的 helix_truth/<target-dir>/
+`material-helix-20261015-10a9266/`，先执行当前代码 `make ci`、相关 ROOT I/O 和三组 smoke。
+`source_pin.json` 将请求提交与源码字节绑定；正式组之间及比较前检查源码未变，
+manifest、状态、分阶段耗时和最终比较分别保存在新目录，不覆盖已完成的 b9f33df 结果。
+
+## Iteration 48 — pT=100 GeV 材料开：ACTS-Alignment 与 Schur-LM 受控对照（2026-10-15）
+
+**这次改了什么假设。** 图二的三方对照用的是 10 万事件、pT 1–100 GeV 的旧样本，而且 ACTS 校准没有任何配置和耗时记录。这一轮换成 material study 的 g3 样本（`material-helix-20261014-r2/g3_pt100_material_on`：20000 事件，pT 固定 100 GeV，Fatras 材料开，seed 42）。用一次带 seed 的误校准抽样（`PT100_MISALIGNMENT_SEED=20261015`，每个 sensor 的 local tx/ty 取 ±[0.25,0.75] mm、rz 取 ±[0.01,0.03] rad，即 `runAlignment` 的原默认值）让两种方法共用，误校准文件 SHA-256 为 `3c5ad160…`，并按资源对等的口径计时。
+
+**入口。** 常量和路径在 `scripts/pt100_alignment_layout.py`。
+- ACTS 侧：`alignment_odd.py pt100-alignment {acts-alignment,misaligned,aligned-acts,aligned-schur}`。
+- Schur 侧：`scripts/analysis/run_pt100_schur_calibration.py --threads {1,default}`，调用生产 free pipeline，参数取编排器 joint_free 阶段的值，并对各阶段分段计时。
+- 汇总：`scripts/analysis/compare_pt100_alignment.py`，原样复用 compare_geometries / plot_chi2ndf / plot_residuals。
+- 事后诊断：`scripts/analysis/pt100_sensor_tail.py`。
+- 输出目录：`data/experiments/pt100_alignment/Vol17_Lay8__Vol24_Lay4/pt100-align-20261015/`。
+
+**计时口径。** ACTS `AlignmentAlgorithm::execute` 收集径迹时没有加锁，所以 Sequencer 只能单线程；`finalize` 中的迭代也是串行的。因此主口径是 Schur 也单线程（`torch.set_num_threads(1)` 加 BLAS 环境变量设为 1，代码中断言）。多线程结果只作副口径。
+
+**ACTS 的开销结构。** alignmentDof 等于 2268×6=13608，与 mask 无关。每次迭代都要做一次稠密 `.inverse()` 和一次 `fullPivLu()`，内存约 6 GB。
+- 64 条径迹的冒烟中，一次迭代 12.8 min。
+- 20000 条径迹的正式运行中，一次迭代约 30 min，共 9 次。χ²/ndf 依次为 48.64、0.799、0.465，从 iIter=3 起恒为 0.464747，但收敛判据要求 5 次迭代内变化 ≤1e-4，所以又多跑了 5 次。
+- 第一次冒烟和 `make test` 同时运行，触发宿主 OOM，被 SIGKILL，manifest 已补记为 failed。
+
+| 校准时间（同一份误校准） | 墙钟 s | CPU s | 备注 |
+|---|---|---|---|
+| ACTS-Alignment，单线程 | 16176 | 16161 | event loop 23 s；finalize 16142 s；9 次迭代，converged |
+| Schur-LM，单线程（主口径） | 544 | 543 | load 17、selection 4、seed 12、refit 25、solve 481；7 次外迭代 |
+| misaligned KF 重建（只有 Schur 需要） | 44 | 30 | 加上后 Schur 端到端 588 s |
+| Schur-LM，3 线程（副口径） | 319 | 903 | 导出几何与单线程逐位相同（2268 个面最大差 0.0） |
+
+| 几何残差 RMS | 注入 | Schur-LM | ACTS |
+|---|---|---|---|
+| 17:8 tx / ty（μm） | 518 / 522 | 6.83 / 8.21 | 25.91 / 16.89 |
+| 17:8 rz（mrad） | 20.5 | 0.466 | 3.093 |
+| 24:4 tx / ty（μm） | 522 / 517 | 31.2 / 377.1 | 40.0 / 378.7 |
+| 24:4 rz（mrad） | 20.5 | 1.19 | 1.60 |
+
+**RMS 差距是尾部 sensor 的假象（事后诊断，未预注册）。** 每个 sensor 的 target hit 中位数只有 12–13 个，最少只有 1 个。
+- 只在 hit 数 >6 的 sensor 上算（17:8 保留 960/1092，24:4 保留 1026/1176），两种方法的 RMS 逐格一致：17:8 tx 5.46/5.46、ty 7.22/7.22、rz 0.27/0.27；24:4 tx 14.35/14.41、ty 342/344、rz 0.49/0.49。
+- 中位数相同，Schur 更好的 sensor 占 0.48–0.51。
+- ACTS 的最大偏差出在 1 个 hit 的 sensor 上（17:8 sen 524 为 684 μm，Schur 为 54 μm）。这类 sensor 约束不足，两者给出的值都没有意义；Schur 的 `rank_deficient`（缩放后最小本征值约 −1e-15，零空间梯度约 1e-19）指的应该就是它们。
+
+**重建指标两者几乎相同。** 两者都是 20000 条径迹、同一批 hit，完全受控。
+- χ²/ndf 的 mean：nominal 176.944、misaligned 236.369、Schur 176.934、ACTS 176.932。std 均为 1143.28。
+- measurement−truth（图二口径，μm）：17:8 LOC0 14.32 / 14.29，LOC1 15.41 / 15.41；24:4 LOC0 39.34 / 39.31，LOC1 1126.6 / 1126.3。
+
+**结论。**
+- 在这份样本上，两种方法的精度等价：剔除约束不足的 sensor 后无差别，重建层面差异 ≤0.1%。
+- 单线程资源对等时，Schur 端到端 588 s，ACTS 16176 s，约 27 倍。差距主要来自 ACTS 示例实现里每次迭代的 O((6N)³) 稠密求解，以及必须多跑的 5 次确认迭代，不代表 KF 型对齐方法本身的极限。
+- 局限：20k 事件、一次误校准抽样；样本量是图二的 1/5，不能与图二逐格比较。径迹数：粒子枪每个事件只生成 1 个 μ（`num=1`、`multiplicity=1`，模拟中没有次级粒子），所以 20000 事件对应 20000 条径迹。ACTS 的 truth proto track 经 pT>2 GeV、≥5 个测量的选择后 20000 条全部保留（每个事件的测量数最少 6、中位 13）。Schur 的选择条件（`build_track_batches`）剔除了 7544 条：其中 7496 条在 17:8 和 24:4 上都没有测量，对 target 对齐不提供信息，在 ACTS 中对齐导数也为 0；另外 48 条有 target hit，但非 target 的 hit 不足 8 个。所以两者实际有效信息只差这 48 条（约 0.4%）。helix 模型没有多重散射项。24:4 ty 处于 strip LOC1 的信息下限。WSL2 上单次计时，没有重复测量。

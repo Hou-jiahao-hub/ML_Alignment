@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="520" viewBox="0 0 1600 520">
+<defs><marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8 Z" fill="#53616D"/></marker><marker id="arrowmute" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8 Z" fill="#C6D0D5"/></marker><marker id="arrowink" markerWidth="11" markerHeight="9" refX="10" refY="4.5" orient="auto"><path d="M0 0 L11 4.5 L0 9 Z" fill="#23343D"/></marker></defs>
+<rect width="100%" height="100%" fill="white"/>
+<text x="45" y="85.0" font-family="Droid Sans Fallback, sans-serif" font-size="24" font-weight="400" text-anchor="start" fill="#23343D">固定径迹 helix</text>
+<text x="45" y="119.8" font-family="Droid Sans Fallback, sans-serif" font-size="24" font-weight="400" text-anchor="start" fill="#23343D">（已通过驻点验收）</text>
+<text x="45" y="300.0" font-family="Droid Sans Fallback, sans-serif" font-size="24" font-weight="400" text-anchor="start" fill="#23343D">目标层局部测量</text>
+<text x="45" y="334.8" font-family="Droid Sans Fallback, sans-serif" font-size="24" font-weight="400" text-anchor="start" fill="#23343D">及测量方差</text>
+<path d="M272 98 C322 110 330 152 306 186" fill="none" stroke="#23343D" stroke-width="3.2" stroke-linecap="round" marker-end="url(#arrowink)"/>
+<path d="M222 306 C268 300 288 272 306 244" fill="none" stroke="#23343D" stroke-width="3.2" stroke-linecap="round" marker-end="url(#arrowink)"/>
+<text x="430" y="210.0" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#23343D">逐 target sensor</text>
+<text x="430" y="247.7" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#23343D">helix 与该面求交</text>
+<text x="760" y="60.0" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#23343D">转换为局部坐标系</text>
+<text x="760" y="97.69999999999999" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#23343D">得到 LOC0／LOC1 预测</text>
+<text x="1090" y="60.0" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#23343D">构造按方差</text>
+<text x="1090" y="97.69999999999999" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#23343D">标准化的残差</text>
+<text x="1150" y="210.0" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#23343D">阻尼 LM</text>
+<text x="1150" y="247.7" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#23343D">调整该面对齐增量 δ</text>
+<text x="1440" y="210.0" font-family="Droid Sans Fallback, sans-serif" font-size="26" font-weight="400" text-anchor="middle" fill="#23343D">驻点与终态检查</text>
+<text x="1440" y="310.0" font-family="Droid Sans Fallback, sans-serif" font-size="24" font-weight="400" text-anchor="middle" fill="#23343D">输出逐 sensor</text>
+<text x="1440" y="344.8" font-family="Droid Sans Fallback, sans-serif" font-size="24" font-weight="400" text-anchor="middle" fill="#23343D">对齐增量 δ</text>
+<path d="M442 178 C512 172 540 126 588 106" fill="none" stroke="#23343D" stroke-width="3.2" stroke-linecap="round" marker-end="url(#arrowink)"/>
+<path d="M948 78 C972 66 988 62 1004 62" fill="none" stroke="#23343D" stroke-width="3.2" stroke-linecap="round" marker-end="url(#arrowink)"/>
+<path d="M1128 112 C1146 146 1148 164 1150 178" fill="none" stroke="#23343D" stroke-width="3.2" stroke-linecap="round" marker-end="url(#arrowink)"/>
+<path d="M1282 210 L1336 210" fill="none" stroke="#23343D" stroke-width="3.2" stroke-linecap="round" marker-end="url(#arrowink)"/>
+<path d="M1440 232 L1440 282" fill="none" stroke="#23343D" stroke-width="3.2" stroke-linecap="round" marker-end="url(#arrowink)"/>
+<path d="M1150 262 C1122 348 902 358 790 358 C654 358 462 352 434 270" fill="none" stroke="#23343D" stroke-width="3.2" stroke-linecap="round" marker-end="url(#arrowink)"/>
+<text x="790" y="396.0" font-family="Droid Sans Fallback, sans-serif" font-size="23" font-weight="400" text-anchor="middle" fill="#23343D">按 δ 移动测量面 → 重求交 → 在固定分量集上评分</text>
+<text x="790" y="428.0" font-family="Droid Sans Fallback, sans-serif" font-size="21" font-weight="400" text-anchor="middle" fill="#53616D">接受：μ×0.5；拒绝：μ×10 重试，同一 Jacobian 复用</text>
+<text x="1580" y="372.0" font-family="Droid Sans Fallback, sans-serif" font-size="18" font-weight="400" text-anchor="end" fill="#53616D">终态：converged ／ rank_deficient</text>
+<text x="1580" y="398.1" font-family="Droid Sans Fallback, sans-serif" font-size="18" font-weight="400" text-anchor="end" fill="#53616D">budget_exhausted ／ intersection_failed</text>
+<text x="45" y="470.0" font-family="Droid Sans Fallback, sans-serif" font-size="22" font-weight="400" text-anchor="start" fill="#23343D">· 拟合过程中径迹固定，仅更新各 target sensor 的对齐增量；block 之间精确解耦。</text>
+<text x="45" y="502.0" font-family="Droid Sans Fallback, sans-serif" font-size="22" font-weight="400" text-anchor="start" fill="#23343D">· 迭代停止不等于收敛：converged 需通过独立的自由集驻点判据。</text></svg>
