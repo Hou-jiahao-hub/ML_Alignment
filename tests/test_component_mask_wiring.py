@@ -71,6 +71,7 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
     wiring rather than from a coincidental substring in the output.
     """
     m = load_module()
+    pipeline = importlib.import_module("mlalign.free_helix_pipeline")
 
     n_tracks, n_hits = 1, 2
     batches = m.TrackBatches(
@@ -108,7 +109,7 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
     }
 
     monkeypatch.setattr(m.os.path, "exists", lambda _p: True)
-    monkeypatch.setattr(m, "load_joint_geometry", lambda *_a, **_k: geometry)
+    monkeypatch.setattr(pipeline, "load_joint_geometry", lambda *_a, **_k: geometry)
     # Arguments are evaluated before the stubbed callee runs, so the fake inputs
     # object still needs the attributes the call sites read.
     inputs_stub = SimpleNamespace(
@@ -117,12 +118,12 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
         hit_layer_ids=torch.full((n_hits,), 6, dtype=torch.long),
         loc1_valid=torch.ones(n_hits, dtype=torch.bool),
     )
-    monkeypatch.setattr(m, "load_variable_information", lambda *_a, **_k: inputs_stub)
-    monkeypatch.setattr(m, "print_target_residual_stats", lambda *_a, **_k: None)
-    monkeypatch.setattr(m, "build_track_batches", lambda *_a, **_k: batches)
+    monkeypatch.setattr(pipeline, "load_variable_information", lambda *_a, **_k: inputs_stub)
+    monkeypatch.setattr(pipeline, "print_target_residual_stats", lambda *_a, **_k: None)
+    monkeypatch.setattr(pipeline, "build_track_batches", lambda *_a, **_k: batches)
     seeded = torch.zeros((n_tracks, 6), dtype=torch.float64)
     monkeypatch.setattr(
-        m,
+        pipeline,
         "seed_helices",
         lambda *_a, **_k: (
             seeded,
@@ -142,12 +143,12 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
         ),
     )
     monkeypatch.setattr(
-        m,
+        pipeline,
         "smt_seed_statistics",
         lambda *_a, **_k: {"loss": 0.0, "n_points": 2, "invalid_fraction": 0.0},
     )
     monkeypatch.setattr(
-        m,
+        pipeline,
         "fit_helices_to_measurements",
         lambda *_a, **_k: (
             seeded,
@@ -160,7 +161,7 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
         ),
     )
     monkeypatch.setattr(
-        m,
+        pipeline,
         "_joint_forward",
         lambda *_a, **_k: (
             torch.zeros((n_tracks, n_hits, 2)),
@@ -169,13 +170,13 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
             torch.ones((n_tracks, n_hits), dtype=torch.bool),
         ),
     )
-    monkeypatch.setattr(m, "summarize_joint_layer_chi2", lambda *_a, **_k: {})
+    monkeypatch.setattr(pipeline, "summarize_joint_layer_chi2", lambda *_a, **_k: {})
     monkeypatch.setattr(
-        m, "select_joint_solver", lambda _config: lambda *_a, **_k: joint_result
+        pipeline, "select_joint_solver", lambda _config: lambda *_a, **_k: joint_result
     )
-    monkeypatch.setattr(m, "validate_against_truth", lambda *_a, **_k: {})
-    monkeypatch.setattr(m, "export_joint_geometry", lambda *_a, **_k: None)
-    monkeypatch.setattr(m, "print_per_layer_residual_diagnostics", lambda *_a, **_k: {})
+    monkeypatch.setattr(pipeline, "validate_against_truth", lambda *_a, **_k: {})
+    monkeypatch.setattr(pipeline, "export_joint_geometry", lambda *_a, **_k: None)
+    monkeypatch.setattr(pipeline, "print_per_layer_residual_diagnostics", lambda *_a, **_k: {})
 
     calls = []
 
@@ -185,7 +186,7 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
         # Sentinel counts: 17/23 cannot arise from this 1x2 fixture.
         return keep, (initial_component_mask & final_component_mask)[keep], 17, 23
 
-    monkeypatch.setattr(m, "combine_component_masks", recorder)
+    monkeypatch.setattr(pipeline, "combine_component_masks", recorder)
 
     config = m.AlignmentRunConfig(
         track_mode="free",
@@ -193,7 +194,7 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
         make_plot=False,
         target_layers=((16, 6),),
     )
-    m.run_free_alignment_pipeline(config, ((16, 6),), (0, 1, 5))
+    pipeline.run_free_alignment_pipeline(config, ((16, 6),), (0, 1, 5))
 
     assert len(calls) == 1, "combine_component_masks was not called exactly once"
     output = capsys.readouterr().out

@@ -337,7 +337,7 @@ def test_block_lm_stays_the_default_solver():
 
 
 def test_schur_lm_summary_is_retained_in_the_run_summary():
-    source = inspect.getsource(M)
+    source = inspect.getsource(M.write_alignment_summary)
     assert '"schur_lm_summary"' in source
 
 

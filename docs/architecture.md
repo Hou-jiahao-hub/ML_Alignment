@@ -22,8 +22,15 @@ simulation -> ROOT/geometry JSON -> loaders -> solver -> aligned geometry
 | `alignment_artifact_layout.py` | Compatibility API for paths and target-layer naming | None |
 | `project_config.py` | Typed TOML configuration and validation | None |
 | `ml_alignment.py` | Analytic-Jacobian surface solver | AlignDerivLib only |
-| `ml_alignment_autograd.py` | Production autograd surface solver, helix initialization, measurement refit and block-LM geometry solver | None |
-| `helix_model.py` | Production six-parameter helix, intersections, point seed and independent single-helix measurement Gauss–Newton fit | None |
+| `ml_alignment_autograd.py` | CLI and import facade of the production solvers below; re-exports every historical name | None |
+| `mlalign/stage_surface.py` | Stage A: surface mode, Adam on target surfaces against frozen KF-smoothed tracks | None |
+| `mlalign/stage_ntr_helix.py`, `mlalign/block_lm_contract.py` | Stage B (NTR-helix): fixed-track block-LM geometry solver and its pre-registered convergence contract | None |
+| `joint_alignment_schur.py` | Stage C: joint track-geometry Schur-reduced LM (`schur-lm`) | None |
+| `mlalign/free_helix_pipeline.py` | Free-mode orchestration shared by stages B and C: initialization, solver selection, reporting | None |
+| `mlalign/helix_init.py` | Non-target SMT point seed and measurement Gauss–Newton refit | None |
+| `mlalign/{conventions,rotations,geometry_io,root_inputs,track_batches,joint_residuals,box_constraints,run_config,reporting}.py` | Shared layer: DOF/target-layer parsing, Euler rotations, geometry JSON, ROOT loading, per-track batches, helix-to-surface residuals, box bounds, run configuration, JSON summary | None |
+| `helix_model.py` | Import facade over `mlalign/helix/` | None |
+| `mlalign/helix/` | Production six-parameter helix (`trajectory`, `gauge`), shared row-wise LM (`gauss_newton`), point seed (`point_fit`) and single-helix measurement Gauss–Newton fit (`measurement_fit`) | None |
 | `broken_helix_model.py` | Experimental material nodes, Highland prior and broken-helix segments | None |
 | `alignment_diagnostics.py` | Residual reporting and optional truth-geometry comparison | None |
 | `ml_alignment_helix.py` | Frozen-helix holdout alignment | None |
@@ -63,6 +70,22 @@ The profile's event identity hashes the event IDs actually present in the
 nominal `trackstates`; it cannot represent generated events absent from that
 file. The pinned profile SHA256 protects the exact profile bytes, while the
 experiment manifest's input SHA256 records the ROOT inputs themselves.
+
+### Module layering
+
+`mlalign` imports in one direction only, so no stage module imports a facade:
+
+```text
+conventions, rotations, helix/{trajectory,gauge,gauss_newton}
+  -> helix/{measurement_fit,point_fit}, geometry_io, root_inputs, track_batches, box_constraints
+  -> joint_residuals, helix_init
+  -> stage_surface, block_lm_contract -> stage_ntr_helix, joint_alignment_schur
+  -> free_helix_pipeline (loads joint_alignment_schur lazily), run_config, reporting
+  -> ml_alignment_autograd, helix_model (facades)
+```
+
+A test that monkeypatches a solver dependency must patch the `mlalign` module that
+calls it; patching the facade only rebinds the re-exported name.
 
 ## Configuration flow
 

@@ -316,8 +316,9 @@ def test_autograd_residual_gradient_includes_tz_path_correction():
     )
 
 
-def test_autograd_pipeline_does_not_import_align_derivlib(monkeypatch):
+def test_autograd_pipeline_does_not_import_align_derivlib(monkeypatch, tmp_path):
     ml_alignment = load_ml_alignment_autograd_module()
+    surface = importlib.import_module("mlalign.stage_surface")
     observed_measurements = []
     original_compute_residuals = ml_alignment.compute_autograd_residuals
 
@@ -325,13 +326,13 @@ def test_autograd_pipeline_does_not_import_align_derivlib(monkeypatch):
         observed_measurements.append(measured_local.detach().clone())
         return original_compute_residuals(measured_local, *args, **kwargs)
 
-    monkeypatch.setattr(ml_alignment, "compute_autograd_residuals", record_measurements)
+    monkeypatch.setattr(surface, "compute_autograd_residuals", record_measurements)
 
     assert not hasattr(ml_alignment, "compute_jacobians_from_alignderivlib")
 
     monkeypatch.setattr(ml_alignment.os.path, "exists", lambda _path: True)
     monkeypatch.setattr(
-        ml_alignment,
+        surface,
         "load_geometry_from_json",
         lambda _path: (
             [
@@ -348,7 +349,7 @@ def test_autograd_pipeline_does_not_import_align_derivlib(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        ml_alignment,
+        surface,
         "load_variable_information",
         lambda *_args, **_kwargs: ml_alignment.AlignmentInputs(
             hit_sensor_ids=torch.tensor([0], dtype=torch.long),
@@ -370,12 +371,12 @@ def test_autograd_pipeline_does_not_import_align_derivlib(monkeypatch):
     )
     expected_truth_metrics = {"sentinel": 1.0}
     monkeypatch.setattr(
-        ml_alignment,
+        surface,
         "validate_against_truth",
         lambda *_args: expected_truth_metrics,
     )
     monkeypatch.setattr(
-        ml_alignment, "update_geometry_to_json", lambda *_args, **_kwargs: None
+        surface, "update_geometry_to_json", lambda *_args, **_kwargs: None
     )
 
     result = ml_alignment.run_alignment_pipeline(
@@ -383,6 +384,7 @@ def test_autograd_pipeline_does_not_import_align_derivlib(monkeypatch):
             epochs=1,
             make_plot=False,
             target_layers=((17, 8),),
+            output_geom=str(tmp_path / "aligned.json"),
         )
     )
 
@@ -688,7 +690,11 @@ def test_joint_refit_rejects_a_truncated_gauss_newton_solution(monkeypatch):
     def truncated_solver(*args, **kwargs):
         return full_solver(*args, **{**kwargs, "max_iters": 1})
 
-    monkeypatch.setattr(m, "fit_helix_measurements_gauss_newton", truncated_solver)
+    monkeypatch.setattr(
+        importlib.import_module("mlalign.helix_init"),
+        "fit_helix_measurements_gauss_newton",
+        truncated_solver,
+    )
     with pytest.raises(ValueError, match="pre-registered stationary point"):
         m.fit_helices_to_measurements(batches, geometry, seed)
 
@@ -711,7 +717,11 @@ def test_gauss_newton_refit_stationarity_reuses_the_identical_gate_report(
         measured_rows.append(parameters)
         return original(batches_, geometry_, parameters, **kwargs)
 
-    monkeypatch.setattr(m, "measure_joint_refit_stationarity", counted)
+    monkeypatch.setattr(
+        importlib.import_module("mlalign.helix_init"),
+        "measure_joint_refit_stationarity",
+        counted,
+    )
     fitted, stats = m.fit_helices_to_measurements(
         batches, geometry, seed, stationarity=True
     )
@@ -1037,7 +1047,9 @@ def test_block_lm_retries_with_more_damping_after_a_rejection(monkeypatch):
         value = genuine(residuals, covariance, fixed_mask)
         return value * 1e6 if calls["n"] == 1 else value
 
-    monkeypatch.setattr(m, "_block_lm_fixed_chi2", inflated)
+    monkeypatch.setattr(
+        importlib.import_module("mlalign.stage_ntr_helix"), "_block_lm_fixed_chi2", inflated
+    )
     config = m.AlignmentRunConfig(
         track_mode="free", joint_solver="block-lm", lm_max_iters=8,
         lambda_l2=0.0, make_plot=False,
@@ -1076,7 +1088,11 @@ def test_block_lm_retry_ladder_reaches_the_preregistered_absolute_scale(monkeypa
         value = genuine(residuals, covariance, fixed_mask)
         return value * 1e6 if calls["n"] <= 8 else value
 
-    monkeypatch.setattr(m, "_block_lm_fixed_chi2", reject_first_eight)
+    monkeypatch.setattr(
+        importlib.import_module("mlalign.stage_ntr_helix"),
+        "_block_lm_fixed_chi2",
+        reject_first_eight,
+    )
     config = m.AlignmentRunConfig(
         track_mode="free",
         joint_solver="block-lm",
@@ -1189,7 +1205,9 @@ def test_block_lm_refuses_a_candidate_that_buys_its_improvement_by_losing_a_hit(
             valid[3] = False
         return path, intersections, valid
 
-    monkeypatch.setattr(m, "intersect_plane", failing)
+    monkeypatch.setattr(
+        importlib.import_module("mlalign.joint_residuals"), "intersect_plane", failing
+    )
     config = m.AlignmentRunConfig(
         track_mode="free", joint_solver="block-lm", lm_max_iters=4,
         lambda_l2=0.0, make_plot=False,
@@ -1284,7 +1302,11 @@ def test_block_lm_reports_hits_with_no_valid_intersection_as_intersection_failed
             valid = torch.zeros_like(valid)
         return path, intersections, valid
 
-    monkeypatch.setattr(m, "intersect_plane", fail_one_sensor)
+    monkeypatch.setattr(
+        importlib.import_module("mlalign.joint_residuals"),
+        "intersect_plane",
+        fail_one_sensor,
+    )
     config = m.AlignmentRunConfig(
         track_mode="free",
         joint_solver="block-lm",

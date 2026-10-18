@@ -45,22 +45,24 @@ from scipy.sparse import csc_matrix, csr_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import splu
 
-from helix_model import (
-    MeasurementFitInputs,
-    _measurement_standardized_residual_tensors,
-    measurement_local_prediction,
+from mlalign.box_constraints import (
+    BLOCK_LM_BOUND_ATOL,
+    JOINT_CLAMP_R,
+    JOINT_CLAMP_T,
+    _block_lm_free_dof_mask,
+)
+from mlalign.conventions import DEFAULT_ACTIVE_DOF
+from mlalign.helix.gauge import (
     pack_gauge_fixed_track_parameters,
     reference_gauge_frame,
     unpack_gauge_fixed_track_parameters,
 )
-from ml_alignment_autograd import (
-    BLOCK_LM_BOUND_ATOL,
-    DEFAULT_ACTIVE_DOF,
-    JOINT_CLAMP_R,
-    JOINT_CLAMP_T,
-    _block_lm_free_dof_mask,
-    apply_alignment_torch,
+from mlalign.helix.measurement_fit import (
+    MeasurementFitInputs,
+    _measurement_standardized_residual_tensors,
+    measurement_local_prediction,
 )
+from mlalign.rotations import apply_alignment_torch
 
 #: Units of the dimensionless geometry increment, identical to block-LM's
 #: ``physical_scales``: mm for translations, 10 mrad for rotations.
@@ -1483,7 +1485,8 @@ def run_schur_lm_alignment(
     there is no per-DOF step clipping.  ``history`` is the target chi2 per
     frozen target component after each accepted step.
     """
-    from ml_alignment_autograd import _target_alignment_evaluation, seed_helices
+    from mlalign.helix_init import seed_helices
+    from mlalign.joint_residuals import _target_alignment_evaluation
 
     active_dof = tuple(int(dof) for dof in active_dof)
     if initial_track_params is None:

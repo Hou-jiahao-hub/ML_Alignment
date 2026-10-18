@@ -104,6 +104,7 @@ def main(argv=None):
         torch.set_num_threads(1)
         torch.set_num_interop_threads(1)
     import ml_alignment_autograd as M
+    import mlalign.free_helix_pipeline as pipeline
     import pt100_alignment_layout as pt100
     from alignment_artifact_layout import TARGET_LAYER_DIR, artifact_filename
     from experiment_manifest import finalize_experiment_manifest, write_experiment_manifest
@@ -143,10 +144,12 @@ def main(argv=None):
 
     timer = StageTimer(time.perf_counter, time.process_time)
     captured: dict = {}
+    # Wrap the names where run_free_alignment_pipeline looks them up; rebinding
+    # them on the M facade would not reach the pipeline.
     for stage, attribute in TIMED_STAGES.items():
-        setattr(M, attribute, timer.wrap(stage, getattr(M, attribute)))
-    select_solver = M.select_joint_solver
-    M.select_joint_solver = lambda cfg: timer.wrap("schur_solve", select_solver(cfg), captured)
+        setattr(pipeline, attribute, timer.wrap(stage, getattr(pipeline, attribute)))
+    select_solver = pipeline.select_joint_solver
+    pipeline.select_joint_solver = lambda cfg: timer.wrap("schur_solve", select_solver(cfg), captured)
 
     status, error, result = "failed", None, None
     wall, cpu = time.perf_counter(), time.process_time()

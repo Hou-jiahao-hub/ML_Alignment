@@ -53,10 +53,11 @@ Git commit. An experiment is not complete until its manifest has been written.
 
 - Only ACTS adapter scripts (`alignment_odd.py`, `generate_odd_transform.py`) may
   import `acts`.
-- `ml_alignment*.py`, validation, plotting, configuration, and manifest code
-  must remain importable without ACTS.
-- Keep existing script CLIs compatible during the baseline phase. Large-module
-  package refactoring is a separate project.
+- `ml_alignment*.py`, `mlalign/`, validation, plotting, configuration, and
+  manifest code must remain importable without ACTS.
+- New solver code goes into the `mlalign` module that owns it (see the layering
+  in `docs/architecture.md`); `ml_alignment_autograd.py` and `helix_model.py`
+  are facades that only re-export and parse the CLI.
 
 ## Verification
 

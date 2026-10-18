@@ -24,11 +24,15 @@ def load_module():
 SENTINEL_ROOT_RESIDUAL = [[999.0, 0.0]]
 
 
+def stage_surface():
+    return importlib.import_module("mlalign.stage_surface")
+
+
 def _install_surface_fixture(m, monkeypatch):
     """Single sensor, identity geometry, one 1-D hit."""
     monkeypatch.setattr(m.os.path, "exists", lambda _p: True)
     monkeypatch.setattr(
-        m,
+        stage_surface(),
         "load_geometry_from_json",
         lambda _p: (
             [{
@@ -43,7 +47,7 @@ def _install_surface_fixture(m, monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        m,
+        stage_surface(),
         "load_variable_information",
         lambda *_a, **_k: m.AlignmentInputs(
             hit_sensor_ids=torch.tensor([0], dtype=torch.long),
@@ -65,8 +69,8 @@ def _install_surface_fixture(m, monkeypatch):
             loc1_valid=torch.tensor([False]),
         ),
     )
-    monkeypatch.setattr(m, "validate_against_truth", lambda *_a, **_k: {})
-    monkeypatch.setattr(m, "update_geometry_to_json", lambda *_a, **_k: None)
+    monkeypatch.setattr(stage_surface(), "validate_against_truth", lambda *_a, **_k: {})
+    monkeypatch.setattr(stage_surface(), "update_geometry_to_json", lambda *_a, **_k: None)
 
 
 def test_surface_diagnostics_baseline_uses_zero_delta_projection(monkeypatch):
@@ -80,7 +84,7 @@ def test_surface_diagnostics_baseline_uses_zero_delta_projection(monkeypatch):
         captured["component_mask"] = kwargs.get("component_mask")
         return {(16, 6): {}}
 
-    monkeypatch.setattr(m, "print_per_layer_residual_diagnostics", recorder)
+    monkeypatch.setattr(stage_surface(), "print_per_layer_residual_diagnostics", recorder)
 
     m.run_alignment_pipeline(
         m.AlignmentRunConfig(epochs=1, make_plot=False, target_layers=((16, 6),))
@@ -114,7 +118,7 @@ def test_surface_diagnostics_receives_component_mask(monkeypatch):
         captured["component_mask"] = kwargs.get("component_mask")
         return {(16, 6): {}}
 
-    monkeypatch.setattr(m, "print_per_layer_residual_diagnostics", recorder)
+    monkeypatch.setattr(stage_surface(), "print_per_layer_residual_diagnostics", recorder)
 
     m.run_alignment_pipeline(
         m.AlignmentRunConfig(epochs=1, make_plot=False, target_layers=((16, 6),))
@@ -132,7 +136,7 @@ def test_surface_target_metrics_come_from_the_diagnostics_function(monkeypatch):
 
     sentinel = {(16, 6): {"n_hits": 4242, "mean_after_loc0": -1.5}}
     monkeypatch.setattr(
-        m, "print_per_layer_residual_diagnostics", lambda *_a, **_k: sentinel
+        stage_surface(), "print_per_layer_residual_diagnostics", lambda *_a, **_k: sentinel
     )
 
     result = m.run_alignment_pipeline(

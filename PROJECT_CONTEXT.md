@@ -144,9 +144,10 @@ ACTS simulation / reconstruction
 
 | 定义文件 | 优先理解的对象 |
 |---|---|
-| `scripts/ml_alignment_autograd.py` | `AlignmentRunConfig`：运行参数；`AlignmentInputs`：逐 hit 输入；`TrackBatches`：按径迹 padding 后输入；`JointGeometry`：全几何及目标映射；`AlignmentEngine`：surface 参数模型 |
-| 同上 | `run_alignment_pipeline()` 分派 surface/free；`run_block_lm_alignment()` 是当前几何主求解器；`_sensor_residual_data()` 做 sensor hit 选择、求交和局部残差；`_block_lm_linearized_block()` 形成正规方程 |
-| `scripts/helix_model.py` | `MeasurementFitInputs`、`helix_point()`、`intersect_plane()`、`closest_helix_points()`、`damped_gauss_newton()`、两种 `fit_helix_*_gauss_newton()`、`measurement_stationarity_report()` |
+| `scripts/ml_alignment_autograd.py` | CLI 与兼容 facade：`run_alignment_pipeline()` 分派 surface/free，旧符号全部 re-export；实现都在 `scripts/mlalign/` |
+| `scripts/mlalign/run_config.py`、`root_inputs.py`、`track_batches.py`、`geometry_io.py`、`stage_surface.py` | `AlignmentRunConfig`：运行参数；`AlignmentInputs`：逐 hit 输入；`TrackBatches`：按径迹 padding 后输入；`JointGeometry`：全几何及目标映射；`AlignmentEngine`：surface 参数模型 |
+| `scripts/mlalign/stage_ntr_helix.py`、`joint_residuals.py`、`free_helix_pipeline.py` | `run_free_alignment_pipeline()` 编排 free 模式；`run_block_lm_alignment()` 是当前几何主求解器；`_sensor_residual_data()` 做 sensor hit 选择、求交和局部残差；`_block_lm_linearized_block()` 形成正规方程 |
+| `scripts/mlalign/helix/`（facade：`scripts/helix_model.py`） | `MeasurementFitInputs`、`helix_point()`、`intersect_plane()`、`closest_helix_points()`、`damped_gauss_newton()`、两种 `fit_helix_*_gauss_newton()`、`measurement_stationarity_report()` |
 | `scripts/ml_alignment.py` | `compute_jacobians_from_alignderivlib()`、`physics_informed_loss()`、`run_alignment_pipeline()`；这里也有同名配置/输入类，勿与 autograd 版本混淆 |
 | `scripts/validate_helix_model.py` | `HelixValidationConfig`、`run_helix_validation()`、`run_paired_holdout()`、`predictive_covariance()`、`evaluate_broken_helix_gate()` |
 | `scripts/reconstruction_acceptance.py` | `build_acceptance_baseline()`、`compute_reconstruction_acceptance()`、`acceptance_score()`、`polish_improves()` |
