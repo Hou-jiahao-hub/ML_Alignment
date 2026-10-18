@@ -33,9 +33,7 @@ EXPECTED_TARGET_LAYERS="17:8,24:4"
 TARGET_LAYERS="$EXPECTED_TARGET_LAYERS"
 ACTIVE_DOF="$ACTIVE_DOF_SPEC"
 SURFACE_EPOCHS=200
-JOINT_ITERS=1000
 JOINT_SMT_SEED_ITERS=2000
-JOINT_MEASUREMENT_REFIT_ITERS=200
 LM_MAX_ITERS=60
 MAX_TRACKS=0
 LAMBDA_L2=1e-5
@@ -65,14 +63,11 @@ Required:
 Options:
   --events N                 ACTS reconstruction events (default: 100000)
   --surface-epochs N         Epochs in each guarded polish surface solve
-  --joint-iters N            Joint free-helix iterations (default: 1000)
   --joint-smt-seed-iters N   Non-target SMT seed iterations (default: 2000).
                              A cap, not a cost: the damped Gauss-Newton seed
                              converges at ~367 iterations and breaks out, so
                              200 only truncated it below the 0.1% stationarity
                              gate.  See ml_optimization_log.md Iteration 26.
-  --joint-measurement-refit-iters N
-                              Non-target measurement refit iterations (default: 200)
   --lm-max-iters N            Block-LM geometry iterations (default: 60)
   --max-tracks N             Limit free-helix tracks; 0 keeps all (default: 0)
   --input-geom PATH          Initial misaligned geometry
@@ -103,9 +98,7 @@ while [[ $# -gt 0 ]]; do
         --run-tag) RUN_TAG="$2"; shift 2 ;;
         --events) EVENTS="$2"; shift 2 ;;
         --surface-epochs) SURFACE_EPOCHS="$2"; shift 2 ;;
-        --joint-iters) JOINT_ITERS="$2"; shift 2 ;;
         --joint-smt-seed-iters) JOINT_SMT_SEED_ITERS="$2"; shift 2 ;;
-        --joint-measurement-refit-iters) JOINT_MEASUREMENT_REFIT_ITERS="$2"; shift 2 ;;
         --lm-max-iters) LM_MAX_ITERS="$2"; shift 2 ;;
         --max-tracks) MAX_TRACKS="$2"; shift 2 ;;
         --input-geom) INPUT_GEOM="$2"; shift 2 ;;
@@ -132,9 +125,7 @@ done
 [[ "$RUN_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "--run-tag contains unsafe characters"
 [[ "$EVENTS" =~ ^[1-9][0-9]*$ ]] || die "--events must be positive"
 [[ "$SURFACE_EPOCHS" =~ ^[1-9][0-9]*$ ]] || die "--surface-epochs must be positive"
-[[ "$JOINT_ITERS" =~ ^[1-9][0-9]*$ ]] || die "--joint-iters must be positive"
 [[ "$JOINT_SMT_SEED_ITERS" =~ ^[1-9][0-9]*$ ]] || die "--joint-smt-seed-iters must be positive"
-[[ "$JOINT_MEASUREMENT_REFIT_ITERS" =~ ^[1-9][0-9]*$ ]] || die "--joint-measurement-refit-iters must be positive"
 [[ "$LM_MAX_ITERS" =~ ^[1-9][0-9]*$ ]] || die "--lm-max-iters must be positive"
 [[ "$MAX_TRACKS" =~ ^[0-9]+$ ]] || die "--max-tracks must be non-negative"
 [[ "$BOOTSTRAP_SEED" =~ ^[0-9]+$ ]] || die "--bootstrap-seed must be non-negative"
@@ -358,9 +349,8 @@ run_conda "$RUN_DIR/${joint_label}.log" \
     --output-geom "$joint_geom" --target-layers "$TARGET_LAYERS" --active-dof "$ACTIVE_DOF" \
     --joint-seed-mode non-target-measurement --joint-seed-min-hits 8 \
     --joint-seed-min-span 300 --joint-smt-seed-iters "$JOINT_SMT_SEED_ITERS" \
-    --joint-measurement-refit-iters "$JOINT_MEASUREMENT_REFIT_ITERS" \
     --joint-solver block-lm --lm-max-iters "$LM_MAX_ITERS" \
-    --joint-iters "$JOINT_ITERS" --max-tracks "$MAX_TRACKS" \
+    --max-tracks "$MAX_TRACKS" \
     --lambda-l2 "$LAMBDA_L2" --nominal-full-geom "$GEOMETRY_ROOT/odd_transforms.json" \
     --output-summary "$joint_solver_summary" --no-plot
 reconstruct "$joint_label" "$joint_geom"

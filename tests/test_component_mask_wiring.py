@@ -170,7 +170,9 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
         ),
     )
     monkeypatch.setattr(m, "summarize_joint_layer_chi2", lambda *_a, **_k: {})
-    monkeypatch.setattr(m, "run_joint_alignment", lambda *_a, **_k: joint_result)
+    monkeypatch.setattr(
+        m, "select_joint_solver", lambda _config: lambda *_a, **_k: joint_result
+    )
     monkeypatch.setattr(m, "validate_against_truth", lambda *_a, **_k: {})
     monkeypatch.setattr(m, "export_joint_geometry", lambda *_a, **_k: None)
     monkeypatch.setattr(m, "print_per_layer_residual_diagnostics", lambda *_a, **_k: {})

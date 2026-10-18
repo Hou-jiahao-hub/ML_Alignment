@@ -89,31 +89,22 @@ DEFAULT_ADAM_LR = 1e-2
 DEFAULT_ADAM_ETA_MIN = 1e-5
 ADAM_CLAMP_T = 1.5
 ADAM_CLAMP_R = 0.05
-JOINT_ITERS = 1000
-JOINT_LR_TRANS = 1e-2
-JOINT_LR_TRACK = 3e-2
 JOINT_CLAMP_T = 1.5
 JOINT_CLAMP_R = 0.05
-JOINT_CHECKPOINT_INTERVAL = 10
-JOINT_PATIENCE = 200
 JOINT_SEED_MODE = "non-target-measurement"
 JOINT_SEED_MIN_HITS = 8
 JOINT_SEED_MIN_SPAN = 300.0
 JOINT_SMT_SEED_ITERS = 200
-JOINT_MEASUREMENT_REFIT_ITERS = 200
 JOINT_SOLVER = "block-lm"
+JOINT_SOLVERS = ("block-lm", "schur-lm")
 
 #: Solver for the joint initialization's measurement refit.  Iteration 18 measured
-#: the Adam path on real data: Newton decrement p90 = 4.17e5 against a threshold of
-#: 1e-6, with 100% of rows non-stationary after the full 200-iteration budget.  The
-#: same objective solved by Gauss-Newton comes back stationary, and the two
-#: objectives were shown to agree bit-for-bit, so the optimiser is the only thing
-#: that changes here.  Adam stays reachable so runs made before Iteration 19 remain
-#: reproducible and so the two can be compared under one command.
+#: the former Adam path on real data: Newton decrement p90 = 4.17e5 against a
+#: threshold of 1e-6, with 100% of rows non-stationary after the full
+#: 200-iteration budget.  The same objective solved by Gauss-Newton comes back
+#: stationary.  The Adam path was removed on 2026-10-18; reproducing a run made
+#: before Iteration 19 requires checking out commit 97cd01c.
 JOINT_REFIT_SOLVER_GAUSS_NEWTON = "gauss-newton"
-JOINT_REFIT_SOLVER_ADAM = "adam"
-JOINT_REFIT_SOLVERS = (JOINT_REFIT_SOLVER_GAUSS_NEWTON, JOINT_REFIT_SOLVER_ADAM)
-JOINT_REFIT_SOLVER = JOINT_REFIT_SOLVER_GAUSS_NEWTON
 
 #: Pre-registration for the joint refit, kept separate from the Gate 4 block's
 #: ``PREREGISTRATION_VERSION``.  That constant governs the verdict rules in
@@ -194,15 +185,12 @@ BLOCK_LM_MIN_DAMPING = 1.0e-12
 #: exact, so this only absorbs the round trip through the candidate row.
 BLOCK_LM_BOUND_ATOL = 1.0e-12
 
-MEASUREMENT_REFIT_LR_POSITION = 1e-3
-MEASUREMENT_REFIT_LR_DIRECTION = 1e-5
-MEASUREMENT_REFIT_LR_RHO_SCALED = 1e-3
 @dataclass
 class AlignmentInputs:
     hit_sensor_ids: torch.Tensor
     initial_residuals: torch.Tensor
     covariances: torch.Tensor
-    # EXPERIMENTAL: consumed only by the disabled hit-quality network.
+    # Not read by any solver here; kept as part of the pinned ROOT loader contract.
     track_params: torch.Tensor
     track_chi2_ndf: torch.Tensor
     hit_global_positions: torch.Tensor
@@ -285,28 +273,17 @@ class AlignmentRunConfig:
     epochs: int = DEFAULT_EPOCHS
     lambda_l2: float = DEFAULT_LAMBDA_L2
     track_mode: str = "surface"
-    joint_iters: int = JOINT_ITERS
     min_hits: int = 8
     max_tracks: int = 0
-    track_batch_size: int = 0
-    rng_seed: int = 42
     gpu: bool = False
-    rot_lr_scale: float = 15.0
-    joint_lr_trans: float = JOINT_LR_TRANS
-    joint_lr_track: float = JOINT_LR_TRACK
     joint_clamp_t: float = JOINT_CLAMP_T
     joint_clamp_r: float = JOINT_CLAMP_R
     nominal_full_geom: str = str(data_path("odd_transforms.json"))
-    freeze_tracks: bool = False
-    joint_checkpoint_interval: int = JOINT_CHECKPOINT_INTERVAL
-    joint_patience: int = JOINT_PATIENCE
-    joint_min_delta: float = 0.0
     joint_max_invalid_fraction: float = 0.05
     joint_seed_mode: str = JOINT_SEED_MODE
     joint_seed_min_hits: int = JOINT_SEED_MIN_HITS
     joint_seed_min_span: float = JOINT_SEED_MIN_SPAN
     joint_smt_seed_iters: int = JOINT_SMT_SEED_ITERS
-    joint_measurement_refit_iters: int = JOINT_MEASUREMENT_REFIT_ITERS
     alignment_gain: float = 1.0
     joint_solver: str = JOINT_SOLVER
     lm_max_iters: int = LM_MAX_ITERS
@@ -314,10 +291,6 @@ class AlignmentRunConfig:
     fisher_eigen_floor: float = FISHER_EIGEN_FLOOR
     lm_max_step_t: float = LM_MAX_STEP_T
     lm_max_step_r: float = LM_MAX_STEP_R
-    measurement_refit_lr_position: float = MEASUREMENT_REFIT_LR_POSITION
-    measurement_refit_lr_direction: float = MEASUREMENT_REFIT_LR_DIRECTION
-    measurement_refit_lr_rho_scaled: float = MEASUREMENT_REFIT_LR_RHO_SCALED
-    joint_refit_solver: str = JOINT_REFIT_SOLVER
     joint_refit_stationarity: bool = True
 
 
@@ -684,43 +657,6 @@ def measure_joint_refit_stationarity(
     return measurement_stationarity_report(decrement)
 
 
-def _load_alignment_experiments():
-    try:
-        from . import alignment_experiments
-    except ImportError:  # Direct script execution.
-        import alignment_experiments
-    return alignment_experiments
-
-
-def _refit_helices_adam(
-    batches,
-    geometry,
-    initial,
-    n_iter,
-    max_invalid_fraction,
-    lr_position,
-    lr_direction,
-    lr_rho_scaled,
-    initial_loss,
-):
-    """Load the historical first-order refit only when explicitly requested."""
-    import sys
-
-    experiments = _load_alignment_experiments()
-    return experiments.refit_helices_adam(
-        sys.modules[__name__],
-        batches,
-        geometry,
-        initial,
-        n_iter,
-        max_invalid_fraction,
-        lr_position,
-        lr_direction,
-        lr_rho_scaled,
-        initial_loss,
-    )
-
-
 def _refit_helices_gauss_newton(batches, geometry, initial, device):
     """Solve the same objective, and refuse to return a solution that is not one.
 
@@ -763,37 +699,21 @@ def fit_helices_to_measurements(
     batches,
     geometry,
     initial_parameters,
-    n_iter=JOINT_MEASUREMENT_REFIT_ITERS,
     device="cpu",
     dtype=torch.float64,
     max_invalid_fraction=0.05,
-    lr_position=MEASUREMENT_REFIT_LR_POSITION,
-    lr_direction=MEASUREMENT_REFIT_LR_DIRECTION,
-    lr_rho_scaled=MEASUREMENT_REFIT_LR_RHO_SCALED,
     stationarity=True,
-    solver=JOINT_REFIT_SOLVER,
 ):
     """Refit helices using only non-target local measurements and fixed surfaces.
-
-    ``solver`` selects how the minimum is reached; the objective, the component
-    mask and the seed are the same either way.  ``n_iter`` and the three ``lr_``
-    arguments only reach the Adam path.
 
     ``stationarity`` adds a read-only Newton-decrement measurement of the seed and
     of the refit output.  It does not touch the returned parameters: the seed
     figure is what separates "the optimiser converged" from "the seed was already
     close".  It is a diagnostic, and switching it off does not switch off the
-    pre-registered acceptance criterion the Gauss-Newton path is held to -- that
+    pre-registered acceptance criterion the Gauss-Newton refit is held to -- that
     one reads the decrement the solver computes for itself.  On the float64 CPU
-    Gauss-Newton path the refit figure is that same gate report, reused.
+    path the refit figure is that same gate report, reused.
     """
-    if solver not in JOINT_REFIT_SOLVERS:
-        raise ValueError(
-            f"Unknown joint measurement refit solver {solver!r}; "
-            f"expected one of {JOINT_REFIT_SOLVERS}."
-        )
-    if n_iter < 1:
-        raise ValueError("joint measurement refit iterations must be at least 1.")
     initial = initial_parameters.to(device=device, dtype=dtype)
     with torch.no_grad():
         initial_loss_tensor, initial_invalid, _initial_mask = _measurement_refit_objective(
@@ -805,23 +725,10 @@ def fit_helices_to_measurements(
             "Initial non-target measurement refit exceeds invalid-intersection limit: "
             f"{initial_invalid:.2%} > {max_invalid_fraction:.2%}."
         )
-    if solver == JOINT_REFIT_SOLVER_ADAM:
-        fitted, solver_stats = _refit_helices_adam(
-            batches,
-            geometry,
-            initial,
-            n_iter,
-            max_invalid_fraction,
-            lr_position,
-            lr_direction,
-            lr_rho_scaled,
-            initial_loss,
-        )
-    else:
-        fitted, solver_stats = _refit_helices_gauss_newton(
-            batches, geometry, initial, device
-        )
-        fitted = fitted.to(device=initial.device, dtype=dtype)
+    fitted, solver_stats = _refit_helices_gauss_newton(
+        batches, geometry, initial, device
+    )
+    fitted = fitted.to(device=initial.device, dtype=dtype)
     with torch.no_grad():
         evaluated_loss, final_invalid, component_mask = _measurement_refit_objective(
             fitted, batches, geometry
@@ -833,7 +740,7 @@ def fit_helices_to_measurements(
             f"{final_invalid:.2%} > {max_invalid_fraction:.2%}."
         )
     stats = {
-        "solver": solver,
+        "solver": JOINT_REFIT_SOLVER_GAUSS_NEWTON,
         "joint_refit_preregistration_version": JOINT_REFIT_PREREGISTRATION_VERSION,
         "chi2_per_component": final_loss,
         "initial_chi2_per_component": initial_loss,
@@ -846,20 +753,12 @@ def fit_helices_to_measurements(
         },
     }
     stats.update(solver_stats)
-    if solver == JOINT_REFIT_SOLVER_ADAM:
-        stats["improved"] = bool(
-            stats["best_iteration"] >= 0 and final_loss < initial_loss
-        )
     if stationarity:
         # The Gauss-Newton gate already evaluated the same float64 CPU decrement
         # on these exact parameters; recomputing it costs a full Jacobian pass.
         # Any cast to float32 or another device changes the parameters, so only
         # then is the refit report measured again.
-        reuse_gate = (
-            solver == JOINT_REFIT_SOLVER_GAUSS_NEWTON
-            and fitted.dtype == torch.float64
-            and fitted.device.type == "cpu"
-        )
+        reuse_gate = fitted.dtype == torch.float64 and fitted.device.type == "cpu"
         stats["stationarity"] = {
             "seed": measure_joint_refit_stationarity(batches, geometry, initial),
             "refit": (
@@ -1695,61 +1594,30 @@ def select_joint_solver(config):
         from joint_alignment_schur import run_schur_lm_alignment
 
         return run_schur_lm_alignment
-    return run_joint_alignment
-
-
-def run_joint_alignment(
-    batches,
-    geometry,
-    config,
-    active_dof=DEFAULT_ACTIVE_DOF,
-    initial_track_params=None,
-):
-    """Lazily run the historical joint Adam experiment."""
-    import sys
-
-    return _load_alignment_experiments().run_joint_alignment(
-        sys.modules[__name__],
-        batches,
-        geometry,
-        config,
-        active_dof,
-        initial_track_params,
+    raise ValueError(
+        f"Unknown free-mode geometry solver {config.joint_solver!r}; "
+        f"expected one of {JOINT_SOLVERS}."
     )
 
 
 class AlignmentEngine(nn.Module):
     """Production surface-alignment parameters with unweighted residuals."""
 
-    def __new__(cls, num_sensors, use_hit_weights=False):
-        if use_hit_weights:
-            import sys
-
-            experiments = _load_alignment_experiments()
-            return experiments.HitQualityAlignmentEngine(
-                sys.modules[__name__], num_sensors
-            )
-        return super().__new__(cls)
-
-    def __init__(self, num_sensors, use_hit_weights=False):
+    def __init__(self, num_sensors):
         super().__init__()
         self.num_sensors = num_sensors
-        self.use_hit_weights = False
         self.alignment_params = nn.Parameter(torch.zeros(num_sensors, 6))
 
     def forward(
         self,
         hit_sensor_ids,
-        track_params,
         sensor_center_positions,
         sensor_rotations,
-        track_chi2_ndf,
         measured_local,
         hit_global_positions,
         hit_directions,
     ):
-        del track_params, track_chi2_ndf
-        residuals = compute_autograd_residuals(
+        return compute_autograd_residuals(
             measured_local,
             hit_global_positions,
             hit_directions,
@@ -1758,35 +1626,10 @@ class AlignmentEngine(nn.Module):
             sensor_rotations,
             self.alignment_params,
         )
-        return residuals, None
 
 
-def normalize_hit_weights(hit_weights, hit_volume_ids=None, hit_layer_ids=None):
-    """Compatibility entry point for the historical weighting experiment."""
-    return _load_alignment_experiments().normalize_hit_weights(
-        hit_weights, hit_volume_ids, hit_layer_ids
-    )
-
-
-def physics_informed_residual_loss(
-    residuals,
-    covariances,
-    hit_weights,
-    component_mask=None,
-    hit_volume_ids=None,
-    hit_layer_ids=None,
-):
-    """Compute production chi2, loading experimental weighting only on request."""
-    if hit_weights is not None:
-        return _load_alignment_experiments().weighted_residual_loss(
-            residuals,
-            covariances,
-            hit_weights,
-            EPS_COVARIANCE,
-            component_mask=component_mask,
-            hit_volume_ids=hit_volume_ids,
-            hit_layer_ids=hit_layer_ids,
-        )
+def physics_informed_residual_loss(residuals, covariances, component_mask=None):
+    """Mean chi2 over the valid measurement components."""
     raw_chi2 = residuals.square() / torch.clamp(
         covariances, min=EPS_COVARIANCE
     )
@@ -2426,15 +2269,10 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
         batches,
         geometry,
         seeded_parameters,
-        n_iter=config.joint_measurement_refit_iters,
         device=seeded_parameters.device,
         dtype=seeded_parameters.dtype,
         max_invalid_fraction=config.joint_max_invalid_fraction,
-        lr_position=config.measurement_refit_lr_position,
-        lr_direction=config.measurement_refit_lr_direction,
-        lr_rho_scaled=config.measurement_refit_lr_rho_scaled,
         stationarity=config.joint_refit_stationarity,
-        solver=config.joint_refit_solver,
     )
     print(
         "Joint initialization: "
@@ -2709,8 +2547,6 @@ def run_alignment_pipeline(config=None):
         raise ValueError(f"No hits found for target layers {TARGET_LAYERS}.")
 
     train_hit_sensor_ids = inputs.hit_sensor_ids[training_hit_mask]
-    train_track_params = inputs.track_params[training_hit_mask]
-    train_track_chi2_ndf = inputs.track_chi2_ndf[training_hit_mask]
     train_measured_local = inputs.measured_local[training_hit_mask]
     train_loc1_valid = inputs.loc1_valid[training_hit_mask]
     train_component_mask = torch.stack(
@@ -2746,23 +2582,17 @@ def run_alignment_pipeline(config=None):
     for epoch in range(1, config.epochs + 1):
         optimizer.zero_grad()
 
-        cur_res, hit_weights = engine(
+        cur_res = engine(
             train_hit_sensor_ids,
-            train_track_params,
             initial_positions,
             initial_rotations,
-            train_track_chi2_ndf,
             train_measured_local,
             train_hit_global_positions,
             train_hit_directions,
         )
 
         chi2_loss = physics_informed_residual_loss(
-            cur_res, train_covariances,
-            hit_weights,
-            component_mask=train_component_mask,
-            hit_volume_ids=train_hit_volume_ids,
-            hit_layer_ids=train_hit_layer_ids,
+            cur_res, train_covariances, component_mask=train_component_mask
         )
 
         l2_reg = config.lambda_l2 * torch.sum(engine.alignment_params ** 2)
@@ -2817,32 +2647,12 @@ def run_alignment_pipeline(config=None):
                     if vmask.any():
                         lchi2 = cur_chi2_per_hit[vmask].mean().item()
                         layer_info.append(f"v{vl}l{ll}={lchi2:.2f}")
-                # EXPERIMENTAL: weight diagnostics only when the network is on.
-                # Keeping them conditional preserves observability for a future
-                # restart while costing the disabled path nothing -- and
-                # hit_weights is None here, so detach()/normalize() would crash.
-                weight_info = []
-                if engine.use_hit_weights:
-                    tw = hit_weights.detach()
-                    twn = normalize_hit_weights(
-                        hit_weights, train_hit_volume_ids, train_hit_layer_ids
-                    ).detach()
-                    weight_info.append(
-                        f"W: mean={tw.mean():.3f} std={tw.std(unbiased=False):.3f} min={tw.min():.3f}"
-                    )
-                    for vl, ll in TARGET_LAYERS:
-                        vmask = (train_hit_volume_ids == vl) & (train_hit_layer_ids == ll)
-                        if vmask.any():
-                            weight_info.append(
-                                f"Wv{vl}l{ll}: raw={tw[vmask].mean():.3f} "
-                                f"norm={twn[vmask].mean():.3f}"
-                            )
                 # The Epoch line itself is never conditional: the invariant
                 # extractor and the acceptance criteria both depend on it.
                 print(f"Epoch [{epoch:03d}/{config.epochs}] | LR: {current_lr:.6f} | "
                       f"Chi2: {chi2_loss.item():.4f} | L2: {l2_reg.item():.6f} | "
                       f"Total: {loss.item():.4f} | "
-                      + " | ".join(layer_info + weight_info))
+                      + " | ".join(layer_info))
 
     predicted_deltas = engine.alignment_params.detach().cpu().numpy()
 
@@ -2950,10 +2760,9 @@ def build_argument_parser():
                    help=f"L2 regularisation weight. Default: {DEFAULT_LAMBDA_L2}.")
     p.add_argument("--track-mode", choices=("surface", "free"), default="surface",
                    help="Track treatment: fixed smoothed surface solve or free joint helices.")
-    p.add_argument("--joint-iters", type=int, default=JOINT_ITERS)
     p.add_argument(
         "--joint-solver",
-        choices=("block-lm", "schur-lm", "adam"),
+        choices=JOINT_SOLVERS,
         default=JOINT_SOLVER,
         help=(
             "Free-mode geometry solver; block-lm keeps non-target-refitted tracks fixed, "
@@ -2966,12 +2775,6 @@ def build_argument_parser():
     p.add_argument("--fisher-eigen-floor", type=float, default=FISHER_EIGEN_FLOOR)
     p.add_argument("--lm-max-step-t", type=float, default=LM_MAX_STEP_T)
     p.add_argument("--lm-max-step-r", type=float, default=LM_MAX_STEP_R)
-    p.add_argument("--joint-checkpoint-interval", type=int, default=JOINT_CHECKPOINT_INTERVAL,
-                   help="Full-dataset objective evaluation interval for best checkpointing.")
-    p.add_argument("--joint-patience", type=int, default=JOINT_PATIENCE,
-                   help="Stop after this many iterations without full-objective improvement; 0 disables.")
-    p.add_argument("--joint-min-delta", type=float, default=0.0,
-                   help="Minimum full-objective improvement required to reset patience.")
     p.add_argument(
         "--joint-seed-mode",
         choices=("non-target-measurement",),
@@ -2982,50 +2785,17 @@ def build_argument_parser():
     p.add_argument("--joint-seed-min-span", type=float, default=JOINT_SEED_MIN_SPAN)
     p.add_argument("--joint-smt-seed-iters", type=int, default=JOINT_SMT_SEED_ITERS)
     p.add_argument(
-        "--joint-measurement-refit-iters",
-        type=int,
-        default=JOINT_MEASUREMENT_REFIT_ITERS,
-    )
-    p.add_argument(
-        "--measurement-refit-lr-position",
-        type=float,
-        default=MEASUREMENT_REFIT_LR_POSITION,
-    )
-    p.add_argument(
-        "--measurement-refit-lr-direction",
-        type=float,
-        default=MEASUREMENT_REFIT_LR_DIRECTION,
-    )
-    p.add_argument(
-        "--measurement-refit-lr-rho-scaled",
-        type=float,
-        default=MEASUREMENT_REFIT_LR_RHO_SCALED,
-    )
-    p.add_argument(
-        "--joint-refit-solver",
-        choices=JOINT_REFIT_SOLVERS,
-        default=JOINT_REFIT_SOLVER,
-        help="Solver for the joint initialization measurement refit.",
-    )
-    p.add_argument(
         "--no-joint-refit-stationarity",
         action="store_true",
         help="Skip the Newton-decrement measurement of the measurement refit.",
     )
     p.add_argument("--min-hits", type=int, default=8)
     p.add_argument("--max-tracks", type=int, default=0, help="0 keeps all selected tracks.")
-    p.add_argument("--track-batch-size", type=int, default=0, help="0 uses full-batch.")
-    p.add_argument("--rng-seed", type=int, default=42)
     p.add_argument("--gpu", action="store_true", help="Use CUDA float32; CPU uses float64.")
-    p.add_argument("--rot-lr-scale", type=float, default=15.0)
-    p.add_argument("--joint-lr-trans", type=float, default=JOINT_LR_TRANS)
-    p.add_argument("--joint-lr-track", type=float, default=JOINT_LR_TRACK)
     p.add_argument("--joint-clamp-t", type=float, default=JOINT_CLAMP_T)
     p.add_argument("--joint-clamp-r", type=float, default=JOINT_CLAMP_R)
     p.add_argument("--nominal-full-geom", type=absolute_project_path, default=str(data_path("odd_transforms.json")),
                    help="Full nominal geometry used to anchor non-target hits in free mode.")
-    p.add_argument("--freeze-tracks", action="store_true",
-                   help="Freeze seeded helices and optimize geometry only in free mode.")
     p.add_argument(
         "--alignment-gain",
         type=float,
@@ -3056,57 +2826,25 @@ def alignment_config_from_args(a):
         epochs=a.epochs,
         lambda_l2=a.lambda_l2,
         track_mode=a.track_mode,
-        joint_iters=a.joint_iters,
         joint_solver=a.joint_solver,
         lm_max_iters=a.lm_max_iters,
         lm_initial_damping=a.lm_initial_damping,
         fisher_eigen_floor=a.fisher_eigen_floor,
         lm_max_step_t=a.lm_max_step_t,
         lm_max_step_r=a.lm_max_step_r,
-        joint_checkpoint_interval=a.joint_checkpoint_interval,
-        joint_patience=a.joint_patience,
-        joint_min_delta=a.joint_min_delta,
         min_hits=a.min_hits,
         max_tracks=a.max_tracks,
-        track_batch_size=a.track_batch_size,
-        rng_seed=a.rng_seed,
         gpu=a.gpu,
-        rot_lr_scale=a.rot_lr_scale,
-        joint_lr_trans=a.joint_lr_trans,
-        joint_lr_track=a.joint_lr_track,
         joint_clamp_t=a.joint_clamp_t,
         joint_clamp_r=a.joint_clamp_r,
         nominal_full_geom=a.nominal_full_geom,
-        freeze_tracks=a.freeze_tracks,
         joint_seed_mode=a.joint_seed_mode,
         joint_seed_min_hits=a.joint_seed_min_hits,
         joint_seed_min_span=a.joint_seed_min_span,
         joint_smt_seed_iters=a.joint_smt_seed_iters,
-        joint_measurement_refit_iters=a.joint_measurement_refit_iters,
-        measurement_refit_lr_position=a.measurement_refit_lr_position,
-        measurement_refit_lr_direction=a.measurement_refit_lr_direction,
-        measurement_refit_lr_rho_scaled=a.measurement_refit_lr_rho_scaled,
-        joint_refit_solver=a.joint_refit_solver,
         joint_refit_stationarity=not a.no_joint_refit_stationarity,
         alignment_gain=a.alignment_gain,
     )
-
-
-def __getattr__(name):
-    """Lazily preserve imports of historical experiment-only helpers."""
-    if name in {
-        "HIT_QUALITY_HIDDEN_ONE",
-        "HIT_QUALITY_HIDDEN_TWO",
-        "HIT_QUALITY_INPUT_SIZE",
-        "HIT_QUALITY_OUTPUT_SIZE",
-        "HIT_WEIGHT_FLOOR",
-        "JointBestCheckpoint",
-        "joint_checkpoint_score",
-    }:
-        value = getattr(_load_alignment_experiments(), name)
-        globals()[name] = value
-        return value
-    raise AttributeError(name)
 
 
 if __name__ == "__main__":

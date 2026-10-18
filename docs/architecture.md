@@ -25,7 +25,6 @@ simulation -> ROOT/geometry JSON -> loaders -> solver -> aligned geometry
 | `ml_alignment_autograd.py` | Production autograd surface solver, helix initialization, measurement refit and block-LM geometry solver | None |
 | `helix_model.py` | Production six-parameter helix, intersections, point seed and independent single-helix measurement Gauss–Newton fit | None |
 | `broken_helix_model.py` | Experimental material nodes, Highland prior and broken-helix segments | None |
-| `alignment_experiments.py` | Historical Adam refits, joint Adam alignment and learned hit weighting | None |
 | `alignment_diagnostics.py` | Residual reporting and optional truth-geometry comparison | None |
 | `ml_alignment_helix.py` | Frozen-helix holdout alignment | None |
 | `material_artifact.py` | Per-track material-node artifact from ACTS ROOT output | None |
@@ -126,20 +125,21 @@ reference before clipping windows or assigning segments.
 
 ## Measurement refit solver
 
-`validate_helix_model.py --fit-solver {gauss-newton,adam}` chooses how the
-non-holdout measurement refit is minimised. Both solvers minimise the *same*
-half-chi2 over the same component mask; only the descent differs.
+The non-holdout measurement refit is minimised by damped Gauss--Newton. Its
+production implementation lives in `helix_model.py` and directly fits one
+six-parameter helix to local measurements; it does not import the holdout
+validator or enter the broken-helix zero-node branch. A regression test compares
+its residual, solution and Newton decrement against that historical zero-node
+path.
 
-`gauss-newton` is the default. Its production implementation lives in
-`helix_model.py` and directly fits one six-parameter helix to local measurements;
-it does not import the holdout validator or enter the broken-helix zero-node
-branch. A regression test compares its residual, solution and Newton decrement
-against that historical zero-node path. `adam` is the pre-Iteration-14
-first-order refit, kept in `alignment_experiments.py` so the finding remains
-reproducible: on real data every one of its rows stops short of a stationary
+It replaced the pre-Iteration-14 first-order Adam refit of the same half-chi2
+and component mask. On real data every Adam row stopped short of a stationary
 point (Newton decrement median ~12 against a 1e-6 threshold), which inflated the
 held-out residual by a factor of 2.7-3.9 on the LOC0 groups and was previously
-mis-read as unmodelled multiple scattering.
+mis-read as unmodelled multiple scattering. The Adam refits, the joint Adam
+solver and the learned hit weighting (`alignment_experiments.py`,
+`--fit-solver adam`, `--joint-refit-solver adam`, `--joint-solver adam`) were
+removed on 2026-10-18; commit `97cd01c` is the last one that can reproduce them.
 
 The run records `measurement_fit.stationarity` in the summary and fails when the
 non-stationary row fraction exceeds `MAX_NON_STATIONARY_ROW_FRACTION` -- the same

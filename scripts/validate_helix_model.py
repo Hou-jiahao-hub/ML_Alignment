@@ -24,7 +24,6 @@ import awkward as ak
 import numpy as np
 import pandas as pd
 import torch
-import torch.optim as optim
 import uproot
 
 from alignment_artifact_layout import (
@@ -98,10 +97,8 @@ DEFAULT_MIN_EXTRAPOLATION_FIT_SPAN = 100.0
 DEFAULT_MIN_EXTRAPOLATION_FIT_RESIDUALS = 6
 DEFAULT_MAX_TRACKS = 1000
 DEFAULT_FIT_ITERS = 200
-#: ``fit_iters`` bounds the SMT Gauss-Newton seed and the reproducibility-only
-#: Adam measurement-refit arm.  The measurement Gauss-Newton budget is
-#: ``broken_fit_iters``.
-FIT_SOLVERS = ("gauss-newton", "adam")
+#: ``fit_iters`` bounds the SMT Gauss-Newton seed.  The measurement
+#: Gauss-Newton budget is ``broken_fit_iters``.
 DEFAULT_GEOMETRY_TOLERANCE = 1e-3
 DEFAULT_MAX_INTERSECTION_FAILURE_RATE = 0.05
 DEFAULT_MAX_PIXEL_LOCAL_RMSE = 0.05
@@ -146,7 +143,6 @@ class HelixValidationConfig:
     material_artifact_energy_loss: str | None = None
     on_missing_material: str = "fail"
     broken_fit_iters: int = 60
-    fit_solver: str = "gauss-newton"
     capture_source_snapshot: bool = False
 
 
@@ -861,66 +857,6 @@ def seed_helices(
     return (fitted, diagnostics) if return_diagnostics else fitted
 
 
-def fit_helices_to_measurements(
-    batches: TrackBatches,
-    geometry: NominalGeometry,
-    initial_parameters: torch.Tensor,
-    n_iter: int = 200,
-    device: str | torch.device = "cpu",
-    dtype=torch.float64,
-) -> torch.Tensor:
-    """Refit helices using only non-holdout measurement components."""
-    if n_iter < 1:
-        raise ValueError("n_iter must be at least 1.")
-    initial = initial_parameters.to(device=device, dtype=dtype)
-    linear = initial[:, :5].detach().clone().requires_grad_(True)
-    rho_scaled = (initial[:, 5:6] / 1e-4).detach().clone().requires_grad_(True)
-    optimizer = optim.Adam(
-        [
-            {"params": [linear], "lr": 0.05},
-            {"params": [rho_scaled], "lr": 0.05},
-        ]
-    )
-    sensor_idx = batches.sensor_idx.to(device=device)
-    centers = geometry.centers.to(device=device, dtype=dtype)[sensor_idx]
-    rotations = geometry.rotations.to(device=device, dtype=dtype)[sensor_idx]
-    normals = rotations[..., :, 2]
-    measured = batches.measured_local.to(device=device, dtype=dtype)
-    variance = batches.measurement_variance.to(device=device, dtype=dtype)
-    fit_mask = batches.fit_mask.to(device=device)
-    loc1_valid = batches.loc1_valid.to(device=device)
-    n_hits = measured.shape[1]
-
-    for _ in range(n_iter):
-        optimizer.zero_grad()
-        tracks = torch.cat((linear, rho_scaled * 1e-4), dim=1)
-        expanded = tracks[:, None, :].expand(-1, n_hits, -1)
-        _path, intersections, valid = intersect_plane(
-            expanded, centers, normals, n_newton=12
-        )
-        local3 = torch.matmul(
-            rotations.transpose(-1, -2),
-            (intersections - centers).unsqueeze(-1),
-        ).squeeze(-1)
-        residual = measured - local3[..., :2]
-        valid_hit = fit_mask & valid
-        component_mask = torch.stack(
-            (valid_hit, valid_hit & loc1_valid), dim=-1
-        )
-        if not component_mask.any():
-            raise ValueError("No valid measurement components remain for helix fitting.")
-        weighted = residual.square() / variance.clamp_min(EPS_VARIANCE)
-        loss = torch.sum(
-            torch.where(component_mask, weighted, torch.zeros_like(weighted))
-        ) / component_mask.sum()
-        if not torch.isfinite(loss):
-            raise FloatingPointError("Non-finite measurement helix loss.")
-        loss.backward()
-        optimizer.step()
-
-    return torch.cat((linear, rho_scaled * 1e-4), dim=1).detach()
-
-
 def build_track_batches(
     inputs: HelixInputs,
     holdout_layers,
@@ -1600,10 +1536,6 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
         raise ValueError("on_missing_material must be fail or drop.")
     if config.broken_fit_iters < 1:
         raise ValueError("broken_fit_iters must be at least 1.")
-    if config.fit_solver not in FIT_SOLVERS:
-        raise ValueError(
-            f"fit_solver must be one of {', '.join(sorted(FIT_SOLVERS))}."
-        )
     if config.model == "broken" and not config.material_artifact:
         raise ValueError("--model broken requires --material-artifact.")
     for input_path, label in (
@@ -1727,34 +1659,14 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
         return_diagnostics=True,
     )
     require_stationary_helix_point_fit(seed_diagnostics)
-    if config.fit_solver == "gauss-newton":
-        fitted_parameters, fit_diagnostics = fit_helices_gauss_newton(
-            batches,
-            geometry,
-            seeded_parameters,
-            max_iters=config.broken_fit_iters,
-            device=device,
-            dtype=dtype,
-        )
-    else:
-        fitted_parameters = fit_helices_to_measurements(
-            batches,
-            geometry,
-            seeded_parameters,
-            n_iter=config.fit_iters,
-            device=device,
-            dtype=dtype,
-        )
-        fit_diagnostics = {
-            "solver": "adam",
-            "iterations": config.fit_iters,
-            "stationarity": stationarity_report(
-                measurement_newton_decrement(
-                    batches, geometry, fitted_parameters,
-                    device=device, dtype=dtype,
-                )
-            ),
-        }
+    fitted_parameters, fit_diagnostics = fit_helices_gauss_newton(
+        batches,
+        geometry,
+        seeded_parameters,
+        max_iters=config.broken_fit_iters,
+        device=device,
+        dtype=dtype,
+    )
     initial = evaluate_helix_on_surfaces(
         initial_parameters, batches, geometry
     )
@@ -1866,7 +1778,7 @@ def run_helix_validation(config: HelixValidationConfig | None = None) -> dict:
             "material_artifact_energy_loss": config.material_artifact_energy_loss,
             "on_missing_material": config.on_missing_material,
             "broken_fit_iters": config.broken_fit_iters,
-            "fit_solver": config.fit_solver,
+            "fit_solver": "gauss-newton",
         },
         "measurement_fit": json_safe(fit_diagnostics),
         "smt_seed": json_safe(seed_diagnostics),
@@ -2084,16 +1996,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tracks", type=int, default=defaults.max_tracks)
     parser.add_argument("--fit-iters", type=int, default=defaults.fit_iters)
     parser.add_argument(
-        "--fit-solver",
-        choices=FIT_SOLVERS,
-        default=defaults.fit_solver,
-        help=(
-            "Solver for the measurement refit. gauss-newton is the default; "
-            "adam reproduces the pre-Iteration-14 behaviour and is not expected "
-            "to reach the optimum."
-        ),
-    )
-    parser.add_argument(
         "--context-hits-before", type=int, default=defaults.context_hits_before
     )
     parser.add_argument(
@@ -2185,7 +2087,6 @@ def config_from_args(args: argparse.Namespace) -> HelixValidationConfig:
         min_extrapolation_fit_span=args.min_extrapolation_fit_span,
         max_tracks=args.max_tracks,
         fit_iters=args.fit_iters,
-        fit_solver=args.fit_solver,
         context_hits_before=args.context_hits_before,
         context_hits_after=args.context_hits_after,
         gpu=args.gpu,
@@ -3325,12 +3226,12 @@ def fit_helices_gauss_newton(
 ) -> tuple[torch.Tensor, dict]:
     """Refit helices to the non-holdout measurements by damped Gauss-Newton.
 
-    This is ``fit_helices_to_measurements`` minus the optimiser.  The objective,
-    the component mask and the held-out surface are identical; only the way the
-    minimum is reached changes.  Iteration 14 measured the difference on real
-    data: Adam stopped on budget at 17:8 interpolation LOC0 RMSE 0.076 mm where
-    the same objective, solved properly, reaches 0.022 mm.  What Iteration 10
-    read as unmodelled multiple scattering was largely this gap.
+    It replaced a first-order Adam refit of the same objective, component mask
+    and held-out surface (removed 2026-10-18).  Iteration 14 measured the
+    difference on real data: Adam stopped on budget at 17:8 interpolation LOC0
+    RMSE 0.076 mm where the same objective, solved properly, reaches 0.022 mm.
+    What Iteration 10 read as unmodelled multiple scattering was largely this
+    gap.
 
     Runs through ``fit_broken_helix`` with zero nodes rather than a second
     solver, so the main path and the Gate 4 single arm cannot drift apart.

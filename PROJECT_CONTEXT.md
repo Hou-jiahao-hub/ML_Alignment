@@ -74,7 +74,6 @@ ML_Alignment/
 | `scripts/helix_model.py` | ACTS-independent 六参数 helix、最近点/平面求交、gauge 固定、点拟合与独立 measurement GN |
 | `scripts/ml_alignment.py` | 解析 Jacobian surface 基线：调用 AlignDerivLib，周期性重算 Jacobian，Adam 优化 |
 | `scripts/ml_alignment_helix.py` | 独立 frozen-helix holdout 对齐及 assess/align CLI；不是当前主编排的核心 solver |
-| `scripts/alignment_experiments.py` | 历史 Adam refit、joint Adam、学习 hit 权重；由生产模块延迟访问以支持历史复现 |
 | `scripts/broken_helix_model.py`、`scripts/material_artifact.py` | 实验性分段 helix/散射先验，以及 ACTS 材料 ROOT 到版本化 NPZ 的转换 |
 | `scripts/validate_helix_model.py`、`scripts/compare_helix_recovery.py` | 留出/配对 Gate 4；nominal 与 misaligned 的严格同身份 seed→refit 恢复诊断 |
 | `scripts/reconstruction_acceptance.py`、`scripts/calibrate_acceptance.py` | 重建 measurement/SMT chi2 指标、冻结 bootstrap 阈值、profile 身份核验和候选排序 |
@@ -146,7 +145,7 @@ ACTS simulation / reconstruction
 | 定义文件 | 优先理解的对象 |
 |---|---|
 | `scripts/ml_alignment_autograd.py` | `AlignmentRunConfig`：运行参数；`AlignmentInputs`：逐 hit 输入；`TrackBatches`：按径迹 padding 后输入；`JointGeometry`：全几何及目标映射；`AlignmentEngine`：surface 参数模型 |
-| 同上 | `run_alignment_pipeline()` 分派 surface/free；`run_block_lm_alignment()` 是当前几何主求解器；`_sensor_residual_data()` 做 sensor hit 选择、求交和局部残差；`_block_lm_linearized_block()` 形成正规方程；`run_joint_alignment()` 是历史 Adam 分派 |
+| 同上 | `run_alignment_pipeline()` 分派 surface/free；`run_block_lm_alignment()` 是当前几何主求解器；`_sensor_residual_data()` 做 sensor hit 选择、求交和局部残差；`_block_lm_linearized_block()` 形成正规方程 |
 | `scripts/helix_model.py` | `MeasurementFitInputs`、`helix_point()`、`intersect_plane()`、`closest_helix_points()`、`damped_gauss_newton()`、两种 `fit_helix_*_gauss_newton()`、`measurement_stationarity_report()` |
 | `scripts/ml_alignment.py` | `compute_jacobians_from_alignderivlib()`、`physics_informed_loss()`、`run_alignment_pipeline()`；这里也有同名配置/输入类，勿与 autograd 版本混淆 |
 | `scripts/validate_helix_model.py` | `HelixValidationConfig`、`run_helix_validation()`、`run_paired_holdout()`、`predictive_covariance()`、`evaluate_broken_helix_gate()` |
@@ -159,7 +158,7 @@ ACTS simulation / reconstruction
 
 `configs/default.toml` 定义 `project.data_root`、`project.align_derivlib_root`、`acts.root`、`runtime.conda_setup`、`alignment.target_layers`、`alignment.active_dof`。目标目录和后缀由层列表派生，如 `Vol17_Lay8__Vol24_Lay4`、`v17l8_v24l4`，不得在其他模块另行拼一套规则。
 
-算法预算并未全部集中到 TOML：还分布在 dataclass、模块常量、CLI 和 shell 配方。特别是生产 shell 的 SMT seed 上限为 **2000**，Python 配置默认仍为 **200**；`--joint-iters` 控制历史 Adam，不控制默认 block-LM（应看 `--lm-max-iters`）；measurement refit 的 Adam 迭代/学习率参数不控制 GN 路径。
+算法预算并未全部集中到 TOML：还分布在 dataclass、模块常量、CLI 和 shell 配方。特别是生产 shell 的 SMT seed 上限为 **2000**，Python 配置默认仍为 **200**；block-LM 迭代预算看 `--lm-max-iters`；历史 Adam 路径及其 `--joint-iters`、refit 学习率参数已于 2026-10-18 删除。
 
 ```bash
 python scripts/path_inventory.py --json  # 查看本机最终配置及绝对 I/O 路径

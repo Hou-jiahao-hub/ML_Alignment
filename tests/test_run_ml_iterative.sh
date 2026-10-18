@@ -60,13 +60,12 @@ grep -Fq -- "--output-geom $ALIGNMENT_ROOT/$DIR/aligned_transforms_${TAG}_${SUF}
 grep -Fq -- "--active-dof $ACTIVE_DOF_ESC" "$tmp_default"
 grep -Fq -- "--lambda-l2 1e-5" "$tmp_default"
 
-# The autograd solver must always be told which track mode to use, and the
-# iteration-count flag must match that mode: surface consumes --epochs, free
-# consumes --joint-iters.  Mixing them silently falls back to the wrong solver
-# path, which is exactly the bug this gate exists to catch.
+# The autograd solver must always be told which track mode to use.  Only
+# surface consumes an iteration-count flag (--epochs); free runs block-LM on its
+# own defaults, and the removed --joint-iters must never come back.
 grep -Fq -- "--track-mode $TRACK_MODE" "$tmp_default"
 if [[ "$TRACK_MODE" == "free" ]]; then
-    grep -Fq -- "--joint-iters" "$tmp_default"
+    refute_grep "--joint-iters" "$tmp_default"
     refute_grep "--epochs" "$tmp_default"
 else
     grep -Fq -- "--epochs 300" "$tmp_default"

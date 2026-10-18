@@ -403,13 +403,13 @@ def test_holdout_measurements_do_not_influence_measurement_refit():
     )
     initial = torch.tensor(
         [[0.0, 0.5, 0.0, 0.01, 0.08, 0.0]], dtype=torch.float64
-    )
+    ).expand(original.fit_mask.shape[0], -1)
 
-    fit_original = m.fit_helices_to_measurements(
-        original, geometry, initial, n_iter=20, dtype=torch.float64
+    fit_original, _ = m.fit_helices_gauss_newton(
+        original, geometry, initial, dtype=torch.float64
     )
-    fit_shifted = m.fit_helices_to_measurements(
-        shifted, geometry, initial, n_iter=20, dtype=torch.float64
+    fit_shifted, _ = m.fit_helices_gauss_newton(
+        shifted, geometry, initial, dtype=torch.float64
     )
 
     assert torch.allclose(fit_original, fit_shifted, atol=0.0, rtol=0.0)
@@ -2466,26 +2466,6 @@ def _measurement_objective(m, batches, geometry, parameters, dtype=torch.float64
     return 0.5 * residual.square().sum(dim=1)
 
 
-def test_gauss_newton_measurement_fit_beats_adam_on_the_same_rows():
-    m = load_module()
-    batches, geometry, seeded = _measurement_fit_fixture(m)
-
-    adam = m.fit_helices_to_measurements(
-        batches, geometry, seeded, n_iter=m.DEFAULT_FIT_ITERS
-    )
-    gauss_newton, _diagnostics = m.fit_helices_gauss_newton(
-        batches, geometry, seeded
-    )
-
-    adam_objective = _measurement_objective(m, batches, geometry, adam)
-    gn_objective = _measurement_objective(m, batches, geometry, gauss_newton)
-    assert torch.all(gn_objective < adam_objective)
-    # The old order-of-magnitude gap included Adam's badly truncated SMT seed.
-    # With the seed itself solved by LM, refit Adam starts much closer, but the
-    # stationary GN solution must still improve every row by a visible margin.
-    assert torch.all(gn_objective < 0.9 * adam_objective)
-
-
 def test_gauss_newton_measurement_fit_reaches_a_stationary_point():
     m = load_module()
     batches, geometry, seeded = _measurement_fit_fixture(m)
@@ -2496,20 +2476,6 @@ def test_gauss_newton_measurement_fit_reaches_a_stationary_point():
     assert stationarity["non_stationary_row_fraction"] == 0.0
     assert stationarity["newton_decrement_max"] < m.NEWTON_DECREMENT_STATIONARY
     assert diagnostics["convergence"]["converged"] is True
-
-
-def test_adam_measurement_fit_is_not_stationary_which_is_the_defect():
-    m = load_module()
-    batches, geometry, seeded = _measurement_fit_fixture(m)
-
-    adam = m.fit_helices_to_measurements(
-        batches, geometry, seeded, n_iter=m.DEFAULT_FIT_ITERS
-    )
-    decrement = m.measurement_newton_decrement(batches, geometry, adam)
-
-    # This is the defect Iteration 14 mis-diagnosed as multiple scattering: the
-    # Adam refit stops on budget, far from any stationary point.
-    assert float(decrement.min()) > m.NEWTON_DECREMENT_STATIONARY
 
 
 def test_gauss_newton_measurement_fit_matches_the_gate4_single_arm():
@@ -2579,18 +2545,6 @@ def test_gauss_newton_measurement_fit_chunking_is_exact():
     chunked, _ = m.fit_helices_gauss_newton(batches, geometry, seeded, chunk_rows=1)
 
     assert torch.equal(whole, chunked)
-
-
-def test_fit_solver_option_rejects_an_unknown_name():
-    m = load_module()
-    config = m.HelixValidationConfig(states="states.root", fit_solver="lbfgs")
-    with pytest.raises(ValueError, match="fit_solver"):
-        m.run_helix_validation(config)
-
-
-def test_fit_solver_defaults_to_gauss_newton():
-    m = load_module()
-    assert m.HelixValidationConfig(states="states.root").fit_solver == "gauss-newton"
 
 
 def test_measurement_newton_decrement_chunking_is_exact():

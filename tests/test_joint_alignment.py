@@ -385,28 +385,18 @@ def test_measurement_refit_ignores_target_measurements_and_reports_chi2():
     initial = torch.zeros((1, 6), dtype=torch.float64)
 
     fitted_a, stats_a = m.fit_helices_to_measurements(
-        batches_a, geometry, initial, n_iter=3, dtype=torch.float64, solver="adam"
+        batches_a, geometry, initial, dtype=torch.float64
     )
     fitted_b, stats_b = m.fit_helices_to_measurements(
-        batches_b, geometry, initial, n_iter=3, dtype=torch.float64, solver="adam"
+        batches_b, geometry, initial, dtype=torch.float64
     )
 
     torch.testing.assert_close(fitted_a, fitted_b, rtol=0.0, atol=0.0)
     assert stats_a["chi2_per_component"] == pytest.approx(0.0)
     assert stats_a["initial_chi2_per_component"] == pytest.approx(0.0)
-    assert stats_a["best_iteration"] == -1
-    assert stats_a["improved"] is False
     assert stats_a["parameter_updates"]["position_rms"] == pytest.approx(0.0)
     assert stats_a["parameter_updates"]["direction_rms"] == pytest.approx(0.0)
     assert stats_a["parameter_updates"]["rho_rms"] == pytest.approx(0.0)
-    assert stats_a["first_step"]["loss_before"] == pytest.approx(0.0)
-    assert stats_a["first_step"]["loss_after"] == pytest.approx(0.0)
-    assert stats_a["first_step"]["gradient_norms"] == pytest.approx(
-        {"position": 0.0, "direction": 0.0, "rho_scaled": 0.0}
-    )
-    assert stats_a["first_step"]["update_max"] == pytest.approx(
-        {"position": 0.0, "direction": 0.0, "rho_scaled": 0.0}
-    )
     assert stats_a["invalid_fraction"] == pytest.approx(0.0)
     assert stats_b == stats_a
 
@@ -420,10 +410,6 @@ def test_joint_seed_cli_defaults_to_non_target_measurement_refit():
     assert config.joint_seed_min_hits == 8
     assert config.joint_seed_min_span == 300.0
     assert config.joint_smt_seed_iters == 200
-    assert config.joint_measurement_refit_iters == 200
-    assert config.measurement_refit_lr_position == pytest.approx(1e-3)
-    assert config.measurement_refit_lr_direction == pytest.approx(1e-5)
-    assert config.measurement_refit_lr_rho_scaled == pytest.approx(1e-3)
 
 
 def test_joint_config_defaults_keep_surface_mode_compatible():
@@ -431,10 +417,7 @@ def test_joint_config_defaults_keep_surface_mode_compatible():
     config = m.AlignmentRunConfig()
 
     assert config.track_mode == "surface"
-    assert config.joint_iters == 1000
     assert config.min_hits == 8
-    assert config.track_batch_size == 0
-    assert config.rng_seed == 42
     assert config.nominal_full_geom.endswith("data/geometry/odd_transforms.json")
 
 
@@ -576,17 +559,6 @@ def test_block_lm_geometry_is_independent_of_non_target_measurements():
     np.testing.assert_array_equal(a["predicted_deltas"], b["predicted_deltas"])
 
 
-def test_cli_freeze_tracks_reaches_alignment_config():
-    m = load_module()
-    parser = m.build_argument_parser()
-
-    args = parser.parse_args(["--track-mode", "free", "--freeze-tracks"])
-    config = m.alignment_config_from_args(args)
-
-    assert config.track_mode == "free"
-    assert config.freeze_tracks is True
-
-
 def test_both_track_modes_share_one_default_dof():
     """free used to default to (0,1,3,4), which cannot express rz at all."""
     m = load_module()
@@ -616,10 +588,10 @@ def test_default_dof_includes_rz():
     assert 5 in m.DEFAULT_ACTIVE_DOF
 
 
-def test_run_joint_alignment_signature_default_matches():
+def test_block_lm_signature_default_matches():
     m = load_module()
 
-    default = inspect.signature(m.run_joint_alignment).parameters["active_dof"].default
+    default = inspect.signature(m.run_block_lm_alignment).parameters["active_dof"].default
 
     assert default == m.DEFAULT_ACTIVE_DOF
 
@@ -633,38 +605,6 @@ def test_empty_active_dof_string_does_not_bypass_mode_default():
     )
 
     assert resolved == m.DEFAULT_ACTIVE_DOF
-
-
-def test_joint_checkpoint_restores_best_parameters_and_stops_after_patience():
-    m = load_module()
-    parameter = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float64))
-    checkpoint = m.JointBestCheckpoint((parameter,), patience=2, min_delta=0.0)
-
-    assert checkpoint.observe(5.0, iteration=0) is False
-    with torch.no_grad():
-        parameter.fill_(0.5)
-    assert checkpoint.observe(4.0, iteration=1) is False
-    with torch.no_grad():
-        parameter.fill_(9.0)
-    assert checkpoint.observe(6.0, iteration=2) is False
-    with torch.no_grad():
-        parameter.fill_(10.0)
-    assert checkpoint.observe(7.0, iteration=3) is True
-
-    checkpoint.restore()
-    assert parameter.item() == 0.5
-    assert checkpoint.best_loss == 4.0
-    assert checkpoint.best_iteration == 1
-
-
-def test_joint_checkpoint_score_rejects_excess_invalid_intersections():
-    m = load_module()
-
-    accepted = m.joint_checkpoint_score(12.0, invalid_fraction=0.01, max_invalid_fraction=0.05)
-    rejected = m.joint_checkpoint_score(0.0, invalid_fraction=0.06, max_invalid_fraction=0.05)
-
-    assert accepted == 12.0
-    assert rejected == float("inf")
 
 
 def test_joint_layer_chi2_counts_only_valid_components():
@@ -695,16 +635,6 @@ def test_joint_layer_chi2_counts_only_valid_components():
     assert metrics["24:4"]["LOC0"]["chi2_per_component"] == pytest.approx(4.0)
 
 
-def test_joint_checkpoint_patience_counts_from_initial_baseline():
-    m = load_module()
-    parameter = torch.nn.Parameter(torch.tensor([1.0]))
-    checkpoint = m.JointBestCheckpoint((parameter,), patience=2)
-
-    assert checkpoint.observe(3.0, iteration=-1) is False
-    assert checkpoint.observe(4.0, iteration=0) is False
-    assert checkpoint.observe(5.0, iteration=1) is True
-
-
 def test_clamp_resets_adam_momentum_only_for_saturated_entries():
     m = load_module()
     parameter = torch.nn.Parameter(torch.tensor([-2.0, 0.2, 3.0]))
@@ -726,14 +656,10 @@ def test_surface_residual_loss_gives_invalid_loc1_zero_weight():
     m = load_module()
     residuals = torch.tensor([[2.0, 1.0e6], [4.0, 3.0]], dtype=torch.float64)
     covariances = torch.ones_like(residuals)
-    hit_weights = torch.ones((2, 1), dtype=torch.float64)
     component_mask = torch.tensor([[True, False], [True, True]])
 
     loss = m.physics_informed_residual_loss(
-        residuals,
-        covariances,
-        hit_weights,
-        component_mask=component_mask,
+        residuals, covariances, component_mask=component_mask
     )
 
     assert torch.allclose(loss, torch.tensor((4.0 + 16.0 + 9.0) / 3.0, dtype=torch.float64))
@@ -815,169 +741,6 @@ def test_joint_track_parameterization_scales_physical_curvature():
 
     assert torch.allclose(assembled[:, :5], seed[:, :5])
     assert abs((assembled[0, 5] - seed[0, 5]).item() - 1e-7) < 1e-14
-
-
-def test_free_joint_fit_recovers_hidden_shift_tilt_and_masks_strip_component():
-    m = load_module()
-    dtype = torch.float64
-    n_tracks, n_planes = 24, 6
-    x_planes = torch.linspace(0.0, 40.0, n_planes, dtype=dtype)
-    rotation = torch.tensor(
-        [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=dtype
-    )
-    rotations = rotation.expand(n_planes, -1, -1).clone()
-    nominal_rotations = rotations.clone()
-    nominal_centers = torch.stack((x_planes, torch.zeros_like(x_planes), torch.zeros_like(x_planes)), dim=1)
-    centers = nominal_centers.clone()
-    centers[2, 1] = 0.4
-    centers[2, 2] = -0.2
-    rotations[2] = torch.tensor(m.euler_to_rotation_matrix(0.012, -0.018, 0.0), dtype=dtype)
-    target_mask = torch.tensor([False, False, True, False, False, False])
-    geometry = m.JointGeometry(
-        transforms=[_surface(17 if i == 2 else 10, 8 if i == 2 else i, i + 1, float(x)) for i, x in enumerate(x_planes)],
-        input_transforms=[_surface(17, 8, 3, float(x_planes[2]))],
-        centers=centers,
-        rotations=rotations,
-        target_mask=target_mask,
-        id_to_idx={},
-        input_indices=[2],
-    )
-
-    y0 = torch.linspace(-1.0, 1.0, n_tracks, dtype=dtype)
-    z0 = torch.linspace(0.5, -0.5, n_tracks, dtype=dtype)
-    psi = torch.linspace(-0.02, 0.02, n_tracks, dtype=dtype)
-    tanl = torch.linspace(-0.03, 0.03, n_tracks, dtype=dtype)
-    tracks = torch.stack((torch.zeros_like(y0), y0, z0, psi, tanl, torch.zeros_like(y0)), dim=1)
-    expanded_tracks = tracks[:, None, :].expand(-1, n_planes, -1)
-    expanded_centers = nominal_centers[None, :, :].expand(n_tracks, -1, -1)
-    expanded_normals = nominal_rotations[:, :, 2][None, :, :].expand(n_tracks, -1, -1)
-    _s, points, valid = m.intersect_plane(expanded_tracks, expanded_centers, expanded_normals)
-    local = torch.matmul(
-        nominal_rotations[None, :, :, :].transpose(-1, -2),
-        (points - expanded_centers).unsqueeze(-1),
-    ).squeeze(-1)[..., :2]
-    assert valid.all()
-    batches = m.TrackBatches(
-        measured_local=local,
-        covariances=torch.full((n_tracks, n_planes, 2), 0.01, dtype=dtype),
-        sensor_idx=torch.arange(n_planes).expand(n_tracks, -1),
-        hit_mask=torch.ones((n_tracks, n_planes), dtype=torch.bool),
-        loc1_mask=torch.tensor([True, True, True, True, True, False]).expand(n_tracks, -1),
-        g_smt=points,
-        p_smt=m.helix_tangent(expanded_tracks, _s),
-        volume_id=torch.tensor([10, 10, 17, 10, 10, 10]).expand(n_tracks, -1),
-        layer_id=torch.tensor([0, 1, 8, 3, 4, 5]).expand(n_tracks, -1),
-        is_target=target_mask.expand(n_tracks, -1),
-        event_track_ids=torch.stack((torch.zeros(n_tracks, dtype=torch.long), torch.arange(n_tracks)), dim=1),
-    )
-    config = m.AlignmentRunConfig(
-        track_mode="free",
-        joint_iters=1000,
-        joint_lr_trans=0.01,
-        joint_lr_track=1e-4,
-        lambda_l2=0.0,
-        make_plot=False,
-    )
-
-    sys.modules.pop("alignment_experiments", None)
-    result = m.run_joint_alignment(
-        batches,
-        geometry,
-        config,
-        active_dof=(0, 1, 3, 4),
-        initial_track_params=tracks,
-    )
-    assert "alignment_experiments" in sys.modules
-
-    correction = result["predicted_deltas"]
-    assert result["best_total_loss"] <= result["last_total_loss"]
-    assert result["best_total_loss"] <= result["initial_total_loss"]
-    assert -1 <= result["best_iteration"] < config.joint_iters
-    assert np.isfinite(correction[2, :]).all()
-    assert np.linalg.norm(correction[2, (0, 1)]) > 1e-3
-    assert np.linalg.norm(correction[2, (3, 4)]) > 1e-4
-    assert not result["final_component_mask"][:, -1, 1].any()
-
-    frozen = m.run_joint_alignment(
-        batches, geometry,
-        m.AlignmentRunConfig(track_mode="free", joint_iters=20, joint_lr_trans=0.01,
-                             joint_lr_track=0.01, lambda_l2=0.0, make_plot=False,
-                             freeze_tracks=True),
-        active_dof=(0, 1, 3, 4), initial_track_params=tracks,
-    )
-    assert np.allclose(frozen["track_params"], tracks.numpy())
-    assert torch.count_nonzero(torch.tensor(correction)[~target_mask]).item() == 0
-
-
-def test_frozen_helix_fit_recovers_rz_only_injection():
-    m = load_module()
-    dtype = torch.float64
-    n_tracks, n_planes = 16, 5
-    x_planes = torch.linspace(0.0, 32.0, n_planes, dtype=dtype)
-    nominal_rotation = torch.tensor(
-        [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=dtype
-    )
-    nominal_rotations = nominal_rotation.expand(n_planes, -1, -1).clone()
-    rotations = nominal_rotations.clone()
-    injected_rz = 0.02
-    rotations[2] = rotations[2] @ torch.tensor(
-        m.euler_to_rotation_matrix(0.0, 0.0, injected_rz), dtype=dtype
-    )
-    centers = torch.stack((x_planes, torch.zeros_like(x_planes), torch.zeros_like(x_planes)), dim=1)
-    target_mask = torch.tensor([False, False, True, False, False])
-    geometry = m.JointGeometry(
-        transforms=[_surface(17 if i == 2 else 10, 8 if i == 2 else i, i + 1, float(x))
-                    for i, x in enumerate(x_planes)],
-        input_transforms=[_surface(17, 8, 3, float(x_planes[2]))],
-        centers=centers,
-        rotations=rotations,
-        target_mask=target_mask,
-        id_to_idx={},
-        input_indices=[2],
-    )
-    y0 = torch.linspace(-4.0, 4.0, n_tracks, dtype=dtype)
-    z0 = torch.linspace(3.0, -3.0, n_tracks, dtype=dtype)
-    tracks = torch.stack((
-        torch.zeros_like(y0), y0, z0,
-        torch.linspace(-0.02, 0.02, n_tracks, dtype=dtype),
-        torch.linspace(-0.03, 0.03, n_tracks, dtype=dtype),
-        torch.zeros_like(y0),
-    ), dim=1)
-    expanded_tracks = tracks[:, None, :].expand(-1, n_planes, -1)
-    expanded_centers = centers[None, :, :].expand(n_tracks, -1, -1)
-    expanded_normals = nominal_rotations[:, :, 2][None, :, :].expand(n_tracks, -1, -1)
-    path, points, valid = m.intersect_plane(expanded_tracks, expanded_centers, expanded_normals)
-    measured = torch.matmul(
-        nominal_rotations[None].transpose(-1, -2),
-        (points - expanded_centers).unsqueeze(-1),
-    ).squeeze(-1)[..., :2]
-    assert valid.all()
-    batches = m.TrackBatches(
-        measured_local=measured,
-        covariances=torch.full((n_tracks, n_planes, 2), 0.01, dtype=dtype),
-        sensor_idx=torch.arange(n_planes).expand(n_tracks, -1),
-        hit_mask=torch.ones((n_tracks, n_planes), dtype=torch.bool),
-        loc1_mask=torch.ones((n_tracks, n_planes), dtype=torch.bool),
-        g_smt=points,
-        p_smt=m.helix_tangent(expanded_tracks, path),
-        volume_id=torch.tensor([10, 10, 17, 10, 10]).expand(n_tracks, -1),
-        layer_id=torch.tensor([0, 1, 8, 3, 4]).expand(n_tracks, -1),
-        is_target=target_mask.expand(n_tracks, -1),
-        event_track_ids=torch.stack((torch.zeros(n_tracks, dtype=torch.long), torch.arange(n_tracks)), dim=1),
-    )
-    config = m.AlignmentRunConfig(
-        track_mode="free", freeze_tracks=True, joint_iters=300,
-        joint_lr_trans=0.02, rot_lr_scale=1.0, lambda_l2=0.0,
-        joint_patience=0, make_plot=False,
-    )
-
-    result = m.run_joint_alignment(
-        batches, geometry, config, active_dof=(5,), initial_track_params=tracks
-    )
-
-    correction = result["predicted_deltas"][2]
-    assert abs(correction[5] + injected_rz) < 2e-3
-    assert np.count_nonzero(correction[:5]) == 0
 
 
 def test_rotation_decomposition_matches_rz_ry_rx_convention():

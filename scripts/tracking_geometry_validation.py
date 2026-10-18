@@ -80,8 +80,8 @@ TOLERANCES = {
 SOLVER_OPTIONS = ("--track-mode", "free", "--active-dof", "tx,ty,rz",
                   "--joint-seed-mode", "non-target-measurement", "--joint-seed-min-hits", "8",
                   "--joint-seed-min-span", "300", "--joint-smt-seed-iters", "2000",
-                  "--joint-measurement-refit-iters", "200", "--joint-solver", "block-lm",
-                  "--lm-max-iters", "60", "--lm-max-step-r", "5e-3", "--joint-iters", "1000",
+                  "--joint-solver", "block-lm",
+                  "--lm-max-iters", "60", "--lm-max-step-r", "5e-3",
                   "--max-tracks", "0", "--lambda-l2", "1e-5")
 CONFIG_TEXT = ('[alignment]\ntarget_layers = ["17:8"]\nactive_dof = [0, 1, 5]\n')
 DEFAULT_ROOT = "data/experiments/helix_truth/Vol17_Lay8__Vol24_Lay4/tracking_geometry_validation"

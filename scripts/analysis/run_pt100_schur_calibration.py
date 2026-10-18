@@ -18,9 +18,9 @@ THREAD_ENV = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS")
 # Copied from run_surface_helix_experiment.sh joint_free; CLI defaults are unvalidated.
 ORCHESTRATOR_ARGS = (
     "--track-mode", "free", "--joint-solver", "schur-lm",
-    "--joint-smt-seed-iters", "2000", "--joint-measurement-refit-iters", "200",
+    "--joint-smt-seed-iters", "2000",
     "--joint-seed-min-hits", "8", "--joint-seed-min-span", "300",
-    "--joint-iters", "1000", "--lambda-l2", "1e-5", "--lm-max-iters", "60",
+    "--lambda-l2", "1e-5", "--lm-max-iters", "60",
     "--no-plot",
 )
 TIMED_STAGES = {

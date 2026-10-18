@@ -39,7 +39,6 @@ START_ITER=0
 TARGET_LAYERS="$TARGET_LAYERS_SPEC"
 ACTIVE_DOF="$ACTIVE_DOF_SPEC"
 EPOCHS=300
-JOINT_ITERS=1000
 JACOBIAN_UPDATE_INTERVAL=20
 LAMBDA_L2=1e-5
 SUFFIX="$TARGET_LAYER_SUFFIX"
@@ -53,7 +52,7 @@ RUN_TAG="autograd_free"
 
 # Track handling for the autograd solver.
 #   surface -> keep the ACTS KF-smoothed tracks frozen, uses EPOCHS
-#   free    -> refit helix track parameters jointly with the geometry, uses JOINT_ITERS
+#   free    -> refit non-target helices, then solve the geometry with block-LM defaults
 # surface leaves the strip v direction unrecoverable because the KF absorbs that
 # misalignment into the track parameters; free breaks that degeneracy.
 TRACK_MODE="free"
@@ -167,7 +166,6 @@ done
 [[ "$START_ITER" =~ ^[0-9]+$ ]] || die "--start-iter must be a non-negative integer"
 [[ "$EPOCHS" =~ ^[0-9]+$ ]] || die "--epochs must be a non-negative integer"
 [[ "$JACOBIAN_UPDATE_INTERVAL" =~ ^[0-9]+$ ]] || die "--jacobian-update-interval must be a non-negative integer"
-[[ "$JOINT_ITERS" =~ ^[0-9]+$ ]] || die "hardcoded JOINT_ITERS must be a non-negative integer"
 
 case "$TRACK_MODE" in
     surface|free) ;;
@@ -315,7 +313,7 @@ echo "  start iter   : $START_ITER"
 echo "  target layers: $TARGET_LAYERS"
 echo "  active dof   : $ACTIVE_DOF"
 if [[ "$ALIGNMENT_SOLVER" != "cpp" && "$TRACK_MODE" == "free" ]]; then
-    echo "  track mode   : $TRACK_MODE (joint iters: $JOINT_ITERS)"
+    echo "  track mode   : $TRACK_MODE (block-lm defaults)"
 else
     echo "  track mode   : $TRACK_MODE (epochs: $EPOCHS)"
 fi
@@ -366,9 +364,7 @@ for ((offset=0; offset<ITERS; offset++)); do
         ml_cmd+=(--jacobian-update-interval "$JACOBIAN_UPDATE_INTERVAL")
     else
         ml_cmd+=(--track-mode "$TRACK_MODE")
-        if [[ "$TRACK_MODE" == "free" ]]; then
-            ml_cmd+=(--joint-iters "$JOINT_ITERS")
-        else
+        if [[ "$TRACK_MODE" == "surface" ]]; then
             ml_cmd+=(--epochs "$EPOCHS")
         fi
     fi
