@@ -7,6 +7,10 @@ import ctypes
 import os
 import argparse
 import sys
+import time
+import hashlib
+import traceback
+from contextlib import redirect_stdout, redirect_stderr
 
 import acts
 import acts.examples
@@ -26,6 +30,9 @@ from experiment_manifest import (
     finalize_experiment_manifest,
     write_experiment_manifest,
 )
+# Pinned pT=100 GeV ACTS-Alignment vs Schur-LM study (ACTS-free shared layout).
+import pt100_alignment_layout as pt100
+from pt100_alignment_layout import PT100_STAGES
 from project_config import (
     absolute_project_path,
     add_config_argument,
@@ -34,6 +41,244 @@ from project_config import (
 )
 
 u = acts.UnitConstants
+
+# Deliberately hardcoded: simulation/reconstruction gain no CLI switches.
+MATERIAL_STUDY_RUN = "material-helix-20261014-r2"
+MATERIAL_STUDY_EVENTS = 20_000
+MATERIAL_STUDY_CASES = (
+    ("g1_pt10_material_on", 10.0, True),
+    ("g2_pt10_material_off", 10.0, False),
+    ("g3_pt100_material_on", 100.0, True),
+)
+
+
+def material_study_paths(data_root, target_dir, run_id, group):
+    root = Path(data_root)
+    return (root / "simulation" / run_id / group,
+            root / "reconstruction" / "nominal" / target_dir / run_id / group)
+
+
+def run_material_study_stage(output, stage, prepare, *, inputs, config):
+    """Own fresh outputs, provenance, native/Python logs and failure-safe timing."""
+    output = Path(output)
+    if output.exists():
+        raise FileExistsError(f"refusing to reuse study output: {output}")
+    output.mkdir(parents=True)
+    timings = {"schema_version": 1, "stage": stage, "setup_seconds": 0.0,
+               "run_seconds": 0.0, "wall_seconds": 0.0,
+               "excludes": "environment loading, manifest hashing and source archival"}
+    timing_path = output / "timings.json"
+    cpu_started = cpu_stopped = None
+    manifest = write_experiment_manifest(
+        output, run_id=f"{output.parent.name}/{output.name}/{stage}",
+        command=[sys.executable, *sys.argv], config=PROJECT_CONFIG,
+        inputs=inputs, outputs={"timings": timing_path, "log": output / f"{stage}.log"},
+        metrics={"study_config": config}, capture_source_snapshot=True, allow_missing_inputs=True)
+    status, error, phase, started = "failed", None, "setup_seconds", None
+    try:
+        with (output / f"{stage}.log").open("w") as log:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            saved = (os.dup(1), os.dup(2))
+            try:
+                os.dup2(log.fileno(), 1)
+                os.dup2(log.fileno(), 2)
+                with redirect_stdout(log), redirect_stderr(log):
+                    try:
+                        started = time.perf_counter()
+                        cpu_started = time.process_time()
+                        sequencer = prepare()
+                        timings[phase] = time.perf_counter() - started
+                        phase, started = "run_seconds", time.perf_counter()
+                        try:
+                            sequencer.run()
+                        finally:
+                            del sequencer
+                        timings[phase] = time.perf_counter() - started
+                        cpu_stopped = time.process_time()
+                        started = None
+                    except BaseException as exc:
+                        # Setup can also fail after creating writer-owning `s`.
+                        # Release traceback frames while the native log is open.
+                        traceback.clear_frames(exc.__traceback__)
+                        raise
+            finally:
+                log.flush()
+                os.dup2(saved[0], 1)
+                os.dup2(saved[1], 2)
+                os.close(saved[0])
+                os.close(saved[1])
+        status = "completed"
+    except BaseException as exc:
+        if started is not None:
+            timings[phase] = time.perf_counter() - started
+        error = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        timings["wall_seconds"] = timings["setup_seconds"] + timings["run_seconds"]
+        # Process CPU over setup+run, summed over all threads: a thread-count-free check.
+        if cpu_started is not None:
+            timings["process_cpu_seconds"] = (cpu_stopped or time.process_time()) - cpu_started
+        timing_path.write_text(json.dumps(timings, indent=2, allow_nan=False) + "\n")
+        outputs = {p.name: p for p in output.iterdir() if p.is_file() and p.name != "manifest.json"}
+        hashes = {}
+        for name, path in outputs.items():
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            hashes[name] = digest.hexdigest()
+        finalize_experiment_manifest(manifest, status=status, outputs=outputs,
+                                     metrics={"timings": timings, "error": error,
+                                              "output_sha256": hashes})
+
+
+def run_material_study(stage):
+    """Run the three pinned arms through an existing adapter subcommand."""
+    config = {"run_id": MATERIAL_STUDY_RUN, "num_events": MATERIAL_STUDY_EVENTS,
+              "random_seed": 42, "geometry": "nominal", "field_tesla": 2.0,
+              "particle": "muon, randomized charge", "eta": [-3., 3.],
+              "reconstruction": "unchanged TruthSmeared seed + Kalman"}
+    field = acts.ConstantBField(acts.Vector3(0, 0, 2 * u.T))
+    for group, pt, interactions in MATERIAL_STUDY_CASES:
+        simulation, reconstruction = material_study_paths(
+            PROJECT_CONFIG.data_root, TARGET_LAYER_DIR, MATERIAL_STUDY_RUN, group)
+        output = simulation if stage == "simulation" else reconstruction
+        inputs = {"digi_config": PROJECT_CONFIG.odd_digi_config,
+                  "nominal_geometry": data_path("odd_transforms.json")}
+        if stage == "reconstruction":
+            if not (simulation / "manifest.json").exists():
+                raise FileNotFoundError(f"missing completed simulation: {simulation}")
+            if json.loads((simulation / "manifest.json").read_text())["status"] != "completed":
+                raise ValueError(f"simulation is not completed: {simulation}")
+            inputs["simulation_dir"] = simulation
+        detectors = []
+        def prepare():
+            detector = get_configured_open_data_detector(misaligned=False)
+            detectors.append(detector)  # Keep detector elements alive through Sequencer.run().
+            common = dict(trackingGeometry=detector.trackingGeometry(), field=field,
+                          digiConfigFile=PROJECT_CONFIG.odd_digi_config, outputDir=output,
+                          detector=detector, numEvents=MATERIAL_STUDY_EVENTS)
+            if stage == "simulation":
+                return runSimulation(**common, fixedPtGeV=pt, enableInteractions=interactions)
+            return runReconstruction(**common, inputDir=simulation, mode="nominal",
+                                     finalOutputDir=True, overwriteOutputs=False)
+        print(f"Starting {stage}: {group} -> {output}", flush=True)
+        run_material_study_stage(output, stage, prepare, inputs=inputs,
+                                 config={**config, "group": group, "pt_gev": pt,
+                                         "fatras_interactions": interactions})
+        print(f"Completed {stage}: {group}", flush=True)
+
+
+class _DeferredRun:
+    """Adapter for run_material_study_stage when the callee runs its own Sequencer."""
+
+    def __init__(self, call):
+        self._call = call
+
+    def run(self):
+        self._call()
+
+
+def _require_completed(directory):
+    manifest = Path(directory) / "manifest.json"
+    if not manifest.exists():
+        raise FileNotFoundError(f"missing completed stage: {directory}")
+    if json.loads(manifest.read_text())["status"] != "completed":
+        raise ValueError(f"stage is not completed: {directory}")
+
+
+def link_pt100_nominal(paths):
+    """Expose the existing g3 nominal reconstruction in the plot-script layout."""
+    if paths["nominal"].exists():
+        return
+    _require_completed(paths["nominal_source"])
+    paths["nominal"].mkdir(parents=True)
+    for stem in ("trackstates_kf", "tracksummary_kf"):
+        name = artifact_filename(stem, ".root")
+        (paths["nominal"] / name).symlink_to(paths["nominal_source"] / name)
+
+
+def full_workflow_manifest(alignment_dir):
+    """The `full` workflow's manifest in `alignment_dir`, or None for any other run."""
+    manifest = Path(alignment_dir) / "manifest.json"
+    if not manifest.exists():
+        return None
+    record = json.loads(manifest.read_text())
+    return record if "workflow_config" in record.get("metrics", {}) else None
+
+
+def run_pt100_alignment_study(stage, run_id=None):
+    if stage not in PT100_STAGES:
+        raise ValueError(f"unknown pt100-alignment stage: {stage}")
+    run_id = run_id or pt100.PT100_ALIGNMENT_RUN
+    paths = pt100.pt100_alignment_paths(PROJECT_CONFIG.data_root, TARGET_LAYER_DIR, run_id)
+    workflow = full_workflow_manifest(paths["alignment"])
+    inputs = {"digi_config": PROJECT_CONFIG.odd_digi_config,
+              "nominal_geometry": data_path("odd_transforms.json")}
+    if workflow is None:
+        _require_completed(paths["simulation"])
+        simulation, num_events = paths["simulation"], pt100.PT100_ALIGNMENT_EVENTS
+        config = {"run_id": run_id, "num_events": num_events,
+                  "source_run": pt100.PT100_SOURCE_RUN, "source_group": pt100.PT100_SOURCE_GROUP,
+                  "pt_gev": 100.0, "fatras_interactions": True,
+                  "misalignment_seed": pt100.PT100_MISALIGNMENT_SEED,
+                  "misalignment": "per-sensor local tx/ty in +-[0.25,0.75] mm, rz in +-[0.01,0.03] rad",
+                  "acts_max_iterations": pt100.PT100_ACTS_MAX_ITERATIONS,
+                  "sequencer_threads": -1, "stage": stage}
+        inputs["simulation_manifest"] = paths["simulation"] / "manifest.json"
+    else:
+        # A `full` run already holds its ACTS alignment and misaligned/aligned
+        # reconstructions; only the Schur-geometry reconstruction is added here.
+        if stage != "aligned-schur":
+            raise ValueError(f"full-workflow run {run_id} only takes the aligned-schur stage")
+        simulation = Path(workflow["outputs"]["simulation_dir"])
+        num_events = workflow["metrics"]["workflow_config"]["num_events"]
+        config = {**workflow["metrics"]["workflow_config"], "run_id": run_id,
+                  "simulation_dir": str(simulation), "stage": stage}
+        inputs["workflow_manifest"] = paths["alignment"] / "manifest.json"
+    field = acts.ConstantBField(acts.Vector3(0, 0, 2 * u.T))
+    if stage != "acts-alignment":
+        _require_completed(paths["alignment"])
+        inputs["misalignment"] = paths["misalignment"]
+    aligned_file = None
+    if stage == "aligned-acts":
+        aligned_file = paths["acts_geometry"]
+    elif stage == "aligned-schur":
+        _require_completed(paths["schur_geometry"].parent)
+        aligned_file = paths["schur_geometry"]
+    if aligned_file is not None:
+        inputs["aligned_geometry"] = aligned_file
+    output = paths["alignment"] if stage == "acts-alignment" else paths[stage]
+    detectors = []
+
+    def prepare():
+        # Every stage applies an alignment store, as HEAD's non-nominal modes did.
+        detector = get_configured_open_data_detector(misaligned=True)
+        detectors.append(detector)  # Keep detector elements alive through the run.
+        common = dict(trackingGeometry=detector.trackingGeometry(), field=field,
+                      digiConfigFile=PROJECT_CONFIG.odd_digi_config,
+                      inputDir=simulation, detector=detector, numEvents=num_events)
+        if stage == "acts-alignment":
+            def align():
+                # setupMisalignment draws from the module-level `random`.
+                random.seed(pt100.PT100_MISALIGNMENT_SEED)
+                runAlignment(**common, outputDir=output,
+                             maxNumIterations=pt100.PT100_ACTS_MAX_ITERATIONS)
+            return _DeferredRun(align)
+        mode = "misaligned" if stage == "misaligned" else "aligned"
+        suffix = "" if aligned_file is None else (
+            f"{TARGET_LAYER_SUFFIX}_{stage.removeprefix('aligned-').replace('schur', 'schur_lm')}")
+        return runReconstruction(**common, outputDir=output, mode=mode,
+                                 alignmentDir=paths["alignment"], alignedFile=aligned_file,
+                                 outputSuffix=suffix, finalOutputDir=True,
+                                 overwriteOutputs=False)
+
+    print(f"Starting pt100-alignment {stage} -> {output}", flush=True)
+    run_material_study_stage(output, stage, prepare, inputs=inputs, config=config)
+    if stage == "misaligned":
+        link_pt100_nominal(paths)
+    print(f"Completed pt100-alignment {stage}", flush=True)
 
 
 def get_configured_open_data_detector(*, misaligned: bool):
@@ -290,6 +535,8 @@ def runSimulation(
     detector=None,
     numEvents=100,
     s: acts.examples.Sequencer = None,
+    fixedPtGeV: Optional[float] = None,
+    enableInteractions: bool = True,
 ):
     """
     Run simulation with misaligned geometry.
@@ -318,7 +565,9 @@ def runSimulation(
         s,
         ParticleConfig(num=1, pdg=acts.PdgParticle.eMuon, randomizeCharge=True),
         EtaConfig(-3.0, 3.0, uniform=True),
-        MomentumConfig(1.0 * u.GeV, 100.0 * u.GeV, transverse=True),
+        MomentumConfig((1.0 if fixedPtGeV is None else fixedPtGeV) * u.GeV,
+                       (100.0 if fixedPtGeV is None else fixedPtGeV) * u.GeV,
+                       transverse=True),
         PhiConfig(0.0 * u.degree, 360.0 * u.degree),
         vtxGen=acts.examples.GaussianVertexGenerator(
             mean=acts.Vector4(0, 0, 0, 0),
@@ -335,7 +584,7 @@ def runSimulation(
         trackingGeometry,
         field,
         rnd=rnd,
-        enableInteractions=True,
+        enableInteractions=enableInteractions,
         outputDirCsv=outputDir,
         outputDirRoot=outputDir,
     )
@@ -646,6 +895,7 @@ def runAlignment(
     reverseFilteringMomThreshold=0 * u.GeV,
     reverseFilteringCovarianceScaling=1,
     s: acts.examples.Sequencer = None,
+    maxNumIterations: int = 100,
 ):
     from acts.examples.simulation import (
         addFatras,
@@ -660,7 +910,7 @@ def runAlignment(
     )
 
     s = s or acts.examples.Sequencer(
-        events=numEvents, numThreads=1, logLevel=acts.logging.INFO
+        events=numEvents, numThreads=-1, logLevel=acts.logging.INFO
     )
 
     rnd = acts.examples.RandomNumbers(seed=42)
@@ -886,7 +1136,7 @@ def runAlignment(
     aal_cfg.align = acts.examples.alignment.makeAlignmentFunction(
         trackingGeometry, field, acts.logging.INFO
     )
-    aal_cfg.maxNumIterations = 100  # Reasonable number of iterations
+    aal_cfg.maxNumIterations = maxNumIterations
     aal_cfg.maxNumTracks = 100000
     aal_cfg.iterationState = {
         i: int(alignment_dof) for i in range(aal_cfg.maxNumIterations)
@@ -1015,6 +1265,7 @@ def runReconstruction(
     recordSteps: bool = False,  # Keep the stepping logger alive for diagnostics
     materialEnergyLoss: bool = False,  # Gate 0 ablation only; see below
     overwriteOutputs: bool = False,  # Allow RECREATE over an existing ROOT file
+    finalOutputDir: bool = False,  # Internal study path already includes target/group
 ):
     """
     Run reconstruction with different geometry modes.
@@ -1043,12 +1294,12 @@ def runReconstruction(
     )
 
     s = s or acts.examples.Sequencer(
-        events=numEvents, numThreads=1, logLevel=acts.logging.INFO
+        events=numEvents, numThreads=-1, logLevel=acts.logging.INFO
     )
 
     rnd = acts.examples.RandomNumbers(seed=42)
     inputDir = Path(inputDir)
-    outputDir = target_subdir(outputDir)
+    outputDir = Path(outputDir) if finalOutputDir else target_subdir(outputDir)
     outputDir.mkdir(parents=True, exist_ok=True)
 
     logger = acts.logging.getLogger("Reconstruction")
@@ -1391,6 +1642,12 @@ if "__main__" == __name__:
         default=None,
         help="Reconstruction output directory (default: reconstruction_output)",
     )
+    full_parser.add_argument(
+        "--pt-gev",
+        type=float,
+        default=None,
+        help="Fixed simulated muon pT in GeV (default: uniform 1-100 GeV)",
+    )
 
     # Simulation command
     sim_parser = subparsers.add_parser("simulation", help="Run simulation")
@@ -1520,6 +1777,17 @@ if "__main__" == __name__:
         "manifest so it can be replayed independent of git commit/dirty state.",
     )
 
+    pt100_parser = subparsers.add_parser(
+        "pt100-alignment",
+        help="Pinned pT=100 GeV material-on ACTS-Alignment vs Schur-LM study stage",
+    )
+    pt100_parser.add_argument("stage", choices=PT100_STAGES)
+    pt100_parser.add_argument(
+        "--run-id", default=None,
+        help="Run under data/alignment/ (default: the pinned study run); a completed "
+        "`full` run takes only aligned-schur",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1555,103 +1823,155 @@ if "__main__" == __name__:
             else data_path("reconstruction_output")
         )
 
-        # Step 1: Simulation (NOMINAL geometry — controlled experiment)
-        # Hits are generated at nominal positions (clean baseline).
-        # Misalignment is injected only into the reconstruction geometry (Step 2+),
-        # so we know the ground truth and can measure how well alignment recovers it.
-        print("\n" + "=" * 80)
-        print("STEP 1: SIMULATION (using NOMINAL geometry)")
-        print("=" * 80)
-        detector_nom = get_configured_open_data_detector(misaligned=False)
-        trackingGeometry_nom = detector_nom.trackingGeometry()
-
-        runSimulation(
-            trackingGeometry=trackingGeometry_nom,
-            field=field,
-            digiConfigFile=digiConfigFile,
-            outputDir=simulationDir,
-            detector=detector_nom,
-            numEvents=args.num_events,
-        ).run()
-
-        # Step 2: Alignment (starting from MISALIGNED geometry)
-        # The alignment algorithm starts from the perturbed geometry and uses the
-        # nominal hits from Step 1 to learn corrections back toward nominal.
-        print("\n" + "=" * 80)
-        print("STEP 2: ALIGNMENT (starting from MISALIGNED geometry)")
-        print("=" * 80)
-        alignmentDir.mkdir(parents=True, exist_ok=True)
-
-        detector_mis = get_configured_open_data_detector(misaligned=True)
-        trackingGeometry_mis = detector_mis.trackingGeometry()
-
-        runAlignment(
-            trackingGeometry=trackingGeometry_mis,
-            field=field,
-            digiConfigFile=digiConfigFile,
-            inputDir=simulationDir,
-            outputDir=alignmentDir,
-            detector=detector_mis,
-            numEvents=args.num_events,
+        manifest_path = alignmentDir / "manifest.json"
+        if manifest_path.exists():
+            raise FileExistsError(f"refusing to reuse full-workflow run: {manifest_path}")
+        manifest = write_experiment_manifest(
+            alignmentDir,
+            run_id=f"full/{alignmentDir.parent.name}",
+            command=[sys.executable, *sys.argv],
+            config=PROJECT_CONFIG,
+            inputs={
+                "digi_config": digiConfigFile,
+                "nominal_geometry": data_path("odd_transforms.json"),
+            },
+            outputs={
+                "simulation_dir": simulationDir,
+                "alignment_dir": alignmentDir,
+                "reconstruction_dir": reconstructionDir,
+            },
+            metrics={
+                "workflow_config": {
+                    "num_events": args.num_events,
+                    "pt_gev": args.pt_gev,
+                    "fatras_interactions": True,
+                    "sequencer_threads": -1,
+                    "random_seed": 42,
+                    "field_tesla": 2.0,
+                }
+            },
+            status="running",
+            capture_source_snapshot=True,
         )
+        try:
+            # Step 1: Simulation (NOMINAL geometry — controlled experiment)
+            # Hits are generated at nominal positions (clean baseline).
+            # Misalignment is injected only into the reconstruction geometry (Step 2+),
+            # so we know the ground truth and can measure how well alignment recovers it.
+            print("\n" + "=" * 80)
+            print("STEP 1: SIMULATION (using NOMINAL geometry)")
+            print("=" * 80)
+            detector_nom = get_configured_open_data_detector(misaligned=False)
+            trackingGeometry_nom = detector_nom.trackingGeometry()
 
-        # Step 3: Reconstruction with nominal geometry
-        print("\n" + "=" * 80)
-        print("STEP 3: RECONSTRUCTION WITH NOMINAL GEOMETRY")
-        print("=" * 80)
-        # detector_nom and trackingGeometry_nom already created in Step 1
-        reconDir_nom = target_subdir(reconstructionDir / "nominal")
-        reconDir_nom.mkdir(parents=True, exist_ok=True)
+            runSimulation(
+                trackingGeometry=trackingGeometry_nom,
+                field=field,
+                digiConfigFile=digiConfigFile,
+                outputDir=simulationDir,
+                detector=detector_nom,
+                numEvents=args.num_events,
+                fixedPtGeV=args.pt_gev,
+            ).run()
 
-        runReconstruction(
-            trackingGeometry=trackingGeometry_nom,
-            field=field,
-            digiConfigFile=digiConfigFile,
-            inputDir=simulationDir,
-            outputDir=reconDir_nom,
-            detector=detector_nom,
-            numEvents=args.num_events,
-            mode="nominal",
-            alignmentDir=alignmentDir,
-        ).run()
+            # Step 2: Alignment (starting from MISALIGNED geometry)
+            # The alignment algorithm starts from the perturbed geometry and uses the
+            # nominal hits from Step 1 to learn corrections back toward nominal.
+            print("\n" + "=" * 80)
+            print("STEP 2: ALIGNMENT (starting from MISALIGNED geometry)")
+            print("=" * 80)
+            alignmentDir.mkdir(parents=True, exist_ok=True)
 
-        # Step 4: Reconstruction with misaligned geometry
-        print("\n" + "=" * 80)
-        print("STEP 4: RECONSTRUCTION WITH MISALIGNED GEOMETRY")
-        print("=" * 80)
-        reconDir_mis = target_subdir(reconstructionDir / "misaligned")
-        reconDir_mis.mkdir(parents=True, exist_ok=True)
+            detector_mis = get_configured_open_data_detector(misaligned=True)
+            trackingGeometry_mis = detector_mis.trackingGeometry()
 
-        runReconstruction(
-            trackingGeometry=trackingGeometry_mis,
-            field=field,
-            digiConfigFile=digiConfigFile,
-            inputDir=simulationDir,
-            outputDir=reconDir_mis,
-            detector=detector_mis,
-            numEvents=args.num_events,
-            mode="misaligned",
-            alignmentDir=alignmentDir,
-        ).run()
+            runAlignment(
+                trackingGeometry=trackingGeometry_mis,
+                field=field,
+                digiConfigFile=digiConfigFile,
+                inputDir=simulationDir,
+                outputDir=alignmentDir,
+                detector=detector_mis,
+                numEvents=args.num_events,
+            )
 
-        # Step 5: Reconstruction with aligned geometry
-        print("\n" + "=" * 80)
-        print("STEP 5: RECONSTRUCTION WITH ALIGNED GEOMETRY")
-        print("=" * 80)
-        reconDir_ali = target_subdir(reconstructionDir / "aligned")
-        reconDir_ali.mkdir(parents=True, exist_ok=True)
+            # Step 3: Reconstruction with nominal geometry
+            print("\n" + "=" * 80)
+            print("STEP 3: RECONSTRUCTION WITH NOMINAL GEOMETRY")
+            print("=" * 80)
+            # detector_nom and trackingGeometry_nom already created in Step 1
+            reconDir_nom = target_subdir(reconstructionDir / "nominal")
+            reconDir_nom.mkdir(parents=True, exist_ok=True)
 
-        runReconstruction(
-            trackingGeometry=trackingGeometry_mis,
-            field=field,
-            digiConfigFile=digiConfigFile,
-            inputDir=simulationDir,
-            outputDir=reconDir_ali,
-            detector=detector_mis,
-            numEvents=args.num_events,
-            mode="aligned",
-            alignmentDir=alignmentDir,
-        ).run()
+            runReconstruction(
+                trackingGeometry=trackingGeometry_nom,
+                field=field,
+                digiConfigFile=digiConfigFile,
+                inputDir=simulationDir,
+                outputDir=reconDir_nom,
+                detector=detector_nom,
+                numEvents=args.num_events,
+                mode="nominal",
+                alignmentDir=alignmentDir,
+            ).run()
+
+            # Step 4: Reconstruction with misaligned geometry
+            print("\n" + "=" * 80)
+            print("STEP 4: RECONSTRUCTION WITH MISALIGNED GEOMETRY")
+            print("=" * 80)
+            reconDir_mis = target_subdir(reconstructionDir / "misaligned")
+            reconDir_mis.mkdir(parents=True, exist_ok=True)
+
+            runReconstruction(
+                trackingGeometry=trackingGeometry_mis,
+                field=field,
+                digiConfigFile=digiConfigFile,
+                inputDir=simulationDir,
+                outputDir=reconDir_mis,
+                detector=detector_mis,
+                numEvents=args.num_events,
+                mode="misaligned",
+                alignmentDir=alignmentDir,
+            ).run()
+
+            # Step 5: Reconstruction with aligned geometry
+            print("\n" + "=" * 80)
+            print("STEP 5: RECONSTRUCTION WITH ALIGNED GEOMETRY")
+            print("=" * 80)
+            reconDir_ali = target_subdir(reconstructionDir / "aligned")
+            reconDir_ali.mkdir(parents=True, exist_ok=True)
+
+            runReconstruction(
+                trackingGeometry=trackingGeometry_mis,
+                field=field,
+                digiConfigFile=digiConfigFile,
+                inputDir=simulationDir,
+                outputDir=reconDir_ali,
+                detector=detector_mis,
+                numEvents=args.num_events,
+                mode="aligned",
+                alignmentDir=alignmentDir,
+            ).run()
+        except BaseException as error:
+            finalize_experiment_manifest(
+                manifest,
+                status="failed",
+                metrics={"error": f"{type(error).__name__}: {error}"},
+            )
+            raise
+        finalize_experiment_manifest(
+            manifest,
+            status="completed",
+            outputs={
+                "aligned_transforms": alignmentDir
+                / artifact_filename("aligned_transforms", ".json"),
+                "misalignment_applied": alignmentDir
+                / artifact_filename("misalignment_applied", ".json"),
+                "reconstruction_nominal": reconDir_nom,
+                "reconstruction_misaligned": reconDir_mis,
+                "reconstruction_aligned": reconDir_ali,
+            },
+        )
 
         print("\n" + "=" * 80)
         print("=" * 80)
@@ -1666,22 +1986,7 @@ if "__main__" == __name__:
         print(f"  - Reconstruction (aligned): {reconDir_ali}")
 
     elif args.command == "simulation":
-        outputDir = (
-            Path(args.output_dir)
-            if args.output_dir
-            else data_path("simulation_output")
-        )
-        detector = get_configured_open_data_detector(misaligned=True)
-        trackingGeometry = detector.trackingGeometry()
-
-        runSimulation(
-            trackingGeometry=trackingGeometry,
-            field=field,
-            digiConfigFile=digiConfigFile,
-            outputDir=outputDir,
-            detector=detector,
-            numEvents=args.num_events,
-        ).run()
+        run_material_study("simulation")
 
     elif args.command == "alignment":
         inputDir = (
@@ -1713,58 +2018,10 @@ if "__main__" == __name__:
         )
 
     elif args.command == "reconstruction":
-        inputDir = (
-            Path(args.input_dir) if args.input_dir else data_path("simulation_output")
-        )
-#        outputDir = (
-#            Path(args.output_dir)
-#            if args.output_dir
-#            else data_path("reconstruction_output")
-#        )
-#        outputDir.mkdir(exist_ok=True)
-        baseoutputDir = (
-            Path(args.output_dir)
-            if args.output_dir
-            else data_path("reconstruction_output")
-        )
-        outputDir = target_subdir(baseoutputDir / args.mode)
-        outputDir.mkdir(parents=True, exist_ok=True)
+        run_material_study("reconstruction")
 
-        if not inputDir.exists():
-            print(f"Error: Input directory {inputDir} does not exist!")
-            print("Please run simulation first to generate simulation data.")
-            sys.exit(1)
-
-        # Choose detector based on mode
-        if args.mode == "nominal":
-            detector = get_configured_open_data_detector(misaligned=False)
-        else:
-            detector = get_configured_open_data_detector(misaligned=True)
-
-        trackingGeometry = detector.trackingGeometry()
-
-        runReconstruction(
-            trackingGeometry=trackingGeometry,
-            field=field,
-            digiConfigFile=digiConfigFile,
-            inputDir=inputDir,
-            outputDir=outputDir,
-            detector=detector,
-            numEvents=args.num_events,
-            mode=args.mode,
-            alignedFile=args.aligned_file,
-            outputSuffix=args.output_suffix,
-            overwriteOutputs=True,
-        ).run()
-
-        print("\n" + "=" * 60)
-        print("Reconstruction completed successfully!")
-        print("=" * 60)
-        print(f"\nOutput files saved to: {outputDir}")
-        print("\nGenerated files:")
-        print(f"  - {reconstruction_output_name('trackstates_kf', args.output_suffix)}: Track states")
-        print(f"  - {reconstruction_output_name('tracksummary_kf', args.output_suffix)}: Track summary")
-        print(f"  - {reconstruction_output_name('performance_kf', args.output_suffix)}: Reconstruction performance")
+    elif args.command == "pt100-alignment":
+        run_pt100_alignment_study(args.stage, args.run_id)
 
     elif args.command == "material":
         inputDir = (
