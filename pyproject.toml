@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ml-alignment"
-version = "0.1.0"
-description = "Detector alignment algorithms with an optional ACTS integration layer"
+name = "mlalign"
+version = "0.2.0"
+description = "Joint track-geometry Schur-LM alignment of tracking-detector surfaces"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -14,19 +14,25 @@ dependencies = [
   "numpy>=1.24",
   "pandas>=2.0",
   "scipy>=1.11",
-  "tomli>=2.0; python_version < '3.11'",
   "torch>=2.1",
   "uproot>=5.3",
 ]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-timeout>=2.3"]
+# The scripts/ workflow layer (TOML configuration, ACTS adapter, plots).
+workflow = ["tomli>=2.0; python_version < '3.11'"]
 
-[tool.setuptools]
-py-modules = []
+[project.scripts]
+mlalign-align = "mlalign.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Workflow scripts are flat modules; the package itself comes from `pip install -e .`.
+pythonpath = ["scripts"]
 addopts = "-ra -m 'not root_io'"
 markers = [
   "acts: requires an activated ACTS/LCG runtime",

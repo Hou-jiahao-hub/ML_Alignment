@@ -45,24 +45,24 @@ from scipy.sparse import csc_matrix, csr_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import splu
 
-from mlalign.box_constraints import (
-    BLOCK_LM_BOUND_ATOL,
+from .box_constraints import (
+    BOUND_ATOL,
     JOINT_CLAMP_R,
     JOINT_CLAMP_T,
-    _block_lm_free_dof_mask,
+    free_dof_mask,
 )
-from mlalign.conventions import DEFAULT_ACTIVE_DOF
-from mlalign.helix.gauge import (
+from .conventions import DEFAULT_ACTIVE_DOF
+from .helix.gauge import (
     pack_gauge_fixed_track_parameters,
     reference_gauge_frame,
     unpack_gauge_fixed_track_parameters,
 )
-from mlalign.helix.measurement_fit import (
+from .helix.measurement_fit import (
     MeasurementFitInputs,
     _measurement_standardized_residual_tensors,
     measurement_local_prediction,
 )
-from mlalign.rotations import apply_alignment_torch
+from .rotations import apply_alignment_torch
 
 #: Units of the dimensionless geometry increment, identical to block-LM's
 #: ``physical_scales``: mm for translations, 10 mrad for rotations.
@@ -310,7 +310,7 @@ def linearize_tracks(
     ``_non_target_fit_mask`` guard is neither used nor relaxed.
     """
     active_dof = tuple(int(dof) for dof in active_dof)
-    parameters = parameters.detach().to(device="cpu", dtype=DTYPE)
+    parameters = parameters.detach().to(dtype=DTYPE)
     inputs = _hit_inputs(parameters, batches, geometry, alignment, active_dof)
     n_tracks, n_hits = inputs.is_target.shape
     k = inputs.k
@@ -349,7 +349,7 @@ def whitened_residuals(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Residuals of ``linearize_tracks`` without the Jacobians, and the valid components."""
     active_dof = tuple(int(dof) for dof in active_dof)
-    parameters = parameters.detach().to(device="cpu", dtype=DTYPE)
+    parameters = parameters.detach().to(dtype=DTYPE)
     inputs = _hit_inputs(parameters, batches, geometry, alignment, active_dof)
     residual = torch.zeros((*inputs.is_target.shape, 2), dtype=DTYPE)
     for start in range(0, len(inputs.track_index), chunk_hits):
@@ -767,7 +767,7 @@ def free_geometry_mask(
     ``values`` are the physical active alignment [n, k]; ``gradient`` is the
     undamped reduced gradient ``b = c - G Gamma^-1 beta`` (only its sign is read).
     """
-    return _block_lm_free_dof_mask(values, gradient, -bounds, bounds)
+    return free_dof_mask(values, gradient, -bounds, bounds)
 
 
 def restrict_to_free(system: SchurSystem, free: torch.Tensor) -> SchurSystem:
@@ -822,11 +822,11 @@ def apply_geometry_step(
     """``values + alpha * step`` with the blocking DOFs snapped onto their bound.
 
     The snap only removes rounding of ``alpha * step``; anything beyond
-    ``BLOCK_LM_BOUND_ATOL`` outside the box is an error, never a clamp.
+    ``BOUND_ATOL`` outside the box is an error, never a clamp.
     """
     moved = values + alpha * _physical_step(delta_u, active_dof)
     excess = moved.abs() - bounds
-    if bool((excess > BLOCK_LM_BOUND_ATOL).any()):
+    if bool((excess > BOUND_ATOL).any()):
         raise ValueError("Geometry step leaves the box; scale it with step_to_bound first.")
     return torch.where(excess > 0.0, torch.sign(moved) * bounds, moved)
 
@@ -1479,19 +1479,19 @@ def run_schur_lm_alignment(
 ):
     """Fit target geometry and every track jointly with ``schur-lm``.
 
-    Same inputs and result keys as ``run_block_lm_alignment``, so the pipeline
-    can switch solvers.  Runs on CPU in float64 whatever ``config.gpu`` says,
-    and the outer budget is ``SCHUR_LM_MAX_ITERS``, not ``config.lm_max_iters``;
+    Runs on the CPU in float64.  ``max_iters`` is the outer budget; the
+    pipeline passes ``config.lm_max_iters``, whose default equals the
+    pre-registered ``SCHUR_LM_MAX_ITERS``;
     there is no per-DOF step clipping.  ``history`` is the target chi2 per
     frozen target component after each accepted step.
     """
-    from mlalign.helix_init import seed_helices
-    from mlalign.joint_residuals import _target_alignment_evaluation
+    from .helix_init import seed_helices
+    from .joint_residuals import _target_alignment_evaluation
 
     active_dof = tuple(int(dof) for dof in active_dof)
     if initial_track_params is None:
-        initial_track_params = seed_helices(batches, device=torch.device("cpu"), dtype=DTYPE)
-    tracks = initial_track_params.detach().to(device="cpu", dtype=DTYPE)
+        initial_track_params = seed_helices(batches, dtype=DTYPE)
+    tracks = initial_track_params.detach().to(dtype=DTYPE)
     model = HelixSchurModel(batches, geometry, active_dof)
     zero = torch.zeros((len(geometry.centers), 6), dtype=DTYPE)
     initial_loss, initial_invalid, initial_residuals, initial_mask = _target_alignment_evaluation(

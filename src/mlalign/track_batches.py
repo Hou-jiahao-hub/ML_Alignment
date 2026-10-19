@@ -9,8 +9,10 @@ import torch
 
 from .conventions import parse_target_layers
 
-JOINT_SEED_MIN_HITS = 8
-JOINT_SEED_MIN_SPAN = 300.0
+from .config import (
+    DEFAULT_SEED_MIN_HITS as JOINT_SEED_MIN_HITS,
+    DEFAULT_SEED_MIN_SPAN as JOINT_SEED_MIN_SPAN,
+)
 
 
 @dataclass

@@ -8,10 +8,7 @@ import re
 
 import numpy as np
 
-try:
-    from .alignment_artifact_layout import TARGET_LAYERS
-except ImportError:  # Direct script execution.
-    from alignment_artifact_layout import TARGET_LAYERS
+from .config import DEFAULT_TARGET_LAYERS as TARGET_LAYERS
 
 
 def _parse_target_layers(target_layers):

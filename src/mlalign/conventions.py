@@ -1,16 +1,10 @@
-"""Alignment DOF and target-layer conventions shared by every solver."""
+"""Alignment DOF and target-layer parsing."""
 
 from __future__ import annotations
 
-from alignment_artifact_layout import ACTIVE_DOF as CONFIG_ACTIVE_DOF, TARGET_LAYERS
+from .config import DEFAULT_ACTIVE_DOF, DEFAULT_TARGET_LAYERS
 
 EPS_COVARIANCE = 1e-8
-DEFAULT_TARGET_LAYERS = TARGET_LAYERS
-
-# Shared by both track modes.  tz is excluded (never injected and poorly
-# constrained by a planar residual); rz must stay in -- it is the only
-# rotation the current misalignment actually produces.
-DEFAULT_ACTIVE_DOF = CONFIG_ACTIVE_DOF
 
 
 def parse_active_dof(active_dof):
@@ -62,8 +56,3 @@ def parse_target_layers(target_layers):
     if not parsed:
         raise ValueError("At least one target layer must be selected.")
     return tuple(parsed)
-
-
-def resolve_active_dof(config):
-    """Both track modes share one default; parse_active_dof handles None and ''."""
-    return parse_active_dof(config.active_dof)

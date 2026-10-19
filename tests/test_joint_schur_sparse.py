@@ -14,7 +14,7 @@ import time
 import pytest
 import torch
 
-import joint_alignment_schur as J
+from mlalign import schur_lm as J
 import joint_schur_synthetic as syn
 
 DTYPE = torch.float64

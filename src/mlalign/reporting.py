@@ -45,7 +45,6 @@ def write_alignment_summary(result, output_path):
         "invalid_fraction",
         "solver",
         "stop_reason",
-        "block_lm_summary",
         "schur_lm_summary",
     )
     summary = {key: _json_ready(result[key]) for key in retained_keys if key in result}
@@ -54,25 +53,6 @@ def write_alignment_summary(result, output_path):
         summary["correction_max_abs"] = (
             float(np.max(np.abs(corrections))) if corrections.size else 0.0
         )
-    fisher = result.get("fisher_diagnostics")
-    if fisher is not None:
-        finite_conditions = [
-            float(item["condition_number"])
-            for item in fisher
-            if math.isfinite(float(item.get("condition_number", float("inf"))))
-        ]
-        regularizations = [float(item.get("regularization", 0.0)) for item in fisher]
-        accepted_steps = sum(bool(item.get("accepted")) for item in fisher)
-        summary["fisher_summary"] = {
-            "evaluations": len(fisher),
-            "accepted_steps": accepted_steps,
-            "rejected_steps": len(fisher) - accepted_steps,
-            "damping_retries": sum(int(item.get("attempt", 0) or 0) for item in fisher),
-            "lstsq_fallbacks": sum(bool(item.get("lstsq_fallback")) for item in fisher),
-            "clipped_steps": sum(bool(item.get("step_clipped")) for item in fisher),
-            "finite_condition_max": max(finite_conditions) if finite_conditions else None,
-            "regularization_max": max(regularizations) if regularizations else None,
-        }
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(

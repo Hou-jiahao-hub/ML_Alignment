@@ -58,18 +58,17 @@ def damped_gauss_newton(
             return residual_of(values, rows), torch.ones_like(rows, dtype=torch.bool)
 
     theta = theta.clone()
-    rows = torch.arange(theta.shape[0], device=theta.device)
+    rows = torch.arange(theta.shape[0])
     residual = residual_of(theta, rows)
     current = 0.5 * residual.square().sum(dim=1)
     if not torch.isfinite(current).all():
         raise FloatingPointError("Non-finite initial Gauss-Newton objective.")
     initial = float(current.mean())
-    identity = torch.eye(theta.shape[1], dtype=theta.dtype, device=theta.device)
+    identity = torch.eye(theta.shape[1], dtype=theta.dtype)
     level = torch.full(
         (theta.shape[0], 1, 1),
         float(damping),
         dtype=theta.dtype,
-        device=theta.device,
     )
     decrement = torch.full_like(current, float("nan"))
     relative_decrement = torch.full_like(current, float("nan"))

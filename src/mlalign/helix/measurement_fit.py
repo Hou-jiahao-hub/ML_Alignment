@@ -64,15 +64,13 @@ class MeasurementFitInputs:
             rotations=self.rotations[start:stop],
         )
 
-    def to(
-        self, device: str | torch.device, dtype: torch.dtype
-    ) -> "MeasurementFitInputs":
+    def to(self, dtype: torch.dtype) -> "MeasurementFitInputs":
         return MeasurementFitInputs(
-            measured=self.measured.to(device=device, dtype=dtype),
-            variance=self.variance.to(device=device, dtype=dtype),
-            component_mask=self.component_mask.to(device=device),
-            centers=self.centers.to(device=device, dtype=dtype),
-            rotations=self.rotations.to(device=device, dtype=dtype),
+            measured=self.measured.to(dtype=dtype),
+            variance=self.variance.to(dtype=dtype),
+            component_mask=self.component_mask,
+            centers=self.centers.to(dtype=dtype),
+            rotations=self.rotations.to(dtype=dtype),
         )
 
 
@@ -243,12 +241,11 @@ def _fit_helix_measurements_gauss_newton_block(
         initial, inputs, initial_jacobian, "initial"
     )
     initial_objective = float(current.mean())
-    identity = torch.eye(theta.shape[1], dtype=theta.dtype, device=theta.device)
+    identity = torch.eye(theta.shape[1], dtype=theta.dtype)
     level = torch.full(
         (theta.shape[0], 1, 1),
         float(damping),
         dtype=theta.dtype,
-        device=theta.device,
     )
     converged = False
     iterations = 0
@@ -299,7 +296,6 @@ def fit_helix_measurements_gauss_newton(
     damping: float = GAUSS_NEWTON_INITIAL_DAMPING,
     tolerance: float = GAUSS_NEWTON_TOLERANCE,
     chunk_rows: int = MEASUREMENT_FIT_CHUNK_ROWS,
-    device: str | torch.device = "cpu",
     dtype: torch.dtype = torch.float64,
 ) -> tuple[torch.Tensor, dict]:
     """Fit independent single helices to local measurements in row chunks."""
@@ -309,8 +305,8 @@ def fit_helix_measurements_gauss_newton(
         raise ValueError("initial and measurement inputs must have matching rows.")
     if max_iters < 1:
         raise ValueError("max_iters must be at least 1.")
-    initial = initial.to(device=device, dtype=dtype)
-    inputs = inputs.to(device=device, dtype=dtype)
+    initial = initial.to(dtype=dtype)
+    inputs = inputs.to(dtype=dtype)
     step = initial.shape[0] if chunk_rows <= 0 else chunk_rows
     fitted_blocks: list[torch.Tensor] = []
     diagnostics_blocks: list[dict[str, float | int | bool]] = []
@@ -329,7 +325,7 @@ def fit_helix_measurements_gauss_newton(
         weights.append(stop - start)
     fitted = torch.cat(fitted_blocks, dim=0)
     decrement = measurement_newton_decrement(
-        fitted, inputs, chunk_rows=chunk_rows, device=device, dtype=dtype
+        fitted, inputs, chunk_rows=chunk_rows, dtype=dtype
     )
     return fitted, {
         "solver": "gauss-newton",
@@ -344,14 +340,13 @@ def measurement_newton_decrement(
     parameters: torch.Tensor,
     inputs: MeasurementFitInputs,
     chunk_rows: int = MEASUREMENT_FIT_CHUNK_ROWS,
-    device: str | torch.device = "cpu",
     dtype: torch.dtype = torch.float64,
 ) -> torch.Tensor:
     """Return per-row ``g^T H^-1 g`` for the single-helix measurement fit."""
     if parameters.shape != (inputs.measured.shape[0], 6):
         raise ValueError("parameters must have shape [tracks, 6].")
-    parameters = parameters.to(device=device, dtype=dtype)
-    inputs = inputs.to(device=device, dtype=dtype)
+    parameters = parameters.to(dtype=dtype)
+    inputs = inputs.to(dtype=dtype)
     step = parameters.shape[0] if chunk_rows <= 0 else chunk_rows
     pieces: list[torch.Tensor] = []
     for start in range(0, parameters.shape[0], max(step, 1)):
@@ -371,7 +366,7 @@ def measurement_newton_decrement(
         ).squeeze(-1)
         scale = hessian.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1.0e-30)
         identity = torch.eye(
-            theta.shape[1], dtype=theta.dtype, device=theta.device
+            theta.shape[1], dtype=theta.dtype
         )
         regularized = (
             hessian

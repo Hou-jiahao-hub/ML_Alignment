@@ -4,19 +4,19 @@ from __future__ import annotations
 
 import torch
 
-import joint_alignment_schur as J
+from mlalign import schur_lm as J
 import joint_schur_synthetic as syn
-import ml_alignment_autograd as M
-from helix_model import (
+from mlalign.helix.gauge import pack_gauge_fixed_track_parameters, reference_gauge_frame
+from mlalign.helix.measurement_fit import (
     MEASUREMENT_VARIANCE_FLOOR,
     MeasurementFitInputs,
-    helix_tangent,
-    intersect_plane,
     measurement_residual_jacobian,
     measurement_standardized_residual,
-    pack_gauge_fixed_track_parameters,
-    reference_gauge_frame,
 )
+from mlalign.helix.trajectory import helix_tangent, intersect_plane
+
+from mlalign.conventions import EPS_COVARIANCE
+from mlalign.rotations import apply_alignment_torch
 
 # Iteration 35: Richardson extrapolation of central differences at h and h/2.
 FD_STEP = 1.0e-3
@@ -58,7 +58,7 @@ def _problem():
 
 def _residual(problem, parameters, theta, alignment, component_mask):
     """Production whitened residual on the frozen set, an independent path."""
-    centers, rotations = M.apply_alignment_torch(
+    centers, rotations = apply_alignment_torch(
         problem.geometry.centers, problem.geometry.rotations, alignment
     )
     sensor = problem.batches.sensor_idx
@@ -89,7 +89,7 @@ def _closes(ad, fd):
 
 
 def _cos_incidence(problem, parameters, alignment):
-    centers, rotations = M.apply_alignment_torch(
+    centers, rotations = apply_alignment_torch(
         problem.geometry.centers, problem.geometry.rotations, alignment
     )
     sensor = problem.batches.sensor_idx
@@ -166,40 +166,10 @@ def test_structural_zeros_are_exact():
     assert bool((lin.block_index[~lin.is_target] == -1).all())
 
 
-def test_geometry_blocks_match_production_block_lm_linearisation():
-    problem, parameters, alignment = _problem()
-    lin = J.linearize_tracks(parameters, problem.batches, problem.geometry, alignment, ACTIVE)
-    information, gradient = J.normal_blocks(lin).geometry_information()
-    active_index = torch.tensor(ACTIVE)
-    physical_scales = torch.tensor([1.0, 1.0, 1.0, 0.01, 0.01, 0.01], dtype=torch.float64)[
-        active_index
-    ]
-    assert torch.equal(J.geometry_embedding(ACTIVE).sum(0), physical_scales)
-
-    for block, sensor in enumerate(lin.target_sensors.tolist()):
-        _values, _variance, fixed_mask, _valid = M._sensor_residual_data(
-            parameters, alignment[sensor], sensor, problem.batches, problem.geometry
-        )
-        _residual, fisher, production_gradient = M._block_lm_linearized_block(
-            parameters,
-            alignment[sensor],
-            sensor,
-            problem.batches,
-            problem.geometry,
-            active_index,
-            physical_scales,
-            fixed_mask,
-        )
-        assert torch.linalg.norm(information[block] - fisher) <= PRODUCTION_RTOL * torch.linalg.norm(fisher)
-        assert torch.linalg.norm(gradient[block] - production_gradient) <= (
-            PRODUCTION_RTOL * torch.linalg.norm(production_gradient)
-        )
-
-
 def test_reference_track_jacobian_matches_production_measurement_fit():
     problem, parameters, alignment = _problem()
     lin = J.linearize_tracks(parameters, problem.batches, problem.geometry, alignment, ACTIVE)
-    centers, rotations = M.apply_alignment_torch(
+    centers, rotations = apply_alignment_torch(
         problem.geometry.centers, problem.geometry.rotations, alignment
     )
     sensor = problem.batches.sensor_idx
@@ -220,4 +190,4 @@ def test_reference_track_jacobian_matches_production_measurement_fit():
 
 
 def test_both_whitening_paths_share_one_variance_floor():
-    assert M.EPS_COVARIANCE == MEASUREMENT_VARIANCE_FLOOR == 1.0e-8
+    assert EPS_COVARIANCE == MEASUREMENT_VARIANCE_FLOOR == 1.0e-8

@@ -15,8 +15,6 @@ from .helix.point_fit import fit_helix_points_gauss_newton
 from .helix.trajectory import closest_helix_points, intersect_plane
 from .track_batches import _non_target_fit_mask
 
-JOINT_SMT_SEED_ITERS = 200
-
 #: Solver for the joint initialization's measurement refit.  Iteration 18 measured
 #: the former Adam path on real data: Newton decrement p90 = 4.17e5 against a
 #: threshold of 1e-6, with 100% of rows non-stationary after the full
@@ -25,11 +23,8 @@ JOINT_SMT_SEED_ITERS = 200
 #: before Iteration 19 requires checking out commit 97cd01c.
 JOINT_REFIT_SOLVER_GAUSS_NEWTON = "gauss-newton"
 
-#: Pre-registration for the joint refit, kept separate from the Gate 4 block's
-#: ``PREREGISTRATION_VERSION``.  That constant governs the verdict rules in
-#: ``validate_helix_model``; none of them change here, and Gate 4 does not consume
-#: joint output, so bumping it would make every Gate 4 summary claim a rules change
-#: that never happened.  Bump this one whenever a constant below changes meaning.
+#: Pre-registration for the joint refit (independent of the retired Gate 4
+#: ``PREREGISTRATION_VERSION``).  Bump it whenever a constant below changes meaning.
 #: v1: Iteration 19, the Adam -> Gauss-Newton swap.
 JOINT_REFIT_PREREGISTRATION_VERSION = 1
 
@@ -46,18 +41,17 @@ JOINT_REFIT_MAX_NON_STATIONARY_ROW_FRACTION = 1.0e-3
 def seed_helices(
     batches,
     n_iter=200,
-    device="cpu",
     dtype=torch.float64,
     return_diagnostics=False,
 ):
     """Fit per-track helix warm starts to ACTS smoothed points with LM."""
-    points = batches.g_smt.to(device=device, dtype=dtype)
-    mask = _non_target_fit_mask(batches).to(device=device)
+    points = batches.g_smt.to(dtype=dtype)
+    mask = _non_target_fit_mask(batches)
     n_tracks, _n_hits, _ = points.shape
     first_index = mask.to(torch.int64).argmax(dim=1)
-    rows = torch.arange(n_tracks, device=device)
+    rows = torch.arange(n_tracks)
     first = points[rows, first_index]
-    direction = batches.p_smt.to(device=device, dtype=dtype)[rows, first_index]
+    direction = batches.p_smt.to(dtype=dtype)[rows, first_index]
     transverse = torch.linalg.norm(direction[:, :2], dim=1).clamp(min=1e-6)
     psi = torch.atan2(direction[:, 1], direction[:, 0])
     tanl = direction[:, 2] / transverse
@@ -66,7 +60,7 @@ def seed_helices(
             first,
             psi[:, None],
             tanl[:, None],
-            torch.zeros((n_tracks, 1), device=device, dtype=dtype),
+            torch.zeros((n_tracks, 1), dtype=dtype),
         ),
         dim=1,
     )
@@ -78,8 +72,8 @@ def seed_helices(
 
 def smt_seed_statistics(batches, track_parameters):
     """Summarize the non-target SMT point fit used only for initialization."""
-    points = batches.g_smt.to(track_parameters.device, track_parameters.dtype)
-    fit_mask = _non_target_fit_mask(batches).to(track_parameters.device)
+    points = batches.g_smt.to(track_parameters.dtype)
+    fit_mask = _non_target_fit_mask(batches)
     expanded = track_parameters[:, None, :].expand(-1, points.shape[1], -1)
     fitted, _path, valid = closest_helix_points(expanded, points)
     effective = fit_mask & valid
@@ -102,15 +96,15 @@ def _measurement_refit_objective(
     geometry,
 ):
     """Evaluate non-target measurement chi2 on fixed working geometry."""
-    measured = batches.measured_local.to(track_parameters.device, track_parameters.dtype)
-    covariance = batches.covariances.to(track_parameters.device, track_parameters.dtype)
-    sensor_idx = batches.sensor_idx.to(track_parameters.device)
-    fit_mask = _non_target_fit_mask(batches).to(track_parameters.device)
-    loc1_mask = batches.loc1_mask.to(track_parameters.device)
+    measured = batches.measured_local.to(track_parameters.dtype)
+    covariance = batches.covariances.to(track_parameters.dtype)
+    sensor_idx = batches.sensor_idx
+    fit_mask = _non_target_fit_mask(batches)
+    loc1_mask = batches.loc1_mask
     n_hits = measured.shape[1]
     tracks = track_parameters[:, None, :].expand(-1, n_hits, -1)
-    centers = geometry.centers.to(track_parameters.device, track_parameters.dtype)[sensor_idx]
-    rotations = geometry.rotations.to(track_parameters.device, track_parameters.dtype)[sensor_idx]
+    centers = geometry.centers.to(track_parameters.dtype)[sensor_idx]
+    rotations = geometry.rotations.to(track_parameters.dtype)[sensor_idx]
     _path, intersections, intersection_valid = intersect_plane(
         tracks, centers, rotations[..., :, 2]
     )
@@ -134,17 +128,15 @@ def _measurement_fit_inputs_from_joint(batches, geometry, parameters):
     fit_mask = _non_target_fit_mask(batches)
     if not bool(fit_mask.any(dim=1).all()):
         raise ValueError("Every joint track needs at least one non-target hit.")
-    device = parameters.device
     dtype = parameters.dtype
-    sensor_idx = batches.sensor_idx.to(device=device)
-    centers = geometry.centers.to(device=device, dtype=dtype)[sensor_idx]
-    rotations = geometry.rotations.to(device=device, dtype=dtype)[sensor_idx]
-    fit_mask = fit_mask.to(device=device)
-    loc1_mask = batches.loc1_mask.to(device=device)
+    sensor_idx = batches.sensor_idx
+    centers = geometry.centers.to(dtype=dtype)[sensor_idx]
+    rotations = geometry.rotations.to(dtype=dtype)[sensor_idx]
+    loc1_mask = batches.loc1_mask
     component_mask = torch.stack((fit_mask, fit_mask & loc1_mask), dim=-1)
     return MeasurementFitInputs(
-        measured=batches.measured_local.to(device=device, dtype=dtype),
-        variance=batches.covariances.to(device=device, dtype=dtype),
+        measured=batches.measured_local.to(dtype=dtype),
+        variance=batches.covariances.to(dtype=dtype),
         component_mask=component_mask,
         centers=centers,
         rotations=rotations,
@@ -155,7 +147,6 @@ def measure_joint_refit_stationarity(
     batches,
     geometry,
     parameters,
-    device="cpu",
     dtype=torch.float64,
 ):
     """Per-row Newton decrement of the joint measurement refit.
@@ -172,26 +163,21 @@ def measure_joint_refit_stationarity(
     """
     measured = _measurement_fit_inputs_from_joint(batches, geometry, parameters)
     decrement = measurement_newton_decrement(
-        parameters, measured, device=device, dtype=dtype
+        parameters, measured, dtype=dtype
     )
     return measurement_stationarity_report(decrement)
 
 
-def _refit_helices_gauss_newton(batches, geometry, initial, device):
+def _refit_helices_gauss_newton(batches, geometry, initial):
     """Solve the same objective, and refuse to return a solution that is not one.
 
-    The production solver lives in ``helix_model`` and has no dependency on the
-    holdout-validation or broken-helix experiment entry points.
-
-    Always float64.  The pre-registered stationarity threshold is 1e-6, which is
-    below float32 resolution, and the joint pipeline runs float32 whenever it runs
-    on the GPU.  The caller casts the result back to its own dtype.
+    Always float64: the pre-registered stationarity threshold is 1e-6, which is
+    below float32 resolution.  The caller casts the result back to its own dtype.
     """
     measured = _measurement_fit_inputs_from_joint(batches, geometry, initial)
     fitted, solver_stats = fit_helix_measurements_gauss_newton(
         initial,
         measured,
-        device=device,
         dtype=torch.float64,
     )
     report = solver_stats["stationarity"]
@@ -219,7 +205,6 @@ def fit_helices_to_measurements(
     batches,
     geometry,
     initial_parameters,
-    device="cpu",
     dtype=torch.float64,
     max_invalid_fraction=0.05,
     stationarity=True,
@@ -234,7 +219,7 @@ def fit_helices_to_measurements(
     one reads the decrement the solver computes for itself.  On the float64 CPU
     path the refit figure is that same gate report, reused.
     """
-    initial = initial_parameters.to(device=device, dtype=dtype)
+    initial = initial_parameters.to(dtype=dtype)
     with torch.no_grad():
         initial_loss_tensor, initial_invalid, _initial_mask = _measurement_refit_objective(
             initial, batches, geometry
@@ -246,9 +231,9 @@ def fit_helices_to_measurements(
             f"{initial_invalid:.2%} > {max_invalid_fraction:.2%}."
         )
     fitted, solver_stats = _refit_helices_gauss_newton(
-        batches, geometry, initial, device
+        batches, geometry, initial
     )
-    fitted = fitted.to(device=initial.device, dtype=dtype)
+    fitted = fitted.to(dtype=dtype)
     with torch.no_grad():
         evaluated_loss, final_invalid, component_mask = _measurement_refit_objective(
             fitted, batches, geometry
@@ -274,11 +259,11 @@ def fit_helices_to_measurements(
     }
     stats.update(solver_stats)
     if stationarity:
-        # The Gauss-Newton gate already evaluated the same float64 CPU decrement
-        # on these exact parameters; recomputing it costs a full Jacobian pass.
-        # Any cast to float32 or another device changes the parameters, so only
-        # then is the refit report measured again.
-        reuse_gate = fitted.dtype == torch.float64 and fitted.device.type == "cpu"
+        # The Gauss-Newton gate already evaluated the same float64 decrement on
+        # these exact parameters; recomputing it costs a full Jacobian pass.  A
+        # cast to float32 changes the parameters, so only then is the refit
+        # report measured again.
+        reuse_gate = fitted.dtype == torch.float64
         stats["stationarity"] = {
             "seed": measure_joint_refit_stationarity(batches, geometry, initial),
             "refit": (

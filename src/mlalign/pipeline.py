@@ -1,4 +1,4 @@
-"""Free-mode orchestration shared by stages B and C: initialize, solve, report."""
+"""Schur-LM alignment pipeline: load, select, seed, refit, solve, report."""
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from alignment_diagnostics import (
+from .config import DTYPE, AlignmentConfig
+from .conventions import parse_active_dof, parse_target_layers
+from .diagnostics import (
     print_per_layer_residual_diagnostics,
     print_target_residual_stats,
     validate_against_truth,
@@ -26,32 +28,23 @@ from .joint_residuals import (
     summarize_joint_layer_chi2,
 )
 from .root_inputs import load_variable_information
-from .stage_ntr_helix import run_block_lm_alignment
+from .schur_lm import run_schur_lm_alignment
 from .track_batches import build_track_batches
 
-JOINT_SOLVER = "block-lm"
-JOINT_SOLVERS = ("block-lm", "schur-lm")
+DOF_NAMES = ("tx", "ty", "tz", "rx", "ry", "rz")
 
 
-def select_joint_solver(config):
-    """The free-mode geometry solver named by ``config.joint_solver``."""
-    if config.joint_solver == "block-lm":
-        return run_block_lm_alignment
-    if config.joint_solver == "schur-lm":
-        from joint_alignment_schur import run_schur_lm_alignment
-
-        return run_schur_lm_alignment
-    raise ValueError(
-        f"Unknown free-mode geometry solver {config.joint_solver!r}; "
-        f"expected one of {JOINT_SOLVERS}."
-    )
-
-
-def run_free_alignment_pipeline(config, target_layers, active_dof):
-    if not os.path.exists(config.nominal_full_geom):
-        raise FileNotFoundError(
-            f"Full nominal geometry '{config.nominal_full_geom}' is required for free mode."
-        )
+def run_alignment(config: AlignmentConfig) -> dict:
+    active_dof = parse_active_dof(config.active_dof)
+    print(f"Active alignment DOF: {[DOF_NAMES[d] for d in active_dof]}")
+    target_layers = parse_target_layers(config.target_layers)
+    for path, label in (
+        (config.input_geom, "input geometry"),
+        (config.states_root, "track states"),
+        (config.nominal_full_geom, "full nominal geometry"),
+    ):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing {label}: {path}")
     geometry = load_joint_geometry(
         config.nominal_full_geom, config.input_geom, target_layers
     )
@@ -61,7 +54,7 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
         f"{len(geometry.input_indices)} overlaid input surfaces."
     )
     inputs = load_variable_information(
-        config.summary_root,
+        None,
         config.states_root,
         geometry.id_to_idx,
         max_track_entries=(config.max_tracks * 4 if config.max_tracks > 0 else None),
@@ -85,8 +78,7 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
     seeded_parameters, seed_solver_stats = seed_helices(
         batches,
         n_iter=config.joint_smt_seed_iters,
-        device="cuda" if config.gpu and torch.cuda.is_available() else "cpu",
-        dtype=torch.float32 if config.gpu and torch.cuda.is_available() else torch.float64,
+        dtype=DTYPE,
         return_diagnostics=True,
     )
     smt_stats = {
@@ -107,7 +99,6 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
         batches,
         geometry,
         seeded_parameters,
-        device=seeded_parameters.device,
         dtype=seeded_parameters.dtype,
         max_invalid_fraction=config.joint_max_invalid_fraction,
         stationarity=config.joint_refit_stationarity,
@@ -137,7 +128,6 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
     with torch.no_grad():
         seed_alignment = torch.zeros(
             (len(geometry.centers), 6),
-            device=seeded_parameters.device,
             dtype=seeded_parameters.dtype,
         )
         seed_residuals, seed_covariance, seed_component_mask, _seed_valid = (
@@ -151,19 +141,19 @@ def run_free_alignment_pipeline(config, target_layers, active_dof):
         batches.layer_id,
         target_layers,
     )
-    solver = select_joint_solver(config)
-    result = solver(
+    result = run_schur_lm_alignment(
         batches,
         geometry,
         config,
         active_dof=active_dof,
         initial_track_params=refitted_parameters,
+        max_iters=config.lm_max_iters,
     )
     predicted_deltas = result["predicted_deltas"]
     truth_metrics = validate_against_truth(
         geometry.transforms,
         predicted_deltas,
-        config.nominal_file,
+        config.truth_geom,
         target_layers,
     )
     Path(config.output_geom).parent.mkdir(parents=True, exist_ok=True)

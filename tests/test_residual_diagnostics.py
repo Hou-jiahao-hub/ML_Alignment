@@ -2,22 +2,20 @@
 
 from __future__ import annotations
 
-import importlib.util
 import re
-import sys
 import warnings
-from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
+from mlalign.diagnostics import print_per_layer_residual_diagnostics, print_target_residual_stats
+
 
 def test_diagnostics_module_owns_residual_reporting():
-    diagnostics = importlib.import_module("alignment_diagnostics")
     before = np.array([[3.0, 4.0]], dtype=np.float64)
     after = np.array([[0.0, 0.0]], dtype=np.float64)
-    metrics = diagnostics.print_per_layer_residual_diagnostics(
+    metrics = print_per_layer_residual_diagnostics(
         before,
         after,
         np.array([17]),
@@ -28,17 +26,6 @@ def test_diagnostics_module_owns_residual_reporting():
 
     assert metrics[(17, 8)]["rms_before_loc0"] == 3.0
     assert metrics[(17, 8)]["rms_before_loc1"] == 4.0
-
-
-def load_module():
-    module_path = Path(__file__).resolve().parents[1] / "scripts" / "ml_alignment_autograd.py"
-    sys.path.insert(0, str(module_path.parent))
-    spec = importlib.util.spec_from_file_location("ml_alignment_autograd", module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def mean_table_rows(output):
@@ -63,14 +50,13 @@ def rms_table_rows(output):
 # T2: RMS must be sqrt(mean(x^2)), not np.std
 # --------------------------------------------------------------------------
 def test_rms_table_reports_root_mean_square_not_standard_deviation(capsys):
-    m = load_module()
     # mean 3.5, std 0.5, true RMS sqrt(12.5) = 3.53553...
     init = np.array([[3.0, 3.0], [4.0, 4.0]], dtype=np.float64)
     final = np.array([[3.0, 3.0], [4.0, 4.0]], dtype=np.float64)
     vols = np.array([16, 16])
     lays = np.array([6, 6])
 
-    metrics = m.print_per_layer_residual_diagnostics(
+    metrics = print_per_layer_residual_diagnostics(
         init, final, vols, lays, ((16, 6),), return_metrics=True
     )
 
@@ -89,14 +75,13 @@ def test_rms_table_reports_root_mean_square_not_standard_deviation(capsys):
 # T3: printed values are the 4-decimal rounding of the returned floats
 # --------------------------------------------------------------------------
 def test_printed_table_matches_rounded_return_values(capsys):
-    m = load_module()
     rng = np.random.default_rng(7)
     init = rng.normal(size=(9, 2))
     final = rng.normal(size=(9, 2))
     vols = np.full(9, 16)
     lays = np.full(9, 6)
 
-    metrics = m.print_per_layer_residual_diagnostics(
+    metrics = print_per_layer_residual_diagnostics(
         init, final, vols, lays, ((16, 6),), return_metrics=True
     )
     output = capsys.readouterr().out
@@ -118,7 +103,6 @@ def test_printed_table_matches_rounded_return_values(capsys):
 # T4: component mask keeps invalid LOC1 zeros out of the statistics
 # --------------------------------------------------------------------------
 def test_component_mask_excludes_invalid_loc1_from_statistics(capsys):
-    m = load_module()
     # Third hit is a 1D strip: its LOC1 residual was forced to 0 upstream.
     init = np.array([[1.0, 2.0], [1.0, 2.0], [1.0, 0.0]], dtype=np.float64)
     final = np.array([[1.0, 2.0], [1.0, 2.0], [1.0, 0.0]], dtype=np.float64)
@@ -126,7 +110,7 @@ def test_component_mask_excludes_invalid_loc1_from_statistics(capsys):
     lays = np.array([6, 6, 6])
     component_mask = np.array([[True, True], [True, True], [True, False]])
 
-    metrics = m.print_per_layer_residual_diagnostics(
+    metrics = print_per_layer_residual_diagnostics(
         init, final, vols, lays, ((16, 6),),
         return_metrics=True, component_mask=component_mask,
     )
@@ -142,13 +126,12 @@ def test_component_mask_excludes_invalid_loc1_from_statistics(capsys):
 
 
 def test_component_mask_defaults_to_all_valid(capsys):
-    m = load_module()
     init = np.zeros((4, 2))
     final = np.zeros((4, 2))
     vols = np.full(4, 16)
     lays = np.full(4, 6)
 
-    metrics = m.print_per_layer_residual_diagnostics(
+    metrics = print_per_layer_residual_diagnostics(
         init, final, vols, lays, ((16, 6),), return_metrics=True
     )
 
@@ -159,11 +142,10 @@ def test_component_mask_defaults_to_all_valid(capsys):
 
 def test_component_mask_accepts_torch_tensor_input():
     """surface mode passes a torch bool tensor; it must not be mixed with ndarray."""
-    m = load_module()
     init = torch.zeros((3, 2), dtype=torch.float32)
     final = torch.ones((3, 2), dtype=torch.float32)
 
-    metrics = m.print_per_layer_residual_diagnostics(
+    metrics = print_per_layer_residual_diagnostics(
         init, final,
         torch.tensor([16, 16, 16]), torch.tensor([6, 6, 6]),
         ((16, 6),),
@@ -179,9 +161,8 @@ def test_component_mask_accepts_torch_tensor_input():
 # T5: input validation
 # --------------------------------------------------------------------------
 def test_mismatched_component_mask_shape_raises():
-    m = load_module()
     with pytest.raises(ValueError, match="component_mask"):
-        m.print_per_layer_residual_diagnostics(
+        print_per_layer_residual_diagnostics(
             np.zeros((3, 2)), np.zeros((3, 2)),
             np.full(3, 16), np.full(3, 6), ((16, 6),),
             component_mask=np.ones((2, 2), dtype=bool),
@@ -189,18 +170,16 @@ def test_mismatched_component_mask_shape_raises():
 
 
 def test_mismatched_residual_shapes_raise():
-    m = load_module()
     with pytest.raises(ValueError):
-        m.print_per_layer_residual_diagnostics(
+        print_per_layer_residual_diagnostics(
             np.zeros((3, 2)), np.zeros((4, 2)),
             np.full(3, 16), np.full(3, 6), ((16, 6),),
         )
 
 
 def test_mismatched_layer_id_length_raises():
-    m = load_module()
     with pytest.raises(ValueError):
-        m.print_per_layer_residual_diagnostics(
+        print_per_layer_residual_diagnostics(
             np.zeros((3, 2)), np.zeros((3, 2)),
             np.full(2, 16), np.full(2, 6), ((16, 6),),
         )
@@ -210,13 +189,12 @@ def test_mismatched_layer_id_length_raises():
 # T6: empty components -> N/A + nan, never np.mean([])
 # --------------------------------------------------------------------------
 def test_empty_loc1_component_reports_na_without_warning(capsys):
-    m = load_module()
     init = np.array([[1.0, 0.0], [2.0, 0.0]])
     final = np.array([[1.0, 0.0], [2.0, 0.0]])
 
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
-        metrics = m.print_per_layer_residual_diagnostics(
+        metrics = print_per_layer_residual_diagnostics(
             init, final, np.full(2, 16), np.full(2, 6), ((16, 6),),
             return_metrics=True,
             component_mask=np.array([[True, False], [True, False]]),
@@ -234,13 +212,12 @@ def test_empty_loc1_component_reports_na_without_warning(capsys):
 
 
 def test_empty_loc0_component_keeps_metric_keys(capsys):
-    m = load_module()
     init = np.zeros((2, 2))
     final = np.zeros((2, 2))
 
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
-        metrics = m.print_per_layer_residual_diagnostics(
+        metrics = print_per_layer_residual_diagnostics(
             init, final, np.full(2, 16), np.full(2, 6), ((16, 6),),
             return_metrics=True,
             component_mask=np.zeros((2, 2), dtype=bool),
@@ -262,14 +239,13 @@ def test_empty_loc0_component_keeps_metric_keys(capsys):
 # so its empty-LOC1 behaviour needs its own test.
 # --------------------------------------------------------------------------
 def test_target_residual_stats_splits_counts_and_marks_empty_loc1(capsys):
-    m = load_module()
     residuals = torch.tensor([[1.0, 2.0], [3.0, 0.0]], dtype=torch.float32)
     vols = torch.tensor([16, 16])
     lays = torch.tensor([6, 6])
 
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
-        m.print_target_residual_stats(
+        print_target_residual_stats(
             residuals, vols, lays, ((16, 6),),
             loc1_valid=torch.tensor([True, False]),
         )
@@ -282,12 +258,11 @@ def test_target_residual_stats_splits_counts_and_marks_empty_loc1(capsys):
 
 
 def test_target_residual_stats_reports_na_when_no_valid_loc1(capsys):
-    m = load_module()
     residuals = torch.tensor([[1.0, 0.0], [3.0, 0.0]], dtype=torch.float32)
 
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
-        m.print_target_residual_stats(
+        print_target_residual_stats(
             residuals, torch.tensor([16, 16]), torch.tensor([6, 6]), ((16, 6),),
             loc1_valid=torch.tensor([False, False]),
         )
@@ -299,8 +274,7 @@ def test_target_residual_stats_reports_na_when_no_valid_loc1(capsys):
 
 
 def test_target_residual_stats_loc1_valid_defaults_to_all_valid(capsys):
-    m = load_module()
-    m.print_target_residual_stats(
+    print_target_residual_stats(
         torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32),
         torch.tensor([16, 16]), torch.tensor([6, 6]), ((16, 6),),
     )

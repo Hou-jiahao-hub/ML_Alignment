@@ -33,7 +33,7 @@ def reference_gauge_frame(
     helper[:, 2] = 1.0
     degenerate = direction[:, 2].abs() > 1.0 - 1.0e-6
     helper[degenerate] = torch.tensor(
-        [1.0, 0.0, 0.0], dtype=helper.dtype, device=helper.device
+        [1.0, 0.0, 0.0], dtype=helper.dtype
     )
     axis0 = torch.cross(helper, direction, dim=-1)
     axis0 = axis0 / axis0.norm(dim=-1, keepdim=True).clamp_min(1.0e-12)
@@ -45,7 +45,7 @@ def pack_gauge_fixed_track_parameters(reference: torch.Tensor) -> torch.Tensor:
     """Pack a helix into the five observable parameters of a fixed gauge."""
     _linear, rho_scaled = split_track_parameters(reference)
     offsets = torch.zeros(
-        (reference.shape[0], 2), dtype=reference.dtype, device=reference.device
+        (reference.shape[0], 2), dtype=reference.dtype
     )
     return torch.cat((offsets, reference[:, 3:5], rho_scaled), dim=1)
 

@@ -1,4 +1,4 @@
-"""Geometry JSON input/output and the full working geometry of free mode."""
+"""Geometry JSON input/output and the full working geometry."""
 
 from __future__ import annotations
 
@@ -78,45 +78,10 @@ def export_joint_geometry(geometry, predicted_deltas, output_path):
     update_geometry_to_json(transforms, input_deltas, output_path)
 
 
-def load_geometry_from_json(filepath):
-    with open(filepath, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    if not isinstance(data, list) or not data or "Translation" not in data[0]:
-        raise ValueError(f"The format of {filepath} is incorrect. Please check the JSON structure.")
-
-    transforms_list = data
-    num_sensors = len(transforms_list)
-
-    positions = []
-    rotations = []
-    id_to_idx = {}
+def update_geometry_to_json(transforms_list, predicted_deltas, output_filepath):
     for i, item in enumerate(transforms_list):
-        positions.append(item["Translation"])
-        rotations.append(item["RotationMatrix"])
-        match = re.search(r"vol=(\d+)\|lay=(\d+)\|sen=(\d+)", item.get("ID", ""))
-        if match:
-            vol, lay, sen = map(int, match.groups())
-            id_to_idx[(vol, lay, sen)] = i
-
-    return (
-        transforms_list,
-        num_sensors,
-        torch.tensor(positions, dtype=torch.float32),
-        torch.tensor(rotations, dtype=torch.float32),
-        id_to_idx,
-    )
-
-
-def update_geometry_to_json(
-    transforms_list, predicted_deltas, output_filepath, alignment_gain=1.0
-):
-    if not np.isfinite(alignment_gain) or alignment_gain < 0:
-        raise ValueError("alignment_gain must be a finite non-negative value.")
-    for i, item in enumerate(transforms_list):
-        #The delta transform
-        delta_t_local = predicted_deltas[i, :3] * alignment_gain
-        delta_euler = predicted_deltas[i, 3:] * alignment_gain
+        delta_t_local = predicted_deltas[i, :3]
+        delta_euler = predicted_deltas[i, 3:]
 
         # The original transform
         old_t = np.array(item["Translation"])
@@ -150,12 +115,3 @@ def update_geometry_to_json(
     Path(output_filepath).parent.mkdir(parents=True, exist_ok=True)
     with open(output_filepath, "w", encoding="utf-8") as f_out:
         json.dump(transforms_list, f_out, indent=4)
-
-
-def build_target_mask(num_sensors, id_to_idx_map, target_layers):
-    target_layers = set(parse_target_layers(target_layers))
-    target_mask = torch.zeros(num_sensors, dtype=torch.bool)
-    for (vol, lay, _sen), idx in id_to_idx_map.items():
-        if (vol, lay) in target_layers:
-            target_mask[idx] = True
-    return target_mask

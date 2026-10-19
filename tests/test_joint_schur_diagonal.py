@@ -6,7 +6,7 @@ import math
 
 import torch
 
-import joint_alignment_schur as J
+from mlalign import schur_lm as J
 import joint_schur_synthetic as syn
 from test_joint_schur_solver import WIDE, LinearModel, _dense_gauss_newton, _start
 

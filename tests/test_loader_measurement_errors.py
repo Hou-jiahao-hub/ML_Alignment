@@ -2,28 +2,17 @@
 
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
-
 import awkward as ak
 import numpy as np
 import pytest
 import uproot
 
+from mlalign.root_inputs import load_variable_information
+
 
 pytestmark = pytest.mark.root_io
 
 
-def load_module():
-    module_path = Path(__file__).resolve().parents[1] / "scripts" / "ml_alignment_autograd.py"
-    sys.path.insert(0, str(module_path.parent))
-    spec = importlib.util.spec_from_file_location("ml_alignment_autograd_loader", module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 # Mirrors tests/test_joint_alignment.py::test_root_loader_exposes_raw_joint_...
@@ -81,23 +70,21 @@ GOOD_Y = [0.2, np.nan, 0.2]
 
 
 def test_loader_accepts_matching_measurement_error_lengths(tmp_path):
-    m = load_module()
     summary_path, states_path = write_root(tmp_path, GOOD_X, GOOD_Y)
 
-    inputs = m.load_variable_information(summary_path, states_path, ID_MAP)
+    inputs = load_variable_information(summary_path, states_path, ID_MAP)
 
     assert len(inputs.hit_sensor_ids) == 3
 
 
 @pytest.mark.parametrize("branch", ["err_x_hit", "err_y_hit"])
 def test_loader_raises_when_measurement_error_branch_missing(tmp_path, branch):
-    m = load_module()
     err_x = None if branch == "err_x_hit" else GOOD_X
     err_y = None if branch == "err_y_hit" else GOOD_Y
     summary_path, states_path = write_root(tmp_path, err_x, err_y)
 
     with pytest.raises(ValueError) as excinfo:
-        m.load_variable_information(summary_path, states_path, ID_MAP)
+        load_variable_information(summary_path, states_path, ID_MAP)
 
     message = str(excinfo.value)
     assert "err_x_hit" in message and "err_y_hit" in message
@@ -107,13 +94,12 @@ def test_loader_raises_when_measurement_error_branch_missing(tmp_path, branch):
 @pytest.mark.parametrize("branch", ["err_x_hit", "err_y_hit"])
 def test_loader_raises_with_entry_and_length_on_mismatch(tmp_path, branch):
     """The top-level message must carry the cause's entry/length detail."""
-    m = load_module()
     err_x = [0.1] if branch == "err_x_hit" else GOOD_X
     err_y = [0.2] if branch == "err_y_hit" else GOOD_Y
     summary_path, states_path = write_root(tmp_path, err_x, err_y)
 
     with pytest.raises(ValueError) as excinfo:
-        m.load_variable_information(summary_path, states_path, ID_MAP)
+        load_variable_information(summary_path, states_path, ID_MAP)
 
     message = str(excinfo.value)
     assert branch in message
@@ -123,9 +109,8 @@ def test_loader_raises_with_entry_and_length_on_mismatch(tmp_path, branch):
 
 def test_loader_does_not_claim_a_posterior_variance_fallback(tmp_path, capsys):
     """The old log line advertised a fallback that never existed."""
-    m = load_module()
     summary_path, states_path = write_root(tmp_path, GOOD_X, GOOD_Y)
 
-    m.load_variable_information(summary_path, states_path, ID_MAP)
+    load_variable_information(summary_path, states_path, ID_MAP)
 
     assert "posterior variance" not in capsys.readouterr().out

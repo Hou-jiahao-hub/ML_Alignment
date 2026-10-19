@@ -2,29 +2,22 @@
 
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
+import importlib
 from types import SimpleNamespace
 
 import numpy as np
 import torch
 
+from mlalign.config import AlignmentConfig
+from mlalign.geometry_io import JointGeometry
+from mlalign.joint_residuals import combine_component_masks
+from mlalign.track_batches import TrackBatches
 
-def load_module():
-    module_path = Path(__file__).resolve().parents[1] / "scripts" / "ml_alignment_autograd.py"
-    sys.path.insert(0, str(module_path.parent))
-    spec = importlib.util.spec_from_file_location("ml_alignment_autograd_masks", module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+
 
 
 def test_combine_component_masks_intersects_and_counts_exclusions():
     """Exercises the production helper, not a re-implementation of its logic."""
-    m = load_module()
     T = True
     F = False
     # One track, four hits; the last one is padding.
@@ -32,7 +25,7 @@ def test_combine_component_masks_intersects_and_counts_exclusions():
     initial = torch.tensor([[[T, T], [T, F], [F, F], [T, T]]])
     final = torch.tensor([[[T, T], [T, T], [T, F], [T, T]]])
 
-    hit_valid, comp, initial_only, final_only = m.combine_component_masks(
+    hit_valid, comp, initial_only, final_only = combine_component_masks(
         hit_mask, initial, final
     )
 
@@ -47,13 +40,12 @@ def test_combine_component_masks_intersects_and_counts_exclusions():
 
 
 def test_combine_component_masks_counts_initial_only_exclusions():
-    m = load_module()
     T, F = True, False
     hit_mask = torch.tensor([[T, T]])
     initial = torch.tensor([[[T, T], [T, T]]])
     final = torch.tensor([[[T, T], [F, F]]])
 
-    hit_valid, comp, initial_only, final_only = m.combine_component_masks(
+    hit_valid, comp, initial_only, final_only = combine_component_masks(
         hit_mask, initial, final
     )
 
@@ -64,17 +56,16 @@ def test_combine_component_masks_counts_initial_only_exclusions():
 
 
 def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, capsys):
-    """The helper must actually be called by run_free_alignment_pipeline.
+    """The helper must actually be called by run_alignment.
 
     Every heavy dependency is stubbed, and the helper is replaced by a recorder
     returning sentinel counts, so a passing assertion can only come from real
     wiring rather than from a coincidental substring in the output.
     """
-    m = load_module()
-    pipeline = importlib.import_module("mlalign.free_helix_pipeline")
+    pipeline = importlib.import_module("mlalign.pipeline")
 
     n_tracks, n_hits = 1, 2
-    batches = m.TrackBatches(
+    batches = TrackBatches(
         measured_local=torch.zeros((n_tracks, n_hits, 2)),
         covariances=torch.ones((n_tracks, n_hits, 2)),
         sensor_idx=torch.zeros((n_tracks, n_hits), dtype=torch.long),
@@ -90,7 +81,7 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
         fit_span=torch.tensor([300.0]),
         selection_stats={"input_tracks": 1, "retained_tracks": 1, "excluded_tracks": 0},
     )
-    geometry = m.JointGeometry(
+    geometry = JointGeometry(
         transforms=[], input_transforms=[],
         centers=torch.zeros((1, 3), dtype=torch.float64),
         rotations=torch.eye(3, dtype=torch.float64).unsqueeze(0),
@@ -108,7 +99,7 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
         "history": [],
     }
 
-    monkeypatch.setattr(m.os.path, "exists", lambda _p: True)
+    monkeypatch.setattr(pipeline.os.path, "exists", lambda _p: True)
     monkeypatch.setattr(pipeline, "load_joint_geometry", lambda *_a, **_k: geometry)
     # Arguments are evaluated before the stubbed callee runs, so the fake inputs
     # object still needs the attributes the call sites read.
@@ -171,9 +162,7 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
         ),
     )
     monkeypatch.setattr(pipeline, "summarize_joint_layer_chi2", lambda *_a, **_k: {})
-    monkeypatch.setattr(
-        pipeline, "select_joint_solver", lambda _config: lambda *_a, **_k: joint_result
-    )
+    monkeypatch.setattr(pipeline, "run_schur_lm_alignment", lambda *_a, **_k: joint_result)
     monkeypatch.setattr(pipeline, "validate_against_truth", lambda *_a, **_k: {})
     monkeypatch.setattr(pipeline, "export_joint_geometry", lambda *_a, **_k: None)
     monkeypatch.setattr(pipeline, "print_per_layer_residual_diagnostics", lambda *_a, **_k: {})
@@ -188,13 +177,15 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
 
     monkeypatch.setattr(pipeline, "combine_component_masks", recorder)
 
-    config = m.AlignmentRunConfig(
-        track_mode="free",
+    config = AlignmentConfig(
+        input_geom=str(tmp_path / "in.json"),
+        states_root=str(tmp_path / "states.root"),
         output_geom=str(tmp_path / "out.json"),
+        nominal_full_geom=str(tmp_path / "nominal.json"),
         make_plot=False,
         target_layers=((16, 6),),
     )
-    pipeline.run_free_alignment_pipeline(config, ((16, 6),), (0, 1, 5))
+    pipeline.run_alignment(config)
 
     assert len(calls) == 1, "combine_component_masks was not called exactly once"
     output = capsys.readouterr().out

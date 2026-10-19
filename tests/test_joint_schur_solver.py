@@ -9,15 +9,18 @@ geometry injections.  Terminal states follow Iteration 37 §C.
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import inspect
 
 import pytest
 import torch
 
-import joint_alignment_schur as J
+from mlalign import schur_lm as J
 import joint_schur_synthetic as syn
-import ml_alignment_autograd as M
 import test_joint_schur_constraints as constraints
+
+from mlalign.config import AlignmentConfig
+from mlalign.reporting import write_alignment_summary
 
 DTYPE = torch.float64
 ALGEBRA_RTOL = 1.0e-10
@@ -66,7 +69,7 @@ def _dense_gauss_newton(lin):
 
 
 def _config():
-    return M.AlignmentRunConfig(track_mode="free", joint_solver="schur-lm")
+    return AlignmentConfig(input_geom="", states_root="", output_geom="", nominal_full_geom="")
 
 
 # L1 -------------------------------------------------------------------------
@@ -322,22 +325,14 @@ def test_loc0_only_target_has_a_structurally_absent_ty():
 # L7 -------------------------------------------------------------------------
 
 
-def test_cli_accepts_schur_lm_and_dispatches_to_it():
-    args = M.build_argument_parser().parse_args(["--track-mode", "free", "--joint-solver", "schur-lm"])
-    config = M.alignment_config_from_args(args)
-
-    assert config.joint_solver == "schur-lm"
-    assert M.select_joint_solver(config) is J.run_schur_lm_alignment
-
-
-def test_block_lm_stays_the_default_solver():
-    config = M.alignment_config_from_args(M.build_argument_parser().parse_args(["--track-mode", "free"]))
-    assert config.joint_solver == "block-lm"
-    assert M.select_joint_solver(config) is M.run_block_lm_alignment
+def test_pipeline_dispatches_to_schur_lm():
+    pipeline = importlib.import_module("mlalign.pipeline")
+    assert pipeline.run_schur_lm_alignment is J.run_schur_lm_alignment
+    assert "lm_max_iters" in inspect.getsource(pipeline.run_alignment)
 
 
 def test_schur_lm_summary_is_retained_in_the_run_summary():
-    source = inspect.getsource(M.write_alignment_summary)
+    source = inspect.getsource(write_alignment_summary)
     assert '"schur_lm_summary"' in source
 
 

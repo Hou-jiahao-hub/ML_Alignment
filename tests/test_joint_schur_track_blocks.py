@@ -8,15 +8,17 @@ import itertools
 import pytest
 import torch
 
-import joint_alignment_schur as J
+from mlalign import schur_lm as J
 import joint_schur_synthetic as syn
-from helix_model import (
-    MeasurementFitInputs,
-    measurement_residual_jacobian,
-    measurement_standardized_residual,
+from mlalign.helix.gauge import (
     pack_gauge_fixed_track_parameters,
     reference_gauge_frame,
     unpack_gauge_fixed_track_parameters,
+)
+from mlalign.helix.measurement_fit import (
+    MeasurementFitInputs,
+    measurement_residual_jacobian,
+    measurement_standardized_residual,
 )
 
 SYMMETRY_RTOL = 1.0e-12

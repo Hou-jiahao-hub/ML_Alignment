@@ -43,16 +43,16 @@ def summarize_joint_layer_chi2(
 
 def _joint_forward(track_parameters, alignment, batches, geometry, track_indices=None):
     if track_indices is None:
-        track_indices = torch.arange(len(track_parameters), device=track_parameters.device)
-    measured = batches.measured_local.to(track_parameters.device, track_parameters.dtype)[track_indices]
-    covariance = batches.covariances.to(track_parameters.device, track_parameters.dtype)[track_indices]
-    sensor_idx = batches.sensor_idx.to(track_parameters.device)[track_indices]
-    hit_mask = batches.hit_mask.to(track_parameters.device)[track_indices]
-    loc1_mask = batches.loc1_mask.to(track_parameters.device)[track_indices]
+        track_indices = torch.arange(len(track_parameters))
+    measured = batches.measured_local.to(track_parameters.dtype)[track_indices]
+    covariance = batches.covariances.to(track_parameters.dtype)[track_indices]
+    sensor_idx = batches.sensor_idx[track_indices]
+    hit_mask = batches.hit_mask[track_indices]
+    loc1_mask = batches.loc1_mask[track_indices]
     n_hits = measured.shape[1]
     tracks = track_parameters[track_indices, None, :].expand(-1, n_hits, -1)
-    centers0 = geometry.centers.to(track_parameters.device, track_parameters.dtype)
-    rotations0 = geometry.rotations.to(track_parameters.device, track_parameters.dtype)
+    centers0 = geometry.centers.to(track_parameters.dtype)
+    rotations0 = geometry.rotations.to(track_parameters.dtype)
     centers, rotations = apply_alignment_torch(centers0, rotations0, alignment)
     hit_centers = centers[sensor_idx]
     hit_rotations = rotations[sensor_idx]
@@ -77,18 +77,18 @@ def _sensor_residual_data(
     batches,
     geometry,
 ):
-    device, dtype = track_parameters.device, track_parameters.dtype
+    dtype = track_parameters.dtype
     hit_selection = (
-        batches.hit_mask.to(device)
-        & batches.is_target.to(device)
-        & (batches.sensor_idx.to(device) == int(sensor_index))
+        batches.hit_mask
+        & batches.is_target
+        & (batches.sensor_idx == int(sensor_index))
     )
     track_indices, hit_indices = torch.nonzero(hit_selection, as_tuple=True)
     if len(track_indices) == 0:
         return None
     tracks = track_parameters[track_indices]
-    center0 = geometry.centers.to(device=device, dtype=dtype)[sensor_index]
-    rotation0 = geometry.rotations.to(device=device, dtype=dtype)[sensor_index]
+    center0 = geometry.centers.to(dtype=dtype)[sensor_index]
+    rotation0 = geometry.rotations.to(dtype=dtype)[sensor_index]
     center, rotation = apply_alignment_torch(center0, rotation0, alignment_row)
     centers = center.expand(len(tracks), -1)
     rotations = rotation.expand(len(tracks), -1, -1)
@@ -98,9 +98,9 @@ def _sensor_residual_data(
     local = torch.matmul(
         rotations.transpose(-1, -2), (intersections - centers).unsqueeze(-1)
     ).squeeze(-1)[..., :2]
-    measured = batches.measured_local.to(device=device, dtype=dtype)[track_indices, hit_indices]
-    covariance = batches.covariances.to(device=device, dtype=dtype)[track_indices, hit_indices]
-    loc1 = batches.loc1_mask.to(device)[track_indices, hit_indices]
+    measured = batches.measured_local.to(dtype=dtype)[track_indices, hit_indices]
+    covariance = batches.covariances.to(dtype=dtype)[track_indices, hit_indices]
+    loc1 = batches.loc1_mask[track_indices, hit_indices]
     residuals = measured - local
     component_mask = torch.stack((intersection_valid, intersection_valid & loc1), dim=-1)
     return residuals, covariance, component_mask, intersection_valid
@@ -110,13 +110,13 @@ def _target_alignment_evaluation(track_parameters, alignment, batches, geometry)
     residuals, covariance, component_mask, intersection_valid = _joint_forward(
         track_parameters, alignment, batches, geometry
     )
-    target_components = component_mask & batches.is_target.to(component_mask.device).unsqueeze(-1)
+    target_components = component_mask & batches.is_target.unsqueeze(-1)
     if not target_components.any():
         raise ValueError("No valid target measurement components remain for block LM")
     weighted = residuals.square() / covariance.clamp_min(EPS_COVARIANCE)
     loss = torch.sum(torch.where(target_components, weighted, torch.zeros_like(weighted)))
     loss = loss / target_components.sum()
-    valid_hits = batches.hit_mask.to(intersection_valid.device)
+    valid_hits = batches.hit_mask
     invalid_fraction = 1.0 - float(intersection_valid[valid_hits].float().mean().detach().cpu())
     return loss, invalid_fraction, residuals, component_mask
 

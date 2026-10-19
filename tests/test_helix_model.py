@@ -1,12 +1,38 @@
-import importlib
 import math
-import sys
 
 import pytest
 import torch
 
+from mlalign.helix.gauge import (
+    assemble_track_parameters,
+    pack_gauge_fixed_track_parameters,
+    reference_gauge_frame,
+    split_track_parameters,
+)
+from mlalign.helix.measurement_fit import (
+    MeasurementFitInputs,
+    _single_measurement_residual,
+    fit_helix_measurements_gauss_newton,
+    measurement_newton_decrement,
+    measurement_residual_jacobian,
+    measurement_standardized_residual,
+    measurement_stationarity_report,
+)
+from mlalign.helix.point_fit import (
+    _BATCHED_POINT_FIT_JACOBIAN,
+    _single_point_fit_residual,
+    fit_helix_points_gauss_newton,
+    require_stationary_helix_point_fit,
+)
+from mlalign.helix.trajectory import (
+    closest_helix_points,
+    helix_point,
+    helix_tangent,
+    intersect_plane,
+)
 
-def _measurement_fit_case(model, n_tracks=2):
+
+def _measurement_fit_case(n_tracks=2):
     dtype = torch.float64
     truth = torch.tensor(
         [
@@ -17,8 +43,8 @@ def _measurement_fit_case(model, n_tracks=2):
     )[:n_tracks]
     path = torch.linspace(-250.0, 350.0, 12, dtype=dtype)
     expanded = truth[:, None, :].expand(-1, len(path), -1)
-    centers = model.helix_point(expanded, path.expand(len(truth), -1))
-    tangents = model.helix_tangent(expanded, path.expand(len(truth), -1))
+    centers = helix_point(expanded, path.expand(len(truth), -1))
+    tangents = helix_tangent(expanded, path.expand(len(truth), -1))
     normals = torch.nn.functional.normalize(tangents, dim=-1)
     up = torch.tensor([0.0, 0.0, 1.0], dtype=dtype).expand_as(normals)
     local0 = torch.nn.functional.normalize(torch.cross(up, normals, dim=-1), dim=-1)
@@ -29,7 +55,7 @@ def _measurement_fit_case(model, n_tracks=2):
     variance = torch.full_like(measured, 4.0e-4)
     component_mask = torch.ones_like(measured, dtype=torch.bool)
     component_mask[:, -2:, 1] = False
-    inputs = model.MeasurementFitInputs(
+    inputs = MeasurementFitInputs(
         measured=measured,
         variance=variance,
         component_mask=component_mask,
@@ -43,14 +69,13 @@ def _measurement_fit_case(model, n_tracks=2):
 
 
 def test_shared_helix_point_and_tangent_match_hand_checked_circle():
-    model = importlib.import_module("scripts.helix_model")
     track = torch.tensor(
         [[1.0, -2.0, 3.0, 0.0, 0.5, 0.01]], dtype=torch.float64
     )
     path = torch.tensor([100.0], dtype=torch.float64)
 
-    point = model.helix_point(track, path)
-    tangent = model.helix_tangent(track, path)
+    point = helix_point(track, path)
+    tangent = helix_tangent(track, path)
 
     assert point[0, 0].item() == pytest.approx(1.0 + 100.0 * math.sin(1.0))
     assert point[0, 1].item() == pytest.approx(-2.0 + 100.0 * (1.0 - math.cos(1.0)))
@@ -62,21 +87,20 @@ def test_shared_helix_point_and_tangent_match_hand_checked_circle():
 
 def test_measurement_residual_jacobian_matches_finite_difference():
     """Catch a Jacobian that differentiates a different residual convention."""
-    model = importlib.import_module("scripts.helix_model")
-    inputs, _truth, seed = _measurement_fit_case(model, n_tracks=1)
-    frame = model.reference_gauge_frame(seed)
-    theta = model.pack_gauge_fixed_track_parameters(seed)
+    inputs, _truth, seed = _measurement_fit_case(n_tracks=1)
+    frame = reference_gauge_frame(seed)
+    theta = pack_gauge_fixed_track_parameters(seed)
 
-    residual = model.measurement_standardized_residual(theta, frame, inputs)
-    jacobian = model.measurement_residual_jacobian(theta, frame, inputs)
+    residual = measurement_standardized_residual(theta, frame, inputs)
+    jacobian = measurement_residual_jacobian(theta, frame, inputs)
     eps = 1.0e-6
     plus = theta.clone()
     minus = theta.clone()
     plus[:, 0] += eps
     minus[:, 0] -= eps
     finite_difference = (
-        model.measurement_standardized_residual(plus, frame, inputs)
-        - model.measurement_standardized_residual(minus, frame, inputs)
+        measurement_standardized_residual(plus, frame, inputs)
+        - measurement_standardized_residual(minus, frame, inputs)
     ) / (2.0 * eps)
 
     assert residual.shape == (1, inputs.measured.shape[1] * 2)
@@ -88,51 +112,49 @@ def test_measurement_residual_jacobian_matches_finite_difference():
 def test_forward_mode_jacobians_match_reverse_mode_reference():
     """Catch forward mode differentiating through the detached closest-point
     path, or otherwise departing from the reverse-mode Jacobian it replaced."""
-    model = importlib.import_module("scripts.helix_model")
-    inputs, truth, seed = _measurement_fit_case(model)
-    frame = model.reference_gauge_frame(seed)
-    theta = model.pack_gauge_fixed_track_parameters(seed)
+    inputs, truth, seed = _measurement_fit_case()
+    frame = reference_gauge_frame(seed)
+    theta = pack_gauge_fixed_track_parameters(seed)
     measurement_args = (
         theta, *frame, inputs.measured, inputs.variance,
         inputs.component_mask, inputs.centers, inputs.rotations,
     )
     reference = torch.func.vmap(
-        torch.func.jacrev(model._single_measurement_residual, argnums=0)
+        torch.func.jacrev(_single_measurement_residual, argnums=0)
     )(*measurement_args)
     torch.testing.assert_close(
-        model.measurement_residual_jacobian(theta, frame, inputs),
+        measurement_residual_jacobian(theta, frame, inputs),
         reference, atol=1.0e-9, rtol=1.0e-9,
     )
 
     path = torch.linspace(-30.0, 80.0, 12, dtype=torch.float64)
-    points = model.helix_point(
+    points = helix_point(
         truth[:, None, :].expand(-1, len(path), -1), path.expand(len(truth), -1)
     )
     points[..., 2] += 0.01 * torch.sin(path / 7.0)
     mask = torch.ones(points.shape[:2], dtype=torch.bool)
     point_args = (theta, *frame, points, mask)
     point_reference = torch.func.vmap(
-        torch.func.jacrev(model._single_point_fit_residual, argnums=0)
+        torch.func.jacrev(_single_point_fit_residual, argnums=0)
     )(*point_args)
     torch.testing.assert_close(
-        model._BATCHED_POINT_FIT_JACOBIAN(*point_args),
+        _BATCHED_POINT_FIT_JACOBIAN(*point_args),
         point_reference, atol=1.0e-9, rtol=1.0e-9,
     )
 
 
 def test_measurement_gauss_newton_is_chunk_exact_and_stationary():
     """Catch budget exhaustion being reported as a solved measurement fit."""
-    model = importlib.import_module("scripts.helix_model")
-    inputs, _truth, seed = _measurement_fit_case(model)
+    inputs, _truth, seed = _measurement_fit_case()
 
-    whole, whole_stats = model.fit_helix_measurements_gauss_newton(
+    whole, whole_stats = fit_helix_measurements_gauss_newton(
         seed, inputs, chunk_rows=0
     )
-    chunked, chunked_stats = model.fit_helix_measurements_gauss_newton(
+    chunked, chunked_stats = fit_helix_measurements_gauss_newton(
         seed, inputs, chunk_rows=1
     )
-    decrement = model.measurement_newton_decrement(whole, inputs, chunk_rows=1)
-    report = model.measurement_stationarity_report(decrement)
+    decrement = measurement_newton_decrement(whole, inputs, chunk_rows=1)
+    report = measurement_stationarity_report(decrement)
 
     assert torch.equal(whole, chunked)
     assert whole_stats["convergence"]["converged"] is True
@@ -144,16 +166,15 @@ def test_measurement_gauss_newton_is_chunk_exact_and_stationary():
         < report["stationary_threshold"]
     )
 
-    _truncated, truncated_stats = model.fit_helix_measurements_gauss_newton(
+    _truncated, truncated_stats = fit_helix_measurements_gauss_newton(
         seed, inputs, max_iters=1
     )
     assert truncated_stats["convergence"]["converged"] is False
 
 
 def test_measurement_fit_ignores_fully_masked_padding_hits():
-    model = importlib.import_module("scripts.helix_model")
-    inputs, _truth, seed = _measurement_fit_case(model, n_tracks=1)
-    base = model.MeasurementFitInputs(
+    inputs, _truth, seed = _measurement_fit_case(n_tracks=1)
+    base = MeasurementFitInputs(
         measured=inputs.measured[:, :-1],
         variance=inputs.variance[:, :-1],
         component_mask=inputs.component_mask[:, :-1],
@@ -166,7 +187,7 @@ def test_measurement_fit_ignores_fully_masked_padding_hits():
     padded_centers[:, -1] = torch.tensor(
         [5000.0, 5000.0, 5000.0], dtype=torch.float64
     )
-    padded = model.MeasurementFitInputs(
+    padded = MeasurementFitInputs(
         measured=inputs.measured,
         variance=inputs.variance,
         component_mask=padded_mask,
@@ -174,18 +195,17 @@ def test_measurement_fit_ignores_fully_masked_padding_hits():
         rotations=inputs.rotations,
     )
 
-    expected, _ = model.fit_helix_measurements_gauss_newton(seed, base)
-    actual, _ = model.fit_helix_measurements_gauss_newton(seed, padded)
+    expected, _ = fit_helix_measurements_gauss_newton(seed, base)
+    actual, _ = fit_helix_measurements_gauss_newton(seed, padded)
 
     torch.testing.assert_close(actual, expected, atol=1.0e-10, rtol=0.0)
 
 
 def test_measurement_fit_rejects_non_finite_residuals():
-    model = importlib.import_module("scripts.helix_model")
-    inputs, _truth, seed = _measurement_fit_case(model, n_tracks=1)
+    inputs, _truth, seed = _measurement_fit_case(n_tracks=1)
     measured = inputs.measured.clone()
     measured[0, 0, 0] = float("nan")
-    invalid = model.MeasurementFitInputs(
+    invalid = MeasurementFitInputs(
         measured=measured,
         variance=inputs.variance,
         component_mask=inputs.component_mask,
@@ -194,12 +214,11 @@ def test_measurement_fit_rejects_non_finite_residuals():
     )
 
     with pytest.raises(FloatingPointError, match="Non-finite initial"):
-        model.fit_helix_measurements_gauss_newton(seed, invalid)
+        fit_helix_measurements_gauss_newton(seed, invalid)
 
 
 def test_measurement_fit_rejects_a_row_without_valid_intersections():
     """An all-masked-by-geometry row must not masquerade as a zero residual."""
-    model = importlib.import_module("scripts.helix_model")
     dtype = torch.float64
     seed = torch.tensor(
         [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=dtype
@@ -208,7 +227,7 @@ def test_measurement_fit_rejects_a_row_without_valid_intersections():
         [[[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]]],
         dtype=dtype,
     ).reshape(1, 1, 3, 3)
-    inputs = model.MeasurementFitInputs(
+    inputs = MeasurementFitInputs(
         measured=torch.zeros((1, 1, 2), dtype=dtype),
         variance=torch.ones((1, 1, 2), dtype=dtype),
         component_mask=torch.ones((1, 1, 2), dtype=torch.bool),
@@ -217,17 +236,16 @@ def test_measurement_fit_rejects_a_row_without_valid_intersections():
     )
 
     with pytest.raises(ValueError, match="no valid measurement components"):
-        model.fit_helix_measurements_gauss_newton(seed, inputs)
+        fit_helix_measurements_gauss_newton(seed, inputs)
 
 
 def test_measurement_fit_rejects_an_underconstrained_row():
     """LM damping must not turn a rank-one row into a reported solution."""
-    model = importlib.import_module("scripts.helix_model")
     dtype = torch.float64
     seed = torch.tensor(
         [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=dtype
     )
-    inputs = model.MeasurementFitInputs(
+    inputs = MeasurementFitInputs(
         measured=torch.zeros((1, 1, 2), dtype=dtype),
         variance=torch.ones((1, 1, 2), dtype=dtype),
         component_mask=torch.tensor([[[True, False]]]),
@@ -239,23 +257,22 @@ def test_measurement_fit_rejects_an_underconstrained_row():
     )
 
     with pytest.raises(ValueError, match="underconstrained"):
-        model.fit_helix_measurements_gauss_newton(seed, inputs)
+        fit_helix_measurements_gauss_newton(seed, inputs)
     with pytest.raises(ValueError, match="underconstrained"):
-        model.measurement_newton_decrement(seed, inputs)
+        measurement_newton_decrement(seed, inputs)
 
 
 def test_shared_closest_point_and_plane_intersection_report_invalid_paths():
-    model = importlib.import_module("scripts.helix_model")
     track = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float64)
     point = torch.tensor([[25.0, 3.0, 0.0]], dtype=torch.float64)
-    fitted, path, closest_valid = model.closest_helix_points(track, point)
+    fitted, path, closest_valid = closest_helix_points(track, point)
     assert closest_valid.tolist() == [True]
     assert path.tolist() == pytest.approx([25.0])
     torch.testing.assert_close(
         fitted, torch.tensor([[25.0, 0.0, 0.0]], dtype=torch.float64)
     )
 
-    _path, fallback, intersection_valid = model.intersect_plane(
+    _path, fallback, intersection_valid = intersect_plane(
         track,
         center=torch.tensor([[0.0, 5.0, 0.0]], dtype=torch.float64),
         normal=torch.tensor([[0.0, 1.0, 0.0]], dtype=torch.float64),
@@ -265,20 +282,18 @@ def test_shared_closest_point_and_plane_intersection_report_invalid_paths():
 
 
 def test_curvature_optimizer_scaling_round_trips_physical_parameters():
-    model = importlib.import_module("scripts.helix_model")
     tracks = torch.tensor(
         [[1.0, 2.0, 3.0, 0.4, -0.2, 2.5e-4]], dtype=torch.float64
     )
-    linear, scaled = model.split_track_parameters(tracks)
+    linear, scaled = split_track_parameters(tracks)
     torch.testing.assert_close(
         scaled, torch.tensor([[2.5]], dtype=torch.float64)
     )
-    assert torch.equal(model.assemble_track_parameters(linear, scaled), tracks)
+    assert torch.equal(assemble_track_parameters(linear, scaled), tracks)
 
 
 def test_point_seed_gauss_newton_reaches_the_noiseless_helix_stationary_point():
     """Catch a seed solver that merely exhausts a first-order iteration budget."""
-    model = importlib.import_module("scripts.helix_model")
     truth = torch.tensor(
         [
             [2.0, -1.0, 0.5, 0.4, 0.2, 2.0e-3],
@@ -287,7 +302,7 @@ def test_point_seed_gauss_newton_reaches_the_noiseless_helix_stationary_point():
         dtype=torch.float64,
     )
     path = torch.linspace(-30.0, 80.0, 12, dtype=torch.float64)
-    points = model.helix_point(
+    points = helix_point(
         truth[:, None, :].expand(-1, len(path), -1),
         path.expand(len(truth), -1),
     )
@@ -303,14 +318,14 @@ def test_point_seed_gauss_newton_reaches_the_noiseless_helix_stationary_point():
         dtype=torch.float64,
     )
 
-    fitted, diagnostics = model.fit_helix_points_gauss_newton(
+    fitted, diagnostics = fit_helix_points_gauss_newton(
         initial, points, mask, max_iters=30
     )
-    chunked, chunked_diagnostics = model.fit_helix_points_gauss_newton(
+    chunked, chunked_diagnostics = fit_helix_points_gauss_newton(
         initial, points, mask, max_iters=30, chunk_rows=1
     )
     expanded = fitted[:, None, :].expand(-1, points.shape[1], -1)
-    closest, _path, valid = model.closest_helix_points(expanded, points)
+    closest, _path, valid = closest_helix_points(expanded, points)
     rms = torch.sqrt((closest[mask & valid] - points[mask & valid]).square().mean())
 
     assert diagnostics["solver"] == "gauss-newton"
@@ -325,7 +340,6 @@ def test_point_seed_gauss_newton_reaches_the_noiseless_helix_stationary_point():
 
 def test_point_seed_ignores_closest_point_invalid_inputs():
     """An out-of-range closest path is not an SMT residual and cannot bias the fit."""
-    model = importlib.import_module("scripts.helix_model")
     path = torch.linspace(0.0, 90.0, 10, dtype=torch.float64)
     points = torch.stack((path, torch.zeros_like(path), torch.zeros_like(path)), dim=1)
     points = torch.cat(
@@ -334,7 +348,7 @@ def test_point_seed_ignores_closest_point_invalid_inputs():
     initial = torch.zeros((1, 6), dtype=torch.float64)
     mask = torch.ones((1, len(points[0])), dtype=torch.bool)
 
-    fitted, diagnostics = model.fit_helix_points_gauss_newton(
+    fitted, diagnostics = fit_helix_points_gauss_newton(
         initial, points, mask, max_iters=10
     )
 
@@ -344,15 +358,14 @@ def test_point_seed_ignores_closest_point_invalid_inputs():
 
 
 def test_point_seed_reports_budget_exhaustion_per_row():
-    model = importlib.import_module("scripts.helix_model")
     truth = torch.tensor([[2.0, -1.0, 0.5, 0.4, 0.2, 2.0e-3]], dtype=torch.float64)
     path = torch.linspace(-30.0, 80.0, 12, dtype=torch.float64)
-    points = model.helix_point(truth[:, None, :].expand(-1, len(path), -1), path[None])
+    points = helix_point(truth[:, None, :].expand(-1, len(path), -1), path[None])
     initial = truth + torch.tensor(
         [[0.8, -0.5, 0.3, 0.08, -0.05, 4.0e-4]], dtype=torch.float64
     )
 
-    _fitted, diagnostics = model.fit_helix_points_gauss_newton(
+    _fitted, diagnostics = fit_helix_points_gauss_newton(
         initial, points, torch.ones(points.shape[:2], dtype=torch.bool), max_iters=1
     )
 
@@ -360,26 +373,25 @@ def test_point_seed_reports_budget_exhaustion_per_row():
     assert diagnostics["non_stationary_row_fraction"] == 1.0
     assert diagnostics["relative_newton_decrement_max"] > 1.0e-6
     with pytest.raises(ValueError, match="non-stationary"):
-        model.require_stationary_helix_point_fit(diagnostics)
+        require_stationary_helix_point_fit(diagnostics)
     non_finite = {
         **diagnostics,
         "n_non_finite": 1,
         "non_stationary_row_fraction": 1.0 / 2048.0,
     }
     with pytest.raises(ValueError, match="non-finite"):
-        model.require_stationary_helix_point_fit(non_finite)
+        require_stationary_helix_point_fit(non_finite)
 
 
 def test_point_seed_converges_mixed_exact_and_non_exact_rows_in_float32():
     """Already-stationary rows must not block other rows in a shared GPU-like chunk."""
-    model = importlib.import_module("scripts.helix_model")
     dtype = torch.float32
     path = torch.linspace(-30.0, 80.0, 12, dtype=dtype)
     truth = torch.tensor(
         [[0.0, 0.0, 0.0, 0.0, 0.1, 0.0], [2.0, -1.0, 0.5, 0.4, 0.2, 2e-3]],
         dtype=dtype,
     )
-    points = model.helix_point(
+    points = helix_point(
         truth[:, None, :].expand(-1, len(path), -1), path.expand(2, -1)
     )
     points[1, :, 2] += 0.01 * torch.sin(path / 7.0)
@@ -388,7 +400,7 @@ def test_point_seed_converges_mixed_exact_and_non_exact_rows_in_float32():
         [0.8, -0.5, 0.3, 0.08, -0.05, 4e-4], dtype=dtype
     )
 
-    fitted, diagnostics = model.fit_helix_points_gauss_newton(
+    fitted, diagnostics = fit_helix_points_gauss_newton(
         initial,
         points,
         torch.ones(points.shape[:2], dtype=torch.bool),

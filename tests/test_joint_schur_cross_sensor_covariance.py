@@ -18,9 +18,9 @@ import math
 import pytest
 import torch
 
-import joint_alignment_schur as J
+from mlalign import schur_lm as J
 import joint_schur_synthetic as syn
-from helix_model import (
+from mlalign.helix.measurement_fit import (
     MEASUREMENT_NEWTON_DECREMENT_STATIONARY,
     MeasurementFitInputs,
     measurement_newton_decrement,

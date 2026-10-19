@@ -1,16 +1,15 @@
-"""Box bounds on the geometry corrections, shared by block-LM and schur-lm."""
+"""Box bounds on the geometry corrections and their active set."""
 
 from __future__ import annotations
 
-JOINT_CLAMP_T = 1.5
-JOINT_CLAMP_R = 0.05
+from .config import DEFAULT_CLAMP_R as JOINT_CLAMP_R, DEFAULT_CLAMP_T as JOINT_CLAMP_T  # noqa: F401
 
 #: Tolerance for "sitting on a box constraint".  ``clamp_`` makes the equality
 #: exact, so this only absorbs the round trip through the candidate row.
-BLOCK_LM_BOUND_ATOL = 1.0e-12
+BOUND_ATOL = 1.0e-12
 
 
-def _block_lm_free_dof_mask(values, gradient, lower, upper, atol=BLOCK_LM_BOUND_ATOL):
+def free_dof_mask(values, gradient, lower, upper, atol=BOUND_ATOL):
     """Active-set mask for the box constraints: which DOFs may still move.
 
     From the projected gradient ``P = x - clip(x - g, l, u)`` with a descent

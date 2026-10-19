@@ -15,9 +15,12 @@ import itertools
 import pytest
 import torch
 
-import joint_alignment_schur as J
+from mlalign import schur_lm as J
 import joint_schur_synthetic as syn
-from ml_alignment_autograd import JOINT_CLAMP_R, JOINT_CLAMP_T, LM_MAX_STEP_T
+from mlalign.box_constraints import JOINT_CLAMP_R, JOINT_CLAMP_T
+
+#: The retired block-LM per-step translation cap (mm); schur-lm must not apply it.
+LM_MAX_STEP_T = 0.1
 
 DTYPE = torch.float64
 ORACLE_ATOL = 1.0e-10

@@ -110,7 +110,6 @@ def test_cli_config_activation_supports_split_and_equals_forms(monkeypatch, tmp_
 @pytest.mark.parametrize(
     "script_name",
     [
-        "ml_alignment_autograd.py",
         "reconstruction_acceptance.py",
         "plot_residuals.py",
         "plot_chi2ndf.py",

@@ -12,8 +12,12 @@ from dataclasses import dataclass
 
 import torch
 
-import ml_alignment_autograd as M
-from helix_model import MeasurementFitInputs, measurement_local_prediction
+from mlalign.helix.measurement_fit import MeasurementFitInputs, measurement_local_prediction
+
+from mlalign.geometry_io import JointGeometry
+from mlalign.helix_init import fit_helices_to_measurements
+from mlalign.rotations import apply_alignment_torch
+from mlalign.track_batches import TrackBatches
 
 DTYPE = torch.float64
 # Local frame (u, v, n) = (y, z, x): planes normal to x, measuring y and z.
@@ -88,7 +92,7 @@ def make_problem(
         rotations[n_ref + index] = yawed_rotation(yaw)
     target_mask = torch.zeros(n_surfaces, dtype=torch.bool)
     target_mask[n_ref:] = True
-    geometry = M.JointGeometry(
+    geometry = JointGeometry(
         transforms=[],
         input_transforms=[],
         centers=centers,
@@ -100,7 +104,7 @@ def make_problem(
     true_alignment = torch.zeros((n_surfaces, 6), dtype=DTYPE)
     if injection is not None:
         true_alignment[n_ref:] = torch.as_tensor(injection, dtype=DTYPE)
-    true_centers, true_rotations = M.apply_alignment_torch(centers, rotations, true_alignment)
+    true_centers, true_rotations = apply_alignment_torch(centers, rotations, true_alignment)
 
     if topology is None:
         topology = [list(range(n_targets))] * n_tracks
@@ -142,7 +146,7 @@ def make_problem(
         generator = torch.Generator().manual_seed(noise_seed)
         noise = torch.randn(measured.shape, generator=generator, dtype=DTYPE)
         measured = measured + noise * raw_variance.sqrt() * hit_mask.unsqueeze(-1)
-    batches = M.TrackBatches(
+    batches = TrackBatches(
         measured_local=measured,
         covariances=variance,
         sensor_idx=sensor_idx,
@@ -165,7 +169,7 @@ def make_problem(
 def ref_only_fit(problem: SyntheticProblem, start: torch.Tensor | None = None) -> torch.Tensor:
     """Production ref-only Gauss-Newton refit (target hits never enter)."""
     start = problem.truth if start is None else start
-    fitted, _stats = M.fit_helices_to_measurements(
+    fitted, _stats = fit_helices_to_measurements(
         problem.batches, problem.geometry, start, dtype=DTYPE, stationarity=False
     )
     return fitted.detach().to(DTYPE)
@@ -176,7 +180,7 @@ def random_linearization(topology, n_blocks: int, n_ref_hits: int = 6, seed: int
 
     ``topology[t]`` lists the geometry blocks track ``t`` crosses (one hit each).
     """
-    import joint_alignment_schur as J
+    from mlalign import schur_lm as J
 
     generator = torch.Generator().manual_seed(seed)
     n_tracks = len(topology)
