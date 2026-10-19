@@ -4,13 +4,8 @@ import json
 import random
 import numpy as np
 import ctypes
-import os
 import argparse
 import sys
-import time
-import hashlib
-import traceback
-from contextlib import redirect_stdout, redirect_stderr
 
 import acts
 import acts.examples
@@ -19,8 +14,6 @@ from acts.examples.alignment import AlignmentDecorator
 
 from alignment_artifact_layout import (
     PROJECT_CONFIG,
-    TARGET_LAYER_DIR,
-    TARGET_LAYER_SUFFIX,
     artifact_filename,
     data_path,
     target_subdir,
@@ -30,257 +23,15 @@ from experiment_manifest import (
     finalize_experiment_manifest,
     write_experiment_manifest,
 )
-# Pinned pT=100 GeV ACTS-Alignment vs Schur-LM study (ACTS-free shared layout).
-import pt100_alignment_layout as pt100
-from pt100_alignment_layout import PT100_STAGES
 from project_config import (
     absolute_project_path,
     add_config_argument,
-    load_project_config,
     resolve_project_path,
 )
 
 u = acts.UnitConstants
 
 # Deliberately hardcoded: simulation/reconstruction gain no CLI switches.
-MATERIAL_STUDY_RUN = "material-helix-20261014-r2"
-MATERIAL_STUDY_EVENTS = 20_000
-MATERIAL_STUDY_CASES = (
-    ("g1_pt10_material_on", 10.0, True),
-    ("g2_pt10_material_off", 10.0, False),
-    ("g3_pt100_material_on", 100.0, True),
-)
-
-
-def material_study_paths(data_root, target_dir, run_id, group):
-    root = Path(data_root)
-    return (root / "simulation" / run_id / group,
-            root / "reconstruction" / "nominal" / target_dir / run_id / group)
-
-
-def run_material_study_stage(output, stage, prepare, *, inputs, config):
-    """Own fresh outputs, provenance, native/Python logs and failure-safe timing."""
-    output = Path(output)
-    if output.exists():
-        raise FileExistsError(f"refusing to reuse study output: {output}")
-    output.mkdir(parents=True)
-    timings = {"schema_version": 1, "stage": stage, "setup_seconds": 0.0,
-               "run_seconds": 0.0, "wall_seconds": 0.0,
-               "excludes": "environment loading, manifest hashing and source archival"}
-    timing_path = output / "timings.json"
-    cpu_started = cpu_stopped = None
-    manifest = write_experiment_manifest(
-        output, run_id=f"{output.parent.name}/{output.name}/{stage}",
-        command=[sys.executable, *sys.argv], config=PROJECT_CONFIG,
-        inputs=inputs, outputs={"timings": timing_path, "log": output / f"{stage}.log"},
-        metrics={"study_config": config}, capture_source_snapshot=True, allow_missing_inputs=True)
-    status, error, phase, started = "failed", None, "setup_seconds", None
-    try:
-        with (output / f"{stage}.log").open("w") as log:
-            sys.stdout.flush()
-            sys.stderr.flush()
-            saved = (os.dup(1), os.dup(2))
-            try:
-                os.dup2(log.fileno(), 1)
-                os.dup2(log.fileno(), 2)
-                with redirect_stdout(log), redirect_stderr(log):
-                    try:
-                        started = time.perf_counter()
-                        cpu_started = time.process_time()
-                        sequencer = prepare()
-                        timings[phase] = time.perf_counter() - started
-                        phase, started = "run_seconds", time.perf_counter()
-                        try:
-                            sequencer.run()
-                        finally:
-                            del sequencer
-                        timings[phase] = time.perf_counter() - started
-                        cpu_stopped = time.process_time()
-                        started = None
-                    except BaseException as exc:
-                        # Setup can also fail after creating writer-owning `s`.
-                        # Release traceback frames while the native log is open.
-                        traceback.clear_frames(exc.__traceback__)
-                        raise
-            finally:
-                log.flush()
-                os.dup2(saved[0], 1)
-                os.dup2(saved[1], 2)
-                os.close(saved[0])
-                os.close(saved[1])
-        status = "completed"
-    except BaseException as exc:
-        if started is not None:
-            timings[phase] = time.perf_counter() - started
-        error = f"{type(exc).__name__}: {exc}"
-        raise
-    finally:
-        timings["wall_seconds"] = timings["setup_seconds"] + timings["run_seconds"]
-        # Process CPU over setup+run, summed over all threads: a thread-count-free check.
-        if cpu_started is not None:
-            timings["process_cpu_seconds"] = (cpu_stopped or time.process_time()) - cpu_started
-        timing_path.write_text(json.dumps(timings, indent=2, allow_nan=False) + "\n")
-        outputs = {p.name: p for p in output.iterdir() if p.is_file() and p.name != "manifest.json"}
-        hashes = {}
-        for name, path in outputs.items():
-            digest = hashlib.sha256()
-            with path.open("rb") as stream:
-                for block in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(block)
-            hashes[name] = digest.hexdigest()
-        finalize_experiment_manifest(manifest, status=status, outputs=outputs,
-                                     metrics={"timings": timings, "error": error,
-                                              "output_sha256": hashes})
-
-
-def run_material_study(stage):
-    """Run the three pinned arms through an existing adapter subcommand."""
-    config = {"run_id": MATERIAL_STUDY_RUN, "num_events": MATERIAL_STUDY_EVENTS,
-              "random_seed": 42, "geometry": "nominal", "field_tesla": 2.0,
-              "particle": "muon, randomized charge", "eta": [-3., 3.],
-              "reconstruction": "unchanged TruthSmeared seed + Kalman"}
-    field = acts.ConstantBField(acts.Vector3(0, 0, 2 * u.T))
-    for group, pt, interactions in MATERIAL_STUDY_CASES:
-        simulation, reconstruction = material_study_paths(
-            PROJECT_CONFIG.data_root, TARGET_LAYER_DIR, MATERIAL_STUDY_RUN, group)
-        output = simulation if stage == "simulation" else reconstruction
-        inputs = {"digi_config": PROJECT_CONFIG.odd_digi_config,
-                  "nominal_geometry": data_path("odd_transforms.json")}
-        if stage == "reconstruction":
-            if not (simulation / "manifest.json").exists():
-                raise FileNotFoundError(f"missing completed simulation: {simulation}")
-            if json.loads((simulation / "manifest.json").read_text())["status"] != "completed":
-                raise ValueError(f"simulation is not completed: {simulation}")
-            inputs["simulation_dir"] = simulation
-        detectors = []
-        def prepare():
-            detector = get_configured_open_data_detector(misaligned=False)
-            detectors.append(detector)  # Keep detector elements alive through Sequencer.run().
-            common = dict(trackingGeometry=detector.trackingGeometry(), field=field,
-                          digiConfigFile=PROJECT_CONFIG.odd_digi_config, outputDir=output,
-                          detector=detector, numEvents=MATERIAL_STUDY_EVENTS)
-            if stage == "simulation":
-                return runSimulation(**common, fixedPtGeV=pt, enableInteractions=interactions)
-            return runReconstruction(**common, inputDir=simulation, mode="nominal",
-                                     finalOutputDir=True, overwriteOutputs=False)
-        print(f"Starting {stage}: {group} -> {output}", flush=True)
-        run_material_study_stage(output, stage, prepare, inputs=inputs,
-                                 config={**config, "group": group, "pt_gev": pt,
-                                         "fatras_interactions": interactions})
-        print(f"Completed {stage}: {group}", flush=True)
-
-
-class _DeferredRun:
-    """Adapter for run_material_study_stage when the callee runs its own Sequencer."""
-
-    def __init__(self, call):
-        self._call = call
-
-    def run(self):
-        self._call()
-
-
-def _require_completed(directory):
-    manifest = Path(directory) / "manifest.json"
-    if not manifest.exists():
-        raise FileNotFoundError(f"missing completed stage: {directory}")
-    if json.loads(manifest.read_text())["status"] != "completed":
-        raise ValueError(f"stage is not completed: {directory}")
-
-
-def link_pt100_nominal(paths):
-    """Expose the existing g3 nominal reconstruction in the plot-script layout."""
-    if paths["nominal"].exists():
-        return
-    _require_completed(paths["nominal_source"])
-    paths["nominal"].mkdir(parents=True)
-    for stem in ("trackstates_kf", "tracksummary_kf"):
-        name = artifact_filename(stem, ".root")
-        (paths["nominal"] / name).symlink_to(paths["nominal_source"] / name)
-
-
-def full_workflow_manifest(alignment_dir):
-    """The `full` workflow's manifest in `alignment_dir`, or None for any other run."""
-    manifest = Path(alignment_dir) / "manifest.json"
-    if not manifest.exists():
-        return None
-    record = json.loads(manifest.read_text())
-    return record if "workflow_config" in record.get("metrics", {}) else None
-
-
-def run_pt100_alignment_study(stage, run_id=None):
-    if stage not in PT100_STAGES:
-        raise ValueError(f"unknown pt100-alignment stage: {stage}")
-    run_id = run_id or pt100.PT100_ALIGNMENT_RUN
-    paths = pt100.pt100_alignment_paths(PROJECT_CONFIG.data_root, TARGET_LAYER_DIR, run_id)
-    workflow = full_workflow_manifest(paths["alignment"])
-    inputs = {"digi_config": PROJECT_CONFIG.odd_digi_config,
-              "nominal_geometry": data_path("odd_transforms.json")}
-    if workflow is None:
-        _require_completed(paths["simulation"])
-        simulation, num_events = paths["simulation"], pt100.PT100_ALIGNMENT_EVENTS
-        config = {"run_id": run_id, "num_events": num_events,
-                  "source_run": pt100.PT100_SOURCE_RUN, "source_group": pt100.PT100_SOURCE_GROUP,
-                  "pt_gev": 100.0, "fatras_interactions": True,
-                  "misalignment_seed": pt100.PT100_MISALIGNMENT_SEED,
-                  "misalignment": "per-sensor local tx/ty in +-[0.25,0.75] mm, rz in +-[0.01,0.03] rad",
-                  "acts_max_iterations": pt100.PT100_ACTS_MAX_ITERATIONS,
-                  "sequencer_threads": -1, "stage": stage}
-        inputs["simulation_manifest"] = paths["simulation"] / "manifest.json"
-    else:
-        # A `full` run already holds its ACTS alignment and misaligned/aligned
-        # reconstructions; only the Schur-geometry reconstruction is added here.
-        if stage != "aligned-schur":
-            raise ValueError(f"full-workflow run {run_id} only takes the aligned-schur stage")
-        simulation = Path(workflow["outputs"]["simulation_dir"])
-        num_events = workflow["metrics"]["workflow_config"]["num_events"]
-        config = {**workflow["metrics"]["workflow_config"], "run_id": run_id,
-                  "simulation_dir": str(simulation), "stage": stage}
-        inputs["workflow_manifest"] = paths["alignment"] / "manifest.json"
-    field = acts.ConstantBField(acts.Vector3(0, 0, 2 * u.T))
-    if stage != "acts-alignment":
-        _require_completed(paths["alignment"])
-        inputs["misalignment"] = paths["misalignment"]
-    aligned_file = None
-    if stage == "aligned-acts":
-        aligned_file = paths["acts_geometry"]
-    elif stage == "aligned-schur":
-        _require_completed(paths["schur_geometry"].parent)
-        aligned_file = paths["schur_geometry"]
-    if aligned_file is not None:
-        inputs["aligned_geometry"] = aligned_file
-    output = paths["alignment"] if stage == "acts-alignment" else paths[stage]
-    detectors = []
-
-    def prepare():
-        # Every stage applies an alignment store, as HEAD's non-nominal modes did.
-        detector = get_configured_open_data_detector(misaligned=True)
-        detectors.append(detector)  # Keep detector elements alive through the run.
-        common = dict(trackingGeometry=detector.trackingGeometry(), field=field,
-                      digiConfigFile=PROJECT_CONFIG.odd_digi_config,
-                      inputDir=simulation, detector=detector, numEvents=num_events)
-        if stage == "acts-alignment":
-            def align():
-                # setupMisalignment draws from the module-level `random`.
-                random.seed(pt100.PT100_MISALIGNMENT_SEED)
-                runAlignment(**common, outputDir=output,
-                             maxNumIterations=pt100.PT100_ACTS_MAX_ITERATIONS)
-            return _DeferredRun(align)
-        mode = "misaligned" if stage == "misaligned" else "aligned"
-        suffix = "" if aligned_file is None else (
-            f"{TARGET_LAYER_SUFFIX}_{stage.removeprefix('aligned-').replace('schur', 'schur_lm')}")
-        return runReconstruction(**common, outputDir=output, mode=mode,
-                                 alignmentDir=paths["alignment"], alignedFile=aligned_file,
-                                 outputSuffix=suffix, finalOutputDir=True,
-                                 overwriteOutputs=False)
-
-    print(f"Starting pt100-alignment {stage} -> {output}", flush=True)
-    run_material_study_stage(output, stage, prepare, inputs=inputs, config=config)
-    if stage == "misaligned":
-        link_pt100_nominal(paths)
-    print(f"Completed pt100-alignment {stage}", flush=True)
-
-
 def get_configured_open_data_detector(*, misaligned: bool):
     from acts.examples.odd import getOpenDataDetector
 
@@ -1261,11 +1012,7 @@ def runReconstruction(
     alignmentDir: Path = None,  # Directory containing alignment output files
     alignedFile: str = None,  # Override path for the aligned transforms JSON
     outputSuffix: str = "",  # Appended as _{suffix} to output ROOT file names
-    recordMaterial: bool = False,  # Also record per-track material interactions
-    recordSteps: bool = False,  # Keep the stepping logger alive for diagnostics
-    materialEnergyLoss: bool = False,  # Gate 0 ablation only; see below
     overwriteOutputs: bool = False,  # Allow RECREATE over an existing ROOT file
-    finalOutputDir: bool = False,  # Internal study path already includes target/group
 ):
     """
     Run reconstruction with different geometry modes.
@@ -1299,7 +1046,7 @@ def runReconstruction(
 
     rnd = acts.examples.RandomNumbers(seed=42)
     inputDir = Path(inputDir)
-    outputDir = Path(outputDir) if finalOutputDir else target_subdir(outputDir)
+    outputDir = target_subdir(outputDir)
     outputDir.mkdir(parents=True, exist_ok=True)
 
     logger = acts.logging.getLogger("Reconstruction")
@@ -1469,80 +1216,6 @@ def runReconstruction(
         )
     )
     s.addWhiteboardAlias("tracks", "selected-tracks")
-
-    if recordMaterial:
-        # Material export shares this exact chain -- same geometry, field, seed,
-        # particle selection, fitter and track selection -- so the recorded nodes
-        # belong to the very tracks written by RootTrackStatesWriter below.
-        #
-        # RootMaterialTrackWriter drops the material map key and iterates an
-        # unordered_map (RootMaterialTrackWriter.cpp:87), so the material rows
-        # carry no track index.  RootPropagationSummaryWriter is the index
-        # bridge: it emits (event_nr, track_nr) alongside the same start bound
-        # parameters that PropagationAlgorithm handed to the material recorder.
-        #
-        # energyLoss/multipleScattering stay off on purpose.  The first
-        # broken-helix version keeps curvature constant between segments and
-        # does not model energy loss; letting q/p evolve here would record nodes
-        # along a trajectory the fitted model cannot represent.
-        s.addAlgorithm(
-            acts.examples.TracksToParameters(
-                level=acts.logging.INFO,
-                inputTracks="tracks",
-                outputTrackParameters="params-from-tracks",
-            )
-        )
-        propagator = acts.examples.ConcretePropagator(
-            acts.Propagator(
-                acts.EigenStepper(field),
-                acts.Navigator(trackingGeometry=trackingGeometry),
-            )
-        )
-        s.addAlgorithm(
-            acts.examples.PropagationAlgorithm(
-                level=acts.logging.INFO,
-                propagatorImpl=propagator,
-                # A sterile SteppingLogger empties PropagationSummary::steps, which
-                # is what RootPropagationSummaryWriter counts nMaterials from
-                # (RootPropagationSummaryWriter.cpp:141-151).  Keeping it sterile
-                # is cheap for production; Gate 0 turns it on so nMaterials becomes
-                # a real cross-check of the recorded surface-material nodes.
-                sterileLogger=not recordSteps,
-                recordMaterialInteractions=True,
-                energyLoss=materialEnergyLoss,
-                multipleScattering=False,
-                covarianceTransport=False,
-                inputTrackParameters="params-from-tracks",
-                outputSummaryCollection="propagation_summary",
-                outputMaterialCollection="material_tracks",
-            )
-        )
-        s.addWriter(
-            acts.examples.root.RootMaterialTrackWriter(
-                level=acts.logging.INFO,
-                inputMaterialTracks="material_tracks",
-                filePath=str(
-                    reserve_reconstruction_output(
-                        outputDir, "material_kf", outputSuffix, overwriteOutputs
-                    )
-                ),
-                storeSurface=True,
-                storeVolume=True,
-                prePostStep=False,
-                collapseInteractions=False,
-            )
-        )
-        s.addWriter(
-            acts.examples.root.RootPropagationSummaryWriter(
-                level=acts.logging.INFO,
-                inputSummaryCollection="propagation_summary",
-                filePath=str(
-                    reserve_reconstruction_output(
-                        outputDir, "propsummary_kf", outputSuffix, overwriteOutputs
-                    )
-                ),
-            )
-        )
 
     s.addWriter(
         acts.examples.root.RootTrackStatesWriter(
@@ -1714,78 +1387,6 @@ if "__main__" == __name__:
         type=str,
         default="",
         help="Suffix appended to output ROOT file names (e.g. 'ml' -> trackstates_kf_ml.root)",
-    )
-
-    # Material export command
-    material_parser = subparsers.add_parser(
-        "material",
-        help="Reconstruct and additionally record per-track material interactions",
-    )
-    material_parser.add_argument(
-        "--num-events", type=int, default=100000, help="Number of events"
-    )
-    material_parser.add_argument(
-        "--input-dir",
-        type=absolute_project_path,
-        default=None,
-        help="Input directory (default: simulation_output)",
-    )
-    material_parser.add_argument(
-        "--output-dir",
-        type=absolute_project_path,
-        default=None,
-        help="Output directory (default: reconstruction_output)",
-    )
-    material_parser.add_argument(
-        "--output-suffix",
-        type=str,
-        default="",
-        help="Suffix appended to output ROOT file names (e.g. 'mat0')",
-    )
-    material_parser.add_argument(
-        "--run-tag",
-        type=str,
-        required=True,
-        help="Manifest run identifier for this material export",
-    )
-    material_parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Allow RECREATE to replace existing ROOT outputs",
-    )
-    material_parser.add_argument(
-        "--energy-loss",
-        action="store_true",
-        help=(
-            "Gate 0 ablation only: let q/p evolve during the recording pass. "
-            "Production keeps this off so the recorded nodes stay consistent "
-            "with the constant-curvature broken-helix model."
-        ),
-    )
-    material_parser.add_argument(
-        "--record-steps",
-        action="store_true",
-        help=(
-            "Keep the stepping logger alive so nMaterials is populated. "
-            "Costs memory per track; intended for Gate 0 diagnostics."
-        ),
-    )
-    material_parser.add_argument(
-        "--capture-source-snapshot",
-        action="store_true",
-        help="Archive the exact tracked+untracked source tree into the run's "
-        "manifest so it can be replayed independent of git commit/dirty state.",
-    )
-
-    pt100_parser = subparsers.add_parser(
-        "pt100-alignment",
-        help="Pinned pT=100 GeV material-on ACTS-Alignment vs Schur-LM study stage",
-    )
-    pt100_parser.add_argument("stage", choices=PT100_STAGES)
-    pt100_parser.add_argument(
-        "--run-id", default=None,
-        help="Run under data/alignment/ (default: the pinned study run); a completed "
-        "`full` run takes only aligned-schur",
     )
 
     args = parser.parse_args()
@@ -1986,7 +1587,22 @@ if "__main__" == __name__:
         print(f"  - Reconstruction (aligned): {reconDir_ali}")
 
     elif args.command == "simulation":
-        run_material_study("simulation")
+        outputDir = (
+            Path(args.output_dir)
+            if args.output_dir
+            else data_path("simulation_output")
+        )
+        detector = get_configured_open_data_detector(misaligned=True)
+        trackingGeometry = detector.trackingGeometry()
+
+        runSimulation(
+            trackingGeometry=trackingGeometry,
+            field=field,
+            digiConfigFile=digiConfigFile,
+            outputDir=outputDir,
+            detector=detector,
+            numEvents=args.num_events,
+        ).run()
 
     elif args.command == "alignment":
         inputDir = (
@@ -2018,12 +1634,6 @@ if "__main__" == __name__:
         )
 
     elif args.command == "reconstruction":
-        run_material_study("reconstruction")
-
-    elif args.command == "pt100-alignment":
-        run_pt100_alignment_study(args.stage, args.run_id)
-
-    elif args.command == "material":
         inputDir = (
             Path(args.input_dir) if args.input_dir else data_path("simulation_output")
         )
@@ -2032,7 +1642,7 @@ if "__main__" == __name__:
             if args.output_dir
             else data_path("reconstruction_output")
         )
-        outputDir = target_subdir(baseoutputDir / "nominal")
+        outputDir = target_subdir(baseoutputDir / args.mode)
         outputDir.mkdir(parents=True, exist_ok=True)
 
         if not inputDir.exists():
@@ -2040,89 +1650,33 @@ if "__main__" == __name__:
             print("Please run simulation first to generate simulation data.")
             sys.exit(1)
 
-        # Material export is itself an algorithm experiment: the manifest is
-        # created before the Sequencer starts so an abort still leaves a record.
-        # Export and conversion are separate experiments; giving each its own
-        # run directory is what keeps both manifests from colliding.
-        manifest_dir = (
-            target_subdir(data_path("material_output")) / args.run_tag / "export"
-        )
-        manifest_dir.mkdir(parents=True, exist_ok=True)
-        material_root = outputDir / reconstruction_output_name(
-            "material_kf", args.output_suffix
-        )
-        propsummary_root = outputDir / reconstruction_output_name(
-            "propsummary_kf", args.output_suffix
-        )
-        manifest = write_experiment_manifest(
-            manifest_dir,
-            run_id=args.run_tag,
-            command=[sys.executable, *sys.argv],
-            config=load_project_config(),
-            inputs={"simulation_dir": inputDir},
-            outputs={
-                "material_root": material_root,
-                "propsummary_root": propsummary_root,
-                "trackstates_root": outputDir
-                / reconstruction_output_name("trackstates_kf", args.output_suffix),
-                "tracksummary_root": outputDir
-                / reconstruction_output_name("tracksummary_kf", args.output_suffix),
-            },
-            metrics={
-                "exporter_config": {
-                    "stepper": "EigenStepper",
-                    "navigator": "Navigator",
-                    "energy_loss": args.energy_loss,
-                    "multiple_scattering": False,
-                    "covariance_transport": False,
-                    "record_material_interactions": True,
-                    "sterile_logger": not args.record_steps,
-                    "store_surface": True,
-                    "store_volume": True,
-                    "pre_post_step": False,
-                    "collapse_interactions": False,
-                    "num_events": args.num_events,
-                    "random_seed": 42,
-                    "particle_hypothesis": "muon",
-                    "min_measurements": 5,
-                    "pt_min_gev": 2.0,
-                }
-            },
-            status="running",
-            capture_source_snapshot=args.capture_source_snapshot,
-        )
+        # Choose detector based on mode
+        if args.mode == "nominal":
+            detector = get_configured_open_data_detector(misaligned=False)
+        else:
+            detector = get_configured_open_data_detector(misaligned=True)
 
-        detector = get_configured_open_data_detector(misaligned=False)
         trackingGeometry = detector.trackingGeometry()
-        try:
-            runReconstruction(
-                trackingGeometry=trackingGeometry,
-                field=field,
-                digiConfigFile=digiConfigFile,
-                inputDir=inputDir,
-                outputDir=outputDir,
-                detector=detector,
-                numEvents=args.num_events,
-                mode="nominal",
-                outputSuffix=args.output_suffix,
-                recordMaterial=True,
-                recordSteps=args.record_steps,
-                materialEnergyLoss=args.energy_loss,
-                overwriteOutputs=args.overwrite,
-            ).run()
-        except BaseException as error:
-            finalize_experiment_manifest(
-                manifest,
-                status="failed",
-                metrics={"error": f"{type(error).__name__}: {error}"},
-            )
-            raise
-        finalize_experiment_manifest(manifest, status="completed")
+
+        runReconstruction(
+            trackingGeometry=trackingGeometry,
+            field=field,
+            digiConfigFile=digiConfigFile,
+            inputDir=inputDir,
+            outputDir=outputDir,
+            detector=detector,
+            numEvents=args.num_events,
+            mode=args.mode,
+            alignedFile=args.aligned_file,
+            outputSuffix=args.output_suffix,
+            overwriteOutputs=True,
+        ).run()
 
         print("\n" + "=" * 60)
-        print("Material export completed successfully!")
+        print("Reconstruction completed successfully!")
         print("=" * 60)
         print(f"\nOutput files saved to: {outputDir}")
-        print(f"  - {material_root.name}: material interactions")
-        print(f"  - {propsummary_root.name}: propagation summary (track index bridge)")
-        print(f"\nManifest: {manifest}")
+        print("\nGenerated files:")
+        print(f"  - {reconstruction_output_name('trackstates_kf', args.output_suffix)}: Track states")
+        print(f"  - {reconstruction_output_name('tracksummary_kf', args.output_suffix)}: Track summary")
+        print(f"  - {reconstruction_output_name('performance_kf', args.output_suffix)}: Reconstruction performance")
