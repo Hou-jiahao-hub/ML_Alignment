@@ -378,7 +378,7 @@ def setupMisalignment(
     rx: int = 0,
     ry: int = 0,
     rz: int = 0,
-    shift_mag_mm: float = 2.0,
+    shift_mag_mm: float = 0.5,
     rotation_mag_rad: float = 0.02,
 ):
     """
