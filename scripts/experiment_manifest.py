@@ -272,7 +272,7 @@ def _build_environment_identity(
     """Record the ACTS/conda identity a pipeline actually used.
 
     ``experiment_manifest.py`` runs as a bare ``python3`` call outside the
-    ``run_conda``/``run_acts`` wrappers in ``run_surface_helix_experiment.sh``,
+    ``run_conda``/``run_acts`` wrappers in ``run_schur_experiment.sh``,
     so ``_default_environment()`` alone reflects whatever interpreter is on
     ``PATH`` at that point, not the environments the pipeline stages actually
     ran in.  Callers that know those paths (the shell driver does) should

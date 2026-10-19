@@ -13,7 +13,7 @@ test-root-io:
 	timeout 120s python -m pytest tests -m root_io
 
 test-shell:
-	bash tests/test_run_surface_helix_experiment.sh
+	bash tests/test_run_schur_experiment.sh
 	bash tests/test_plot_residuals_static.sh
 
 test-all: test test-shell

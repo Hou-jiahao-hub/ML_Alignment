@@ -7,11 +7,11 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 ACCEPTANCE_SCHEMA_VERSION = "3.1"
 ACCEPTANCE_SELECTION_VERSION = "full_event_bootstrap_v1"
 
-WORKFLOW = "block-lm_surface-polish2_full-events"
+WORKFLOW = "schur-lm_full-events"
 
 TARGET_LAYERS = ["17:8", "24:4"]
 ACTIVE_DOF = [0, 1, 5]
@@ -39,7 +39,6 @@ def build_summary(
     final_geometry: str,
     final_trackstates: str,
     final_tracksummary: str,
-    polish_attempts: int,
     selection_stop_reason: str,
 ) -> dict[str, Any]:
     if final_acceptance.get("schema_version") != ACCEPTANCE_SCHEMA_VERSION:
@@ -81,12 +80,11 @@ def build_summary(
         "final_geometry": final_geometry,
         "final_trackstates": final_trackstates,
         "final_tracksummary": final_tracksummary,
-        "joint_free": dict(joint),
+        "schur_lm": dict(joint),
         "joint_effective": effective,
         "joint_solver_effective": solver_effective,
         "joint_adopted": joint_adopted,
         "final_acceptance": dict(final_acceptance),
-        "polish_attempts": polish_attempts,
         "selection_stop_reason": selection_stop_reason,
         "stop_reason": stop_reason,
         "diagnostics": {"truth_and_nominal": "diagnostic_only"},
@@ -113,7 +111,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--final-geometry", required=True)
     parser.add_argument("--final-trackstates", required=True)
     parser.add_argument("--final-tracksummary", required=True)
-    parser.add_argument("--polish-attempts", type=int, required=True)
     parser.add_argument("--selection-stop-reason", required=True)
     parser.add_argument("--output", required=True)
     return parser
@@ -136,7 +133,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         final_geometry=args.final_geometry,
         final_trackstates=args.final_trackstates,
         final_tracksummary=args.final_tracksummary,
-        polish_attempts=args.polish_attempts,
         selection_stop_reason=args.selection_stop_reason,
     )
     Path(args.output).write_text(json.dumps(summary, indent=2))

@@ -20,11 +20,7 @@ _LEGACY_DATA_ROOTS = {
     "alignment_output": DATA_ROOT / "alignment",
     "reconstruction_output": DATA_ROOT / "reconstruction",
     "simulation_output": DATA_ROOT / "simulation",
-    "iterative_ml_logs": DATA_ROOT / "experiments" / "iterative_ml",
-    "surface_helix_logs": DATA_ROOT / "experiments" / "surface_helix",
-    "helix_validation_output": DATA_ROOT / "experiments" / "helix_validation",
-    "ablation": DATA_ROOT / "experiments" / "ablation",
-    "material_output": DATA_ROOT / "experiments" / "material",
+    "schur_lm_logs": DATA_ROOT / "experiments" / "schur_lm",
     "archive": DATA_ROOT / "archive",
 }
 
@@ -109,16 +105,6 @@ def reconstruction_root_path(
     )
 
 
-def iteration_label(run_tag: str, iteration: int) -> str:
-    prefix = f"{run_tag}_ml" if run_tag else "ml"
-    return artifact_filename(
-        "",
-        "",
-        stem_prefix=prefix,
-        iteration=iteration,
-    ).strip("_")
-
-
 def shell_exports() -> str:
     values = {
         "ML_ALIGNMENT_REPOSITORY_ROOT": str(PROJECT_CONFIG.repository_root),
@@ -133,19 +119,12 @@ def shell_exports() -> str:
         "RECONSTRUCTION_ROOT": str(DATA_ROOT / "reconstruction"),
         "SIMULATION_ROOT": str(DATA_ROOT / "simulation"),
         "GEOMETRY_ROOT": str(DATA_ROOT / "geometry"),
-        "ITERATIVE_LOG_ROOT": str(DATA_ROOT / "experiments" / "iterative_ml"),
-        "SURFACE_HELIX_LOG_ROOT": str(DATA_ROOT / "experiments" / "surface_helix"),
+        "SCHUR_LM_LOG_ROOT": str(DATA_ROOT / "experiments" / "schur_lm"),
         "TARGET_LAYER_DIR": TARGET_LAYER_DIR,
         "TARGET_LAYER_SUFFIX": TARGET_LAYER_SUFFIX,
         "TARGET_LAYERS_SPEC": target_layers_spec(),
         "ACTIVE_DOF_SPEC": ",".join(str(value) for value in ACTIVE_DOF),
         "MISALIGNMENT_JSON": artifact_filename("misalignment_applied", ".json"),
-        "ALIGNED_REFERENCE_JSON": artifact_filename("aligned_transforms", ".json"),
-        "DEFAULT_ML_OUTPUT_JSON": artifact_filename(
-            "aligned_transforms",
-            ".json",
-            stem_prefix="ml",
-        ),
     }
     return "\n".join(
         f"{name}={shlex.quote(value)}" for name, value in values.items()

@@ -85,6 +85,8 @@ def test_shell_exports_include_absolute_runtime_dependency_paths():
         "ML_ALIGNMENT_CONDA_SETUP": layout.PROJECT_CONFIG.conda_setup,
     }
     assert {key: Path(exports[key]) for key in expected} == expected
+    assert Path(exports["SCHUR_LM_LOG_ROOT"]) == layout.DATA_ROOT / "experiments" / "schur_lm"
+    assert "SURFACE_HELIX_LOG_ROOT" not in exports
 
 
 def test_layout_uses_effective_project_configuration(monkeypatch, tmp_path):

@@ -42,8 +42,7 @@ def _summary(**overrides):
         final_geometry="geom.json",
         final_trackstates="states.root",
         final_tracksummary="summary.root",
-        polish_attempts=0,
-        selection_stop_reason="joint_acceptance_passed",
+        selection_stop_reason="schur_lm_adopted",
     )
     kwargs.update(overrides)
     return build_summary(**kwargs)
@@ -92,7 +91,8 @@ def test_summary_never_claims_a_hash_split():
     summary = _summary()
     assert "event_split" not in summary
     assert "calibration_acceptance" not in summary
-    assert summary["workflow"] == WORKFLOW
+    assert summary["workflow"] == WORKFLOW == "schur-lm_full-events"
+    assert "polish_attempts" not in summary
     assert summary["acceptance_scope"] == "diagnostic_only"
     assert summary["acceptance_baseline_sha256"] == PROFILE_SHA256
 
@@ -168,8 +168,7 @@ def test_main_hashes_the_baseline_file_and_records_it(tmp_path):
             "--final-geometry", "geom.json",
             "--final-trackstates", "states.root",
             "--final-tracksummary", "summary.root",
-            "--polish-attempts", "0",
-            "--selection-stop-reason", "joint_acceptance_passed",
+            "--selection-stop-reason", "schur_lm_adopted",
             "--output", str(output),
         ]
     )
@@ -189,8 +188,7 @@ def test_final_acceptance_is_required():
         final_geometry="geom.json",
         final_trackstates="states.root",
         final_tracksummary="summary.root",
-        polish_attempts=0,
-        selection_stop_reason="joint_acceptance_passed",
+        selection_stop_reason="schur_lm_adopted",
     )
     with pytest.raises(TypeError):
         build_summary(**kwargs)
