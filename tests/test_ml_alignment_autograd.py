@@ -421,15 +421,6 @@ def test_alignment_run_config_defaults_use_target_subdirectories():
     )
 
 
-def load_validate_helix_model_module():
-    module_path = Path(__file__).resolve().parents[1] / "scripts" / "validate_helix_model.py"
-    sys.path.insert(0, str(module_path.parent))
-    spec = importlib.util.spec_from_file_location("validate_helix_model", module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def build_synthetic_joint_case(m, n_tracks=4, n_hits=6, noise=0.02):

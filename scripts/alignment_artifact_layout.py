@@ -124,10 +124,6 @@ def shell_exports() -> str:
         "ML_ALIGNMENT_REPOSITORY_ROOT": str(PROJECT_CONFIG.repository_root),
         "ML_ALIGNMENT_DATA_ROOT": str(DATA_ROOT),
         "ML_ALIGNMENT_ACTS_ROOT": str(ACTS_ROOT),
-        "ML_ALIGNMENT_ALIGN_DERIVLIB_ROOT": str(PROJECT_CONFIG.align_derivlib_root),
-        "ML_ALIGNMENT_ALIGN_DERIVLIB_BUILD_DIR": str(
-            PROJECT_CONFIG.align_derivlib_build_dir
-        ),
         "ML_ALIGNMENT_ACTS_SETUP": str(PROJECT_CONFIG.acts_setup),
         "ML_ALIGNMENT_ODD_ROOT": str(PROJECT_CONFIG.odd_root),
         "ML_ALIGNMENT_ODD_MATERIAL_MAP": str(PROJECT_CONFIG.odd_material_map),

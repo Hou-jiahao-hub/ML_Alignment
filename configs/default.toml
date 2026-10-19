@@ -1,6 +1,5 @@
 [project]
 data_root = "data"
-align_derivlib_root = "AlignDerivLib"
 
 [acts]
 root = "../alignTest"

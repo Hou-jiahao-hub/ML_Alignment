@@ -1,7 +1,5 @@
 # Build artifacts
 build/
-AlignDerivLib/build/
-AlignDerivLib/build_pybind11/
 install/
 __pycache__/
 .pytest_cache/

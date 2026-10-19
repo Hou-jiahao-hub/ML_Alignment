@@ -21,7 +21,6 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-timeout>=2.3"]
-bindings = ["cmake>=3.20", "ninja>=1.11", "pybind11>=2.12"]
 
 [tool.setuptools]
 py-modules = []

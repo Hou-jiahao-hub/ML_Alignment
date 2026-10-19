@@ -132,31 +132,3 @@ except ImportError:  # Direct script execution.
         PLANE_RESIDUAL_TOLERANCE,
         S_MAX,
     )
-
-
-_BROKEN_HELIX_COMPAT_NAMES = {
-    "HIGHLAND_ENERGY_GEV",
-    "HIGHLAND_LOG_COEFFICIENT",
-    "KINK_THETA_EPS",
-    "MUON_MASS_GEV",
-    "assign_hit_segments",
-    "broken_helix_local_path",
-    "broken_helix_segments",
-    "broken_helix_track_parameters",
-    "highland_kink_sigma",
-    "node_arc_lengths",
-    "segment_origin_path",
-}
-
-
-def __getattr__(name: str):
-    """Lazily preserve historical imports of experimental broken-helix symbols."""
-    if name not in _BROKEN_HELIX_COMPAT_NAMES:
-        raise AttributeError(name)
-    try:
-        from . import broken_helix_model
-    except ImportError:  # Direct script execution.
-        import broken_helix_model
-    value = getattr(broken_helix_model, name)
-    globals()[name] = value
-    return value

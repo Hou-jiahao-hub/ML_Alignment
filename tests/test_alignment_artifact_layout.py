@@ -78,8 +78,6 @@ def test_shell_exports_include_absolute_runtime_dependency_paths():
 
     expected = {
         "ML_ALIGNMENT_REPOSITORY_ROOT": layout.PROJECT_CONFIG.repository_root,
-        "ML_ALIGNMENT_ALIGN_DERIVLIB_ROOT": layout.PROJECT_CONFIG.align_derivlib_root,
-        "ML_ALIGNMENT_ALIGN_DERIVLIB_BUILD_DIR": layout.PROJECT_CONFIG.align_derivlib_build_dir,
         "ML_ALIGNMENT_ACTS_SETUP": layout.PROJECT_CONFIG.acts_setup,
         "ML_ALIGNMENT_ODD_ROOT": layout.PROJECT_CONFIG.odd_root,
         "ML_ALIGNMENT_ODD_MATERIAL_MAP": layout.PROJECT_CONFIG.odd_material_map,

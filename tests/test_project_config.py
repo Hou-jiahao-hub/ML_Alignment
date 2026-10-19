@@ -20,10 +20,6 @@ def test_default_config_derives_consistent_artifact_names(monkeypatch):
     assert config.target_layer_dir == "Vol17_Lay8__Vol24_Lay4"
     assert config.data_root == config.repository_root / "data"
     assert config.acts_root == config.repository_root.parent / "alignTest"
-    assert config.align_derivlib_root == config.repository_root / "AlignDerivLib"
-    assert config.align_derivlib_build_dir == (
-        config.repository_root / "AlignDerivLib" / "build_pybind11"
-    )
     assert config.acts_setup == config.acts_root / "setup_acts.sh"
     assert config.odd_root == config.acts_root / "thirdparty" / "OpenDataDetector"
     assert config.odd_material_map == (
@@ -53,18 +49,6 @@ def test_project_paths_are_absolute_and_independent_of_current_directory(
     )
 
 
-def test_effective_active_dof_is_shared_by_both_solver_modules(monkeypatch):
-    monkeypatch.delenv("ML_ALIGNMENT_CONFIG", raising=False)
-    for module_name in ("alignment_artifact_layout", "ml_alignment", "ml_alignment_autograd"):
-        sys.modules.pop(module_name, None)
-
-    import ml_alignment
-    import ml_alignment_autograd
-
-    assert ml_alignment.DEFAULT_ACTIVE_DOF == (0, 1, 5)
-    assert ml_alignment_autograd.DEFAULT_ACTIVE_DOF == (0, 1, 5)
-
-
 def test_explicit_config_overrides_environment_and_resolves_from_repository(
     monkeypatch, tmp_path
 ):
@@ -79,7 +63,6 @@ def test_explicit_config_overrides_environment_and_resolves_from_repository(
         """
 [project]
 data_root = "local-data"
-align_derivlib_root = "native/AlignDerivLib"
 
 [acts]
 root = "/opt/acts"
@@ -101,9 +84,6 @@ active_dof = [0, 5]
     assert config.active_dof == (0, 5)
     assert config.data_root == config.repository_root / "local-data"
     assert config.acts_root == Path("/opt/acts")
-    assert config.align_derivlib_root == (
-        config.repository_root / "native" / "AlignDerivLib"
-    )
     assert config.conda_setup == config.repository_root / "tools" / "conda.sh"
     assert config.source_paths[0] == DEFAULT_CONFIG_PATH
     assert config.source_paths[-1] == explicit_config
@@ -130,14 +110,10 @@ def test_cli_config_activation_supports_split_and_equals_forms(monkeypatch, tmp_
 @pytest.mark.parametrize(
     "script_name",
     [
-        "ml_alignment.py",
         "ml_alignment_autograd.py",
-        "ml_alignment_helix.py",
-        "validate_helix_model.py",
         "reconstruction_acceptance.py",
         "plot_residuals.py",
         "plot_chi2ndf.py",
-        "plot_hit_number.py",
     ],
 )
 def test_pure_python_clis_expose_project_config_override(script_name):

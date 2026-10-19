@@ -49,7 +49,6 @@ class ProjectConfig:
     repository_root: Path
     data_root: Path
     acts_root: Path
-    align_derivlib_root: Path
     conda_setup: Path
     target_layers: tuple[tuple[int, int], ...]
     active_dof: tuple[int, ...]
@@ -65,10 +64,6 @@ class ProjectConfig:
         return "__".join(
             f"Vol{volume}_Lay{layer}" for volume, layer in self.target_layers
         )
-
-    @property
-    def align_derivlib_build_dir(self) -> Path:
-        return self.align_derivlib_root / "build_pybind11"
 
     @property
     def acts_setup(self) -> Path:
@@ -91,8 +86,6 @@ class ProjectConfig:
             "repository_root": str(self.repository_root),
             "data_root": str(self.data_root),
             "acts_root": str(self.acts_root),
-            "align_derivlib_root": str(self.align_derivlib_root),
-            "align_derivlib_build_dir": str(self.align_derivlib_build_dir),
             "acts_setup": str(self.acts_setup),
             "odd_root": str(self.odd_root),
             "odd_material_map": str(self.odd_material_map),
@@ -202,9 +195,6 @@ def load_project_config(path: str | Path | None = None) -> ProjectConfig:
         repository_root=REPOSITORY_ROOT,
         data_root=resolve_project_path(project.get("data_root", "data")),
         acts_root=resolve_project_path(acts.get("root", "../alignTest")),
-        align_derivlib_root=resolve_project_path(
-            project.get("align_derivlib_root", "AlignDerivLib")
-        ),
         conda_setup=resolve_project_path(
             runtime.get("conda_setup", "$HOME/miniconda3/etc/profile.d/conda.sh")
         ),
