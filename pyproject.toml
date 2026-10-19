@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "pytest-timeout>=2.3"]
+test = ["pytest>=8", "pytest-timeout>=2.3", "tomli>=2.0; python_version < '3.11'"]
 # The scripts/ workflow layer (TOML configuration, ACTS adapter, plots).
 workflow = ["tomli>=2.0; python_version < '3.11'"]
 

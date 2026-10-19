@@ -2,15 +2,17 @@
 
 ## Mission
 
-This repository is the single source of truth for detector-alignment algorithm
-development. ACTS is an external runtime used to generate inputs and validate
-geometry; core solvers must remain usable without importing ACTS.
+This repository is the single source of truth for the Schur-LM
+detector-alignment algorithm. The algorithm is the installable package
+`src/mlalign/`; `scripts/` is the workflow layer around it. ACTS is an external
+runtime used to generate inputs and validate geometry; `mlalign` must remain
+usable without importing ACTS.
 
 ## Read before changing algorithms
 
 1. `docs/architecture.md`
-2. `docs/ml_alignment_principles.md`
-3. `docs/history/ml_optimization_log.md`
+2. `docs/history/ml_optimization_log.md`
+3. The module docstring of `src/mlalign/schur_lm.py` (pre-registered contract)
 
 The optimization history records failed approaches and observability limits.
 Do not repeat an experiment without explaining what changed in its assumptions.
@@ -33,8 +35,11 @@ name alone.
 - Versioned defaults: `configs/default.toml`.
 - Machine override: `configs/local.toml` or `ML_ALIGNMENT_CONFIG`.
 - CLI overrides use `--config PATH`.
-- Relative configuration and CLI paths resolve from the repository root; use
-  `python scripts/path_inventory.py --json` to inspect effective absolute paths.
+- Relative configuration and workflow CLI paths resolve from the repository
+  root; `python scripts/alignment_artifact_layout.py --shell` prints the
+  effective absolute paths. `mlalign-align` resolves relative paths against the
+  working directory and reads no TOML: its defaults are the constants in
+  `src/mlalign/config.py`, which must agree with `configs/default.toml`.
 - Target directory and suffix are derived from `alignment.target_layers`; never
   hard-code them in another module.
 - Large artifacts belong below `data/` and must not be committed.
@@ -53,11 +58,14 @@ Git commit. An experiment is not complete until its manifest has been written.
 
 - Only ACTS adapter scripts (`alignment_odd.py`, `generate_odd_transform.py`) may
   import `acts`.
-- `ml_alignment*.py`, `mlalign/`, validation, plotting, configuration, and
-  manifest code must remain importable without ACTS.
-- New solver code goes into the `mlalign` module that owns it (see the layering
-  in `docs/architecture.md`); `ml_alignment_autograd.py` and `helix_model.py`
-  are facades that only re-export and parse the CLI.
+- `mlalign`, acceptance, plotting, configuration, and manifest code must
+  remain importable without ACTS.
+- `mlalign` must not import anything from `scripts/` (no TOML, no repository
+  paths). New solver code goes into the `mlalign` module that owns it (see the
+  layering in `docs/architecture.md`).
+- Each module has one import name. `mlalign/__init__.py` re-exports the public
+  API only; monkeypatch a name in its defining module, never via a re-export.
+- The pipeline runs on the CPU in float64; there is no GPU path.
 
 ## Verification
 
@@ -65,8 +73,8 @@ Git commit. An experiment is not complete until its manifest has been written.
 - Shell path/dry-run contracts: `make test-shell`
 - Both: `make ci`
 - Environment-sensitive ROOT I/O: `make test-root-io`
-- Header-only C++ core: `make test-cpp`
-- Optional C++/pybind11 build: `make test-bindings`
+- Tests import the installed package: run `python -m pip install -e .` in the
+  conda environment once.
 
 For algorithm changes, add a failing regression test first. Record experiment
 configuration, input hashes, metrics, and Git commit in `manifest.json`.
