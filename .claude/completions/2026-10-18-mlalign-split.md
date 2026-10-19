@@ -20,7 +20,8 @@
 一次中间测试里补丁打在 facade 上没生效，把测试桩几何写到了
 `data/alignment/Vol17_Lay8__Vol24_Lay4/aligned_transforms_v17l8_v24l4_ml.json`，覆盖了
 2026-08-03 的原文件（2,986,012 B，sha256 5cdc7856…）。没有副本，无法恢复；该文件没有被任何
-manifest 当作输入引用。测试已改成写 tmp_path。桩文件仍留在原处，等用户决定是否删除。
+manifest 当作输入引用。测试已改成写 tmp_path。经用户同意，2026-10-19 删除了这份桩文件，
+该路径目前为空（`data/` 不在 git 中）。
 
 ## 未做
 - Schur 内部拆分（按用户要求）。
