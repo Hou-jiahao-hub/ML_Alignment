@@ -320,6 +320,7 @@ run_acceptance "$baseline_label" "$INPUT_STATES" "$baseline_acceptance" || true
 
 CURRENT_STAGE="schur_lm"
 run_conda "$RUN_DIR/${joint_label}.log" \
+    env OMP_NUM_THREADS=3 MKL_NUM_THREADS=3 OPENBLAS_NUM_THREADS=3 \
     mlalign-align --input-geom "$INPUT_GEOM" --states "$INPUT_STATES" \
     --nominal-full-geom "$NOMINAL_GEOMETRY" --output-geom "$joint_geom" \
     --target-layers "$TARGET_LAYERS" --active-dof "$ACTIVE_DOF" \
