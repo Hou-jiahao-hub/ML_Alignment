@@ -30,11 +30,21 @@ from .joint_residuals import (
 from .root_inputs import load_variable_information
 from .schur_lm import run_schur_lm_alignment
 from .track_batches import build_track_batches
+from .timing import RunTimings
 
 DOF_NAMES = ("tx", "ty", "tz", "rx", "ry", "rz")
 
 
-def run_alignment(config: AlignmentConfig) -> dict:
+def run_alignment(config: AlignmentConfig, *, timings: RunTimings | None = None) -> dict:
+    """Run alignment and return stage timings, optionally using a caller's recorder."""
+    if timings is None:
+        timings = RunTimings()
+    result = timings.call("pipeline_total", _run_alignment, config, timings)
+    result["timings"] = timings.snapshot()
+    return result
+
+
+def _run_alignment(config: AlignmentConfig, timings: RunTimings) -> dict:
     active_dof = parse_active_dof(config.active_dof)
     print(f"Active alignment DOF: {[DOF_NAMES[d] for d in active_dof]}")
     target_layers = parse_target_layers(config.target_layers)
@@ -45,7 +55,8 @@ def run_alignment(config: AlignmentConfig) -> dict:
     ):
         if not os.path.exists(path):
             raise FileNotFoundError(f"Missing {label}: {path}")
-    geometry = load_joint_geometry(
+    geometry = timings.call(
+        "geometry_load", load_joint_geometry,
         config.nominal_full_geom, config.input_geom, target_layers
     )
     print(
@@ -53,7 +64,8 @@ def run_alignment(config: AlignmentConfig) -> dict:
         f"{int(geometry.target_mask.sum())} trainable targets, "
         f"{len(geometry.input_indices)} overlaid input surfaces."
     )
-    inputs = load_variable_information(
+    inputs = timings.call(
+        "root_load", load_variable_information,
         None,
         config.states_root,
         geometry.id_to_idx,
@@ -64,7 +76,8 @@ def run_alignment(config: AlignmentConfig) -> dict:
         inputs.initial_residuals, inputs.hit_volume_ids, inputs.hit_layer_ids, target_layers,
         loc1_valid=inputs.loc1_valid,
     )
-    batches = build_track_batches(
+    batches = timings.call(
+        "track_batches", build_track_batches,
         inputs,
         target_layers,
         min_hits=config.joint_seed_min_hits,
@@ -75,7 +88,8 @@ def run_alignment(config: AlignmentConfig) -> dict:
         f"Joint track selection: {len(batches.event_track_ids)} tracks, "
         f"{int(batches.hit_mask.sum())} hits, padded width {batches.hit_mask.shape[1]}."
     )
-    seeded_parameters, seed_solver_stats = seed_helices(
+    seeded_parameters, seed_solver_stats = timings.call(
+        "smt_seed", seed_helices,
         batches,
         n_iter=config.joint_smt_seed_iters,
         dtype=DTYPE,
@@ -95,7 +109,8 @@ def run_alignment(config: AlignmentConfig) -> dict:
             f"{smt_stats['invalid_fraction']:.2%} > "
             f"{config.joint_max_invalid_fraction:.2%}."
         )
-    refitted_parameters, measurement_stats = fit_helices_to_measurements(
+    refitted_parameters, measurement_stats = timings.call(
+        "measurement_refit", fit_helices_to_measurements,
         batches,
         geometry,
         seeded_parameters,
@@ -141,7 +156,8 @@ def run_alignment(config: AlignmentConfig) -> dict:
         batches.layer_id,
         target_layers,
     )
-    result = run_schur_lm_alignment(
+    result = timings.call(
+        "schur_lm", run_schur_lm_alignment,
         batches,
         geometry,
         config,
@@ -150,14 +166,18 @@ def run_alignment(config: AlignmentConfig) -> dict:
         max_iters=config.lm_max_iters,
     )
     predicted_deltas = result["predicted_deltas"]
-    truth_metrics = validate_against_truth(
+    truth_metrics = timings.call(
+        "truth_diagnostics", validate_against_truth,
         geometry.transforms,
         predicted_deltas,
         config.truth_geom,
         target_layers,
     )
     Path(config.output_geom).parent.mkdir(parents=True, exist_ok=True)
-    export_joint_geometry(geometry, predicted_deltas, config.output_geom)
+    timings.call(
+        "geometry_export", export_joint_geometry,
+        geometry, predicted_deltas, config.output_geom,
+    )
     print(f"Export successful: {config.output_geom}")
 
     if config.make_plot and result["history"]:

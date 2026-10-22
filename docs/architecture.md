@@ -35,6 +35,7 @@ Its defaults are module constants in `src/mlalign/config.py`.
 | `joint_residuals.py` | Helix-to-surface residuals, per-layer chi2, component-mask merging |
 | `box_constraints.py`, `conventions.py`, `rotations.py` | Correction bounds and free-DOF active set, DOF/target-layer parsing, Euler convention |
 | `diagnostics.py`, `reporting.py` | Residual tables and truth-geometry comparison; compact JSON summary |
+| `timing.py` | Per-run wall and process CPU timing, stage status, and thread configuration |
 
 ### Workflow `scripts/`
 
@@ -61,6 +62,13 @@ run_alignment(config)
   validate_against_truth       diagnostic only
   export_joint_geometry        corrected input surfaces -> aligned JSON
 ```
+
+`run_alignment()` returns schema-versioned `timings` with wall seconds,
+process CPU seconds, stage status and thread configuration. The CLI writes
+these only into its existing `--output-summary` JSON, including partial timings
+on Python exceptions or keyboard interruption. `pipeline_total` covers the
+alignment pipeline, excluding imports, summary serialization and external ACTS
+processes. Process CPU time includes all threads in the current process.
 
 Geometry corrections compose locally: `center = center0 + R0·delta_t`,
 `R = R0·R(delta_rot)`; mm and rad. Everything runs on the CPU in float64:

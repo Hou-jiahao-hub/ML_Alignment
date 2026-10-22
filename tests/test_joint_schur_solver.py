@@ -328,7 +328,8 @@ def test_loc0_only_target_has_a_structurally_absent_ty():
 def test_pipeline_dispatches_to_schur_lm():
     pipeline = importlib.import_module("mlalign.pipeline")
     assert pipeline.run_schur_lm_alignment is J.run_schur_lm_alignment
-    assert "lm_max_iters" in inspect.getsource(pipeline.run_alignment)
+    # Actual iteration-budget forwarding is exercised by the pipeline fixture
+    # in test_component_mask_wiring, including the public timing wrapper.
 
 
 def test_schur_lm_summary_is_retained_in_the_run_summary():

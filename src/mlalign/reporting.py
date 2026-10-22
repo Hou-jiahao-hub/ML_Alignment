@@ -46,6 +46,9 @@ def write_alignment_summary(result, output_path):
         "solver",
         "stop_reason",
         "schur_lm_summary",
+        "timings",
+        "execution_status",
+        "execution_error",
     )
     summary = {key: _json_ready(result[key]) for key in retained_keys if key in result}
     if "predicted_deltas" in result:

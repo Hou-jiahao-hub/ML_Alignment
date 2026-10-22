@@ -162,7 +162,13 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
         ),
     )
     monkeypatch.setattr(pipeline, "summarize_joint_layer_chi2", lambda *_a, **_k: {})
-    monkeypatch.setattr(pipeline, "run_schur_lm_alignment", lambda *_a, **_k: joint_result)
+    solver_calls = []
+
+    def solve_recorder(*args, **kwargs):
+        solver_calls.append((args, kwargs))
+        return joint_result
+
+    monkeypatch.setattr(pipeline, "run_schur_lm_alignment", solve_recorder)
     monkeypatch.setattr(pipeline, "validate_against_truth", lambda *_a, **_k: {})
     monkeypatch.setattr(pipeline, "export_joint_geometry", lambda *_a, **_k: None)
     monkeypatch.setattr(pipeline, "print_per_layer_residual_diagnostics", lambda *_a, **_k: {})
@@ -184,10 +190,18 @@ def test_free_pipeline_wires_combine_component_masks(monkeypatch, tmp_path, caps
         nominal_full_geom=str(tmp_path / "nominal.json"),
         make_plot=False,
         target_layers=((16, 6),),
+        lm_max_iters=7,
     )
-    pipeline.run_alignment(config)
+    result = pipeline.run_alignment(config)
 
     assert len(calls) == 1, "combine_component_masks was not called exactly once"
+    assert len(solver_calls) == 1
+    solver_args, solver_kwargs = solver_calls[0]
+    assert solver_args[0] is batches
+    assert solver_args[1] is geometry
+    assert solver_kwargs["max_iters"] == 7
+    assert solver_kwargs["initial_track_params"] is seeded
+    assert result["timings"]["stages"]["schur_lm"][0]["status"] == "completed"
     output = capsys.readouterr().out
     assert "initial_only=17" in output
     assert "final_only=23" in output
